@@ -1430,7 +1430,7 @@ mod tests {
         let LaneExit::Branch { when, .. } = s.exits[0] else {
             panic!()
         };
-        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let cmp = p.blocks[0].insts[0].write(&p, Reg::S(VCC)).unwrap();
         // In BDD representation: node(when) is (Atom::Lane(cmp), Bool::FALSE, Bool::TRUE)
         // representing when = cmp ? 1 : 0.
         assert_eq!(

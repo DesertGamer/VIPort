@@ -1227,11 +1227,11 @@ mod tests {
         assert_eq!(
             phi.args,
             [
-                p.blocks[1].insts[0].write(Reg::S(2)).unwrap(),
+                p.blocks[1].insts[0].write(&p, Reg::S(2)).unwrap(),
                 input(&p, Reg::S(2)),
             ],
         );
-        assert_eq!(join.insts[0].read(Reg::S(2)), Some(phi.value));
+        assert_eq!(join.insts[0].read(&p, Reg::S(2)), Some(phi.value));
     }
 
     #[test]
