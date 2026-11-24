@@ -1,0 +1,50 @@
+name: Bug report
+description: Something does not work as the README says it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not attach game files, extracts, screenshots or captures of the game, or shader dumps.** They are not allowed here (see `docs/asset-policy.md`) and the issue will be edited or closed. Read logs before pasting them: they can contain paths and names from your machine.
+        A security problem goes through `SECURITY.md`, not a public issue.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got.
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: V2 commit
+      description: Output of `git rev-parse --short HEAD`.
+    validations:
+      required: true
+  - type: textarea
+    id: machine
+    attributes:
+      label: Machine
+      description: Windows version, GPU and driver version, CPU, RAM and paging file size.
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Where it fails
+      options:
+        - Build or tests
+        - Boot or menus
+        - Loading
+        - The world
+        - Audio
+        - Input
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The relevant lines of the run output or `crashes.log`, with `VICTORY_LOG` set if you know how. A short excerpt is better than the whole file.
+      render: text
