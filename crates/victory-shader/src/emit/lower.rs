@@ -6092,7 +6092,7 @@ impl<'a> Lower<'a> {
                         let Some(Operand::Vector { reg, .. }) = v.dst else {
                             return Err("a permlane result outside a VGPR");
                         };
-                        self.i32_of(inst.read(Reg::V(reg)).ok_or("a permlane old value")?)?
+                        self.i32_of(inst.read(self.x.p, Reg::V(reg)).ok_or("a permlane old value")?)?
                     };
                     self.s.m.select(c, active, read, fallback)
                 };
