@@ -19,11 +19,26 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
+fn resolve_prebuilt_probe(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let path = value.filter(|p| !p.is_empty())?;
+    let path = PathBuf::from(path);
+    assert!(
+        path.is_file(),
+        "VICTORY_HLE_PROBE_DLL must point to an existing file: {}",
+        path.display()
+    );
+    Some(path)
+}
+
 /// Builds the fixture into its own target dir (the outer cargo holds the
 /// lock on the main one while tests run), in the outer one's scratch folder
 /// for tests, so that it follows `CARGO_TARGET_DIR` like the rest of the
-/// build.
+/// build. When `VICTORY_HLE_PROBE_DLL` is set and non-empty, uses that
+/// prebuilt DLL directly instead of invoking Cargo.
 fn build_probe() -> PathBuf {
+    if let Some(path) = resolve_prebuilt_probe(std::env::var_os("VICTORY_HLE_PROBE_DLL")) {
+        return path;
+    }
     let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hle-probe");
     let status = Command::new(env!("CARGO"))
@@ -265,4 +280,60 @@ fn maps_a_title_dll_the_title_loads_itself() {
     assert!(dlls[0].1.export("GetFileVersionInfoW").is_some());
     assert!(load("absent.dll", &|_| true).is_empty());
     assert!(load("late.dll", &|_| false).is_empty());
+}
+
+#[test]
+fn victory_hle_probe_dll_overrides_build_and_validates_path() {
+    assert_eq!(resolve_prebuilt_probe(None), None);
+    assert_eq!(
+        resolve_prebuilt_probe(Some(std::ffi::OsString::new())),
+        None
+    );
+
+    let built = build_probe();
+    let dir = tempfile::tempdir().unwrap();
+    let prebuilt = dir.path().join("custom_hle_probe.dll");
+    std::fs::copy(&built, &prebuilt).unwrap();
+    assert_eq!(
+        resolve_prebuilt_probe(Some(prebuilt.clone().into_os_string())),
+        Some(prebuilt.clone())
+    );
+
+    let exe = std::env::current_exe().unwrap();
+    let ok = Command::new(&exe)
+        .args(["--exact", "loads_binds_and_calls_probe", "--nocapture"])
+        .env("VICTORY_HLE_PROBE_DLL", &prebuilt)
+        .output()
+        .unwrap();
+    assert!(
+        ok.status.success(),
+        "prebuilt VICTORY_HLE_PROBE_DLL run failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&ok.stdout),
+        String::from_utf8_lossy(&ok.stderr),
+    );
+
+    for invalid in [
+        dir.path().join("missing_hle_probe.dll"),
+        dir.path().to_path_buf(),
+    ] {
+        let err = Command::new(&exe)
+            .args(["--exact", "loads_binds_and_calls_probe", "--nocapture"])
+            .env("VICTORY_HLE_PROBE_DLL", &invalid)
+            .output()
+            .unwrap();
+        assert!(
+            !err.status.success(),
+            "invalid VICTORY_HLE_PROBE_DLL should fail: {}",
+            invalid.display()
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&err.stdout),
+            String::from_utf8_lossy(&err.stderr)
+        );
+        assert!(
+            combined.contains("VICTORY_HLE_PROBE_DLL"),
+            "expected VICTORY_HLE_PROBE_DLL error message, got: {combined}"
+        );
+    }
 }
