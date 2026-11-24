@@ -99,13 +99,13 @@ impl Default for GraphicsState {
 /// included (an entry stored with other padding bytes never loads). The
 /// caller keeps `value` where it is: a move may rewrite its padding.
 fn zero_padding<T>(value: &mut T, padding: &[Range<usize>]) {
-    // SAFETY: `value` is a whole `T`; only bytes no field reads are written.
-    unsafe {
-        let bytes =
-            std::slice::from_raw_parts_mut(std::ptr::from_mut(value).cast::<u8>(), size_of::<T>());
-        for range in padding {
-            bytes[range.clone()].fill(0);
-        }
+    let bytes = std::ptr::from_mut(value).cast::<u8>();
+    for range in padding {
+        assert!(range.start <= range.end && range.end <= size_of::<T>());
+        // SAFETY: `value` is a whole `T`; these checked ranges contain only
+        // padding. Raw writes do not read the other, possibly uninitialised,
+        // padding bytes as `u8` values.
+        unsafe { bytes.add(range.start).write_bytes(0, range.len()) };
     }
 }
 
@@ -609,13 +609,17 @@ impl HostPipeline {
 struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 
 /// Where the padding of a mesh pipeline's stream lies: after the type of
-/// each subobject whose description is eight bytes wide, then at the end
-/// of the stream, after the last subobject's four-byte-aligned description.
-fn stream_padding() -> [Range<usize>; 4] {
+/// each subobject whose description is eight bytes wide, and at the ends
+/// of the blend and sample-description subobjects.
+fn stream_padding() -> [Range<usize>; 5] {
     [
         std::mem::offset_of!(Stream, root) + 4..std::mem::offset_of!(Stream, root) + 8,
         std::mem::offset_of!(Stream, ms) + 4..std::mem::offset_of!(Stream, ms) + 8,
         std::mem::offset_of!(Stream, ps) + 4..std::mem::offset_of!(Stream, ps) + 8,
+        std::mem::offset_of!(Stream, blend)
+            + std::mem::offset_of!(Sub<D3D12_BLEND_DESC>, 1)
+            + size_of::<D3D12_BLEND_DESC>()
+            ..std::mem::offset_of!(Stream, blend) + size_of::<Sub<D3D12_BLEND_DESC>>(),
         std::mem::offset_of!(Stream, samples) + 4 + size_of::<DXGI_SAMPLE_DESC>()
             ..size_of::<Stream>(),
     ]
@@ -634,6 +638,16 @@ struct Stream {
     targets: Sub<D3D12_RT_FORMAT_ARRAY>,
     dsv: Sub<DXGI_FORMAT>,
     samples: Sub<DXGI_SAMPLE_DESC>,
+}
+
+impl Stream {
+    /// Clean the final storage passed to D3D12, after all typed moves:
+    /// copying even a cleaned description need not preserve its padding.
+    fn clear_padding(&mut self) {
+        zero_padding(self, &stream_padding());
+        zero_padding(&mut self.blend.1, &blend_padding());
+        zero_padding(&mut self.depth.1, &[depth_padding()]);
+    }
 }
 
 /// A mesh pipeline from the title's graphics state: the pipeline-state
@@ -671,7 +685,7 @@ fn mesh_pipeline(
         ),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
     };
-    zero_padding(&mut stream, &stream_padding());
+    stream.clear_padding();
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: size_of::<Stream>(),
         pPipelineStateSubobjectStream: (&raw mut stream).cast(),
@@ -749,15 +763,16 @@ mod tests {
 
     /// The bytes of `value` no field reads (see `zero_padding`).
     fn padding_of<T>(value: &T, padding: &[Range<usize>]) -> Vec<u8> {
-        // SAFETY: `value` is a whole `T`.
-        unsafe {
-            let bytes =
-                std::slice::from_raw_parts(std::ptr::from_ref(value).cast::<u8>(), size_of::<T>());
-            padding
-                .iter()
-                .flat_map(|r| r.clone().map(|i| bytes[i]))
-                .collect()
-        }
+        let bytes = std::ptr::from_ref(value).cast::<u8>();
+        padding
+            .iter()
+            .flat_map(|r| {
+                // SAFETY: the callers just cleaned these padding ranges in place;
+                // no typed move has happened since. Other padding is not read.
+                unsafe { std::slice::from_raw_parts(bytes.add(r.start), r.len()) }
+            })
+            .copied()
+            .collect()
     }
 
     /// Descriptions read with other bytes between their fields are the same
@@ -777,19 +792,20 @@ mod tests {
         assert_eq!(state.blend.RenderTarget[7].RenderTargetWriteMask, 0xff);
         assert_eq!(state.depth.StencilWriteMask, 0xff);
         assert_eq!(state.depth.FrontFace.StencilFailOp, D3D12_STENCIL_OP(-1));
-        // So does the default state.
-        let state = GraphicsState::default();
-        assert_eq!(padding_of(&state.depth, &[depth_padding()]), [0, 0]);
-        assert_eq!(padding_of(&state.blend, &blend_padding()), vec![0; 24]);
+        // Padding cannot be inspected after a typed default-state return:
+        // that move need not preserve it. The final-stream test below checks
+        // the storage D3D12 actually receives after those moves.
     }
 
-    /// A stream's subobjects carry no padding either: a description of
-    /// eight bytes leaves four after its type, and the last one, four-byte
-    /// aligned, leaves four at the end. Every field keeps its value.
+    /// Outer and nested padding is cleaned in the final stream, while every
+    /// field keeps its value. Poison only known padding before observing it.
     #[test]
-    fn stream_subobjects_carry_no_padding() {
+    fn final_stream_clears_outer_and_nested_padding() {
         let g = GraphicsState {
-            samples: DXGI_SAMPLE_DESC { Count: 4, Quality: 7 },
+            samples: DXGI_SAMPLE_DESC {
+                Count: 4,
+                Quality: 7,
+            },
             ..GraphicsState::default()
         };
         let code = D3D12_SHADER_BYTECODE {
@@ -820,21 +836,48 @@ mod tests {
             ),
             samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
         };
-        zero_padding(&mut stream, &stream_padding());
-        // SAFETY: `stream` is a whole `Stream`.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                std::ptr::from_ref(&stream).cast::<u8>(),
-                size_of::<Stream>(),
-            )
-        };
-        for range in stream_padding() {
-            assert_eq!(&bytes[range.clone()], &[0; 4]);
+        let blend = std::mem::offset_of!(Stream, blend);
+        let blend_data = blend + std::mem::offset_of!(Sub<D3D12_BLEND_DESC>, 1);
+        let depth_data = std::mem::offset_of!(Stream, depth)
+            + std::mem::offset_of!(Sub<D3D12_DEPTH_STENCIL_DESC>, 1);
+        let mut padding = stream_padding().to_vec();
+        // Sub<Blend> rounds its 4 + 328 bytes up to eight-byte alignment.
+        let trailer =
+            blend_data + size_of::<D3D12_BLEND_DESC>()..blend + size_of::<Sub<D3D12_BLEND_DESC>>();
+        if !padding.contains(&trailer) {
+            padding.push(trailer);
+        }
+        padding.extend(blend_padding().map(|r| blend_data + r.start..blend_data + r.end));
+        let depth = depth_padding();
+        padding.push(depth_data + depth.start..depth_data + depth.end);
+        let ptr = std::ptr::from_mut(&mut stream).cast::<u8>();
+        for range in &padding {
+            // SAFETY: these are known padding ranges of the final stream.
+            // Initialise them explicitly before observing their bytes: typed
+            // moves need not preserve even previously zeroed struct padding.
+            unsafe { ptr.add(range.start).write_bytes(0xaa, range.len()) };
+        }
+        stream.clear_padding();
+        let ptr = std::ptr::from_ref(&stream).cast::<u8>();
+        for range in padding {
+            // SAFETY: only the padding explicitly initialised above is read;
+            // the stream was not moved after initialisation or cleaning.
+            let bytes = unsafe { std::slice::from_raw_parts(ptr.add(range.start), range.len()) };
+            assert!(
+                bytes.iter().all(|&b| b == 0),
+                "uncleared padding {range:?}: {bytes:?}"
+            );
         }
         // The fields are where they were.
         assert_eq!(stream.root.1, 0x10 as *mut std::ffi::c_void);
         assert_eq!(stream.ms.1.BytecodeLength, 0x20);
-        assert_eq!(stream.samples.1, DXGI_SAMPLE_DESC { Count: 4, Quality: 7 });
+        assert_eq!(
+            stream.samples.1,
+            DXGI_SAMPLE_DESC {
+                Count: 4,
+                Quality: 7
+            }
+        );
         assert_eq!(stream.dsv.1, g.depth_format);
         assert_eq!(stream.mask.1, g.sample_mask);
     }
