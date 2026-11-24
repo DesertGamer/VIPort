@@ -10,7 +10,9 @@ impl Instruction {
     /// Branch targets are written `label_<byte offset>`.
     pub fn text(&self, wave64: bool) -> String {
         let name = self.name().unwrap_or("?");
-        let ops = operands(self, name, &self.fields(wave64));
+        let mut arena = Vec::new();
+        let fields = self.fields(wave64, &mut arena);
+        let ops = operands(self, name, &fields, &arena);
         if ops.is_empty() {
             name.to_owned()
         } else {
@@ -96,11 +98,11 @@ fn join(ops: impl IntoIterator<Item = String>) -> String {
     ops.into_iter().collect::<Vec<_>>().join(", ")
 }
 
-fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
+fn operands(inst: &Instruction, name: &str, fields: &Fields, arena: &[Operand]) -> String {
     let mut out = String::new();
     match fields {
         Fields::Sop { dst, src, imm } => {
-            let regs = join(dst.iter().chain(src).map(|o| o.to_string()));
+            let regs = join(dst.iter().chain(src.of(arena)).map(|o| o.to_string()));
             out = match (name, imm) {
                 ("s_getreg_b32", Some(imm)) => format!("{regs}, {}", hwreg(*imm)),
                 ("s_setreg_b32" | "s_setreg_imm32_b32", Some(imm)) => {
@@ -149,7 +151,7 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             }
             flags(&mut out, cache, false);
         }
-        Fields::Valu(v) => out = valu(name, v, inst.encoding),
+        Fields::Valu(v) => out = valu(name, v, v.src.of(arena), inst.encoding),
         Fields::Vintrp { dst, src, attr } => {
             let src = match (name, src) {
                 ("v_interp_mov_f32", Operand::Const(p)) => ["p10", "p20", "p0"]
@@ -167,7 +169,12 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             offset1,
             gds,
         } => {
-            out = join(dst.iter().chain(addr).chain(data).map(|o| o.to_string()));
+            out = join(
+                dst.iter()
+                    .chain(addr)
+                    .chain(data.of(arena))
+                    .map(|o| o.to_string()),
+            );
             if super::fields::ds_pair(name) {
                 if *offset0 != 0 {
                     let _ = write!(out, " offset0:{offset0}");
@@ -236,7 +243,7 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             lwe,
             cache,
         } => {
-            let addr = match addr.as_slice() {
+            let addr = match addr.of(arena) {
                 [one] => one.to_string(),
                 many => format!(
                     "[{}]",
@@ -499,11 +506,11 @@ fn buffer_format(format: u8) -> String {
         .map_or(format!("{format}"), |n| format!("BUF_FMT_{n}"))
 }
 
-fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
+fn valu(name: &str, v: &Valu, vsrc: &[Operand], encoding: Encoding) -> String {
     let bit = |mask: u8, i: usize| mask >> i & 1 != 0;
     let mix = name.starts_with("v_fma_mix");
     let src = |i: usize| {
-        let o = v.src[i];
+        let o = vsrc[i];
         let mut s = o.to_string();
         if let Some(sdwa) = v.sdwa
             && bit(sdwa.sext, i)
@@ -552,7 +559,7 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
         .chain(&v.carry)
         .map(|o| o.to_string())
         .collect();
-    let mut order: Vec<usize> = (0..v.src.len()).collect();
+    let mut order: Vec<usize> = (0..vsrc.len()).collect();
     if name.starts_with("v_interp_") && order.len() > 1 {
         // dst, i/j, attribute, then the p1 result for p2.
         order.swap(0, 1);
@@ -563,7 +570,7 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
         out.push(' ');
         out.push_str(s);
     };
-    if let Some(Operand::Attr { high: true, .. }) = v.src.first() {
+    if let Some(Operand::Attr { high: true, .. }) = vsrc.first() {
         suffix("high");
     }
     let omod = ["", "mul:2", "mul:4", "div:2"][usize::from(v.omod & 3)];
@@ -775,10 +782,12 @@ mod tests {
             .chain(&[0xBF81_0000])
             .flat_map(|w| w.to_le_bytes())
             .collect();
-        let Fields::Image { data, addr, .. } = decode(&code).unwrap()[0].fields(true) else {
+        let mut arena = Vec::new();
+        let Fields::Image { data, addr, .. } = decode(&code).unwrap()[0].fields(true, &mut arena)
+        else {
             panic!("not an image instruction");
         };
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
-        assert_eq!(addr.len(), 2);
+        assert_eq!(addr.of(&arena).len(), 2);
     }
 }

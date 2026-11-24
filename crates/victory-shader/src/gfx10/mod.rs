@@ -18,7 +18,7 @@ mod fields;
 mod opcodes;
 mod sp3;
 
-pub use fields::{Cache, Dpp, Fields, NULL, Operand, Sdwa, Valu};
+pub use fields::{Cache, Dpp, Fields, NULL, Operand, Sdwa, Span, Valu};
 
 use std::collections::BTreeMap;
 
