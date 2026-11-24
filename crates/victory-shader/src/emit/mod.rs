@@ -180,6 +180,8 @@ mod lower;
 mod rect;
 pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]
+mod lds_tests;
+#[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
 #[cfg(all(test, windows))]
