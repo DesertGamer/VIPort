@@ -369,6 +369,10 @@ struct State {
     queue: VecDeque<Event>,
     /// One thread drains `queue`; other producers only append to it.
     delivering: bool,
+    /// Host slots that have reported input on their current connection. A
+    /// wireless receiver may report a neutral pad while the pad is off, so the
+    /// flag belongs to the connection: a disconnect clears it.
+    seen_input: [bool; PADS],
 }
 
 pub struct Hub {
@@ -416,6 +420,7 @@ impl Hub {
                 running: Vec::new(),
                 queue: VecDeque::new(),
                 delivering: false,
+                seen_input: [false; PADS],
             }),
             returned: Condvar::new(),
         }));
@@ -543,6 +548,21 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        // A slot that has never reported input is not a pad: a wireless receiver keeps
+        // answering for a pad that is switched off, and its all-zero report used to hide the
+        // keyboard's stand-in, leaving the keyboard dead with no pad in hand.
+        let pads: [Option<PadState>; PADS] = std::array::from_fn(|slot| {
+            let Some(pad) = pads[slot] else {
+                // A disconnect ends the connection the flag belongs to: a receiver that
+                // comes back neutral is not the pad that was played with.
+                self.seen_input[slot] = false;
+                return None;
+            };
+            if pad != PadState::default() {
+                self.seen_input[slot] = true;
+            }
+            self.seen_input[slot].then_some(pad)
+        });
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
@@ -1550,7 +1570,10 @@ mod tests {
             }
         };
         register_observer(hub, 0, &slow);
-        host.lock().unwrap().pads[0] = Some(PadState::default());
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
         std::thread::scope(|scope| {
             let release = release;
             scope.spawn(move || hub.poll());
@@ -1697,9 +1720,12 @@ mod tests {
         let stand_in = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         let no_keys = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
         tick();
-        host.lock().unwrap().pads[1] = Some(PadState::default());
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
         hub.poll();
-        let pad_a = current(hub, GAMEPAD_KIND, 1).unwrap();
+        let pad_a =current(hub, GAMEPAD_KIND, 1).unwrap();
         tick();
         host.lock().unwrap().keys = vec![key(b'W')];
         hub.poll();
@@ -1725,6 +1751,109 @@ mod tests {
         for r in order {
             release(r);
         }
+    }
+
+    #[test]
+    fn a_receiver_with_a_switched_off_pad_does_not_hide_the_keyboard_stand_in() {
+        let (hub, host) = fake();
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+
+        // A wireless receiver answers for a pad that is switched off: the slot reads
+        // connected with an all-zero report. That is not a pad, and it must not take the
+        // stand-in away - the keyboard would be dead with nothing in the player's hands.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(
+            *log.lock().unwrap(),
+            [(FALLBACK, STATUS_CONNECTED, 0)],
+            "an all-zero slot is not a pad"
+        );
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+
+        // The first real press turns the slot into a pad, and the stand-in steps aside.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(
+            log.lock().unwrap()[1..],
+            [(0, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
+        );
+        let pressed = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(pressed).buttons, A);
+        release(pressed);
+
+        // Back at rest it stays a pad: a pad that has been used does not connect and
+        // disconnect on every button release.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(log.lock().unwrap().len(), 3, "no churn while the pad rests");
+        let rest = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(rest), PadState::default());
+        release(rest);
+        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
+    }
+
+    #[test]
+    fn a_reconnected_idle_slot_does_not_hide_the_keyboard_stand_in() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: B,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
+
+        host.lock().unwrap().pads[0] = None;
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+
+        {
+            let mut host = host.lock().unwrap();
+            host.pads[0] = Some(PadState::default());
+            host.keys = vec![key(0x0D)];
+        }
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+        let reading = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(reading).buttons, A);
+        release(reading);
+    }
+
+    #[test]
+    fn the_first_press_is_still_current_after_the_connect_callback() {
+        let (hub, host) = fake();
+        // The press that makes an idle slot a pad arrives in the same poll as the connect
+        // callback. A title that only starts reading after that callback still sees it,
+        // because a reading stays current until the pad reports something else.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        hub.poll();
+        let pressed = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(pressed).buttons, A);
+        release(pressed);
+
+        // Nothing changed on the host: no new reading, the pressed one is still current.
+        hub.poll();
+        let again = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(again).buttons, A);
+        release(again);
+
+        // The release does produce a new reading, so a press held across one poll is never
+        // lost; only a press that starts and ends between two reads would be.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        let released = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(released).buttons, 0);
+        release(released);
     }
 
     #[test]
@@ -1821,7 +1950,12 @@ mod tests {
             register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
             S_OK
         );
-        host.lock().unwrap().pads[1] = Some(PadState::default());
+        // A slot that has never reported input is not a pad, so the callback test
+        // presses a button to make this one appear.
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
         let poller = std::thread::spawn(|| hub.poll());
         while !INSIDE.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
@@ -1860,7 +1994,10 @@ mod tests {
             let release = release;
             scope.spawn(|| register_observer(hub, 2, &observe));
             inside.recv_timeout(CALLBACK_WAIT).unwrap();
-            host.lock().unwrap().pads[1] = Some(PadState::default());
+            host.lock().unwrap().pads[1] = Some(PadState {
+                buttons: A,
+                ..Default::default()
+            });
             hub.poll();
             assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED)]);
             release.send(()).unwrap();
@@ -1913,7 +2050,10 @@ mod tests {
                 let release = release;
                 scope.spawn(move || register_observer(hub, 2, observe));
                 inside.recv_timeout(CALLBACK_WAIT).unwrap();
-                host.lock().unwrap().pads[1] = Some(PadState::default());
+                host.lock().unwrap().pads[1] = Some(PadState {
+                    buttons: A,
+                    ..Default::default()
+                });
                 hub.poll();
                 assert_eq!(*log.lock().unwrap(), [(0, STATUS_CONNECTED)]);
                 release.send(()).unwrap();
