@@ -225,7 +225,7 @@ impl Instruction {
     /// are appended to `arena`; the fields hold their [`Span`]s.
     pub fn fields(&self, wave64: bool, arena: &mut Vec<Operand>) -> Fields {
         let name = self.name().unwrap_or("");
-        let w = |i: usize| self.words.get(i).copied().unwrap_or(0);
+        let w = |i: usize| self.words().get(i).copied().unwrap_or(0);
         let (w0, w1) = (w(0), w(1));
         let bit = |word: u32, n: u32| word >> n & 1 != 0;
         let cache = |glc, slc, dlc| Cache { glc, slc, dlc };
@@ -475,7 +475,7 @@ impl Instruction {
         if matches!(name, "v_nop" | "v_pipeflush" | "v_clrexcp") {
             return Valu::default();
         }
-        let w = |i: usize| self.words.get(i).copied().unwrap_or(0);
+        let w = |i: usize| self.words().get(i).copied().unwrap_or(0);
         let w0 = w(0);
         let (dst_n, src_n) = valu_dwords(name);
         let compare = match self.encoding {
