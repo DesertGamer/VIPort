@@ -276,6 +276,10 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 
+[docs/debugging-notes-from-a-gta-v-port.md](docs/debugging-notes-from-a-gta-v-port.md)
+collects what got another RAGE port from "the world loads" to "the game
+runs": what the title waited for, and how each wait was found.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
