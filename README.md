@@ -52,6 +52,9 @@ it can and on first use where it must (shaders). See
 - [#3: single upstream pull requests](https://github.com/DesertGamer/VIctory-V2/issues/3): how to take one and how to report a clash.
 - [#4: hardware reports](https://github.com/DesertGamer/VIctory-V2/issues/4): how far it gets on your machine.
 
+Outside GitHub: Telegram `desertdev`, Discord `desert_gamer`, e-mail
+desert_gamer@icloud.com.
+
 ## Contributing, security, upstream
 
 - How to contribute: [CONTRIBUTING.md](CONTRIBUTING.md).

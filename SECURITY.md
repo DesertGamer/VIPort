@@ -11,6 +11,10 @@ Use **Report a vulnerability** on the repository's *Security* tab
 (<https://github.com/DesertGamer/VIctory-V2/security/advisories/new>).
 Please do not open a public issue or pull request for it.
 
+If that is not possible, write to desert_gamer@icloud.com. Do not put details
+of the problem in a public chat; ask on Telegram (`desertdev`) or Discord
+(`desert_gamer`) for a private conversation instead.
+
 Useful to include: what you found, where (file and line), how to trigger it,
 and what an attacker would gain.
 

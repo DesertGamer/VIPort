@@ -14,4 +14,6 @@ useful to each other.
 
 Comments, issues and pull requests that break these rules may be edited,
 hidden or closed, and repeat offenders may be blocked. To report a problem
-with someone's behaviour, contact the repository owner through GitHub.
+with someone's behaviour, contact the repository owner through GitHub, on
+Telegram (`desertdev`), on Discord (`desert_gamer`) or by e-mail
+(desert_gamer@icloud.com).
