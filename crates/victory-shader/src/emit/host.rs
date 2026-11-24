@@ -98,6 +98,27 @@ impl Host {
         }
     }
 
+    /// Whether this device's adapter is a software renderer (WARP / Microsoft
+    /// Basic Render Driver).
+    pub fn is_software(&self) -> bool {
+        // SAFETY: plain D3D12/DXGI adapter queries.
+        unsafe {
+            let luid = self.device.GetAdapterLuid();
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return false;
+            };
+            let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
+                return false;
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                return false;
+            };
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
+        }
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.

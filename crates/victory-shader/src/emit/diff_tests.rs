@@ -1435,6 +1435,7 @@ fn translated_compute_matches_pc() {
     let mut failures = Vec::new();
     let only = std::env::var("VICTORY_DIFF_ONLY").ok();
     let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let software = warp || host.is_software();
     for (name, src) in CS_CASES
         .iter()
         .filter(|c| only.as_ref().is_none_or(|o| o == c.0))
@@ -1465,7 +1466,7 @@ fn translated_compute_matches_pc() {
         let (root_t, pso_t) = match host.compute_pipeline(&cs_c) {
             Ok(p) => p,
             // WARP runs no fixed wave size of 64.
-            Err(e) if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") => {
+            Err(e) if software => {
                 eprintln!("{name}: skipped on WARP ({e})");
                 continue;
             }

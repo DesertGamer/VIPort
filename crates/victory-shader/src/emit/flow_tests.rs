@@ -361,6 +361,7 @@ fn run(pick: &dyn Fn(&str) -> bool) -> Vec<String> {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        let software = warp || host.is_software();
         for (name, src) in CS_CASES
             .iter()
             .filter(|c| only.as_ref().is_none_or(|o| o == c.0) && pick(c.0))
@@ -381,7 +382,7 @@ fn run(pick: &dyn Fn(&str) -> bool) -> Vec<String> {
             let (root_t, pso_t) = match host.compute_pipeline(&ours) {
                 Ok(p) => p,
                 // WARP runs no fixed wave size.
-                Err(e) if warp => {
+                Err(e) if software => {
                     eprintln!("{name}: skipped on WARP ({e})");
                     continue;
                 }
