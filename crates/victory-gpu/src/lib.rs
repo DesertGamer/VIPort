@@ -46,6 +46,8 @@ mod primitive;
 pub mod query;
 pub mod queue;
 pub mod resource;
+#[cfg(windows)]
+mod rgb9e5;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
