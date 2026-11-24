@@ -54,10 +54,7 @@ pub extern "system" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, si
         return host::get_module_file_name_w(module, out, size);
     };
     let wide: Vec<u16> = path.encode_utf16().collect();
-    // SAFETY: the title passes a buffer of `size` characters.
-    copy_truncated(&wide, unsafe {
-        std::slice::from_raw_parts_mut(out, size as usize)
-    })
+    copy_truncated(&wide, title_buffer(out, size))
 }
 
 /// See [`GetModuleFileNameW`].
@@ -68,10 +65,18 @@ pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, siz
     // The `A` functions speak the ANSI code page, as the host's do for its
     // own modules and as our narrow file functions decode (UTF-8 turned
     // folders outside ASCII into other names there).
-    // SAFETY: the title passes a buffer of `size` bytes.
-    copy_truncated(&to_ansi(&path), unsafe {
-        std::slice::from_raw_parts_mut(out, size as usize)
-    })
+    copy_truncated(&to_ansi(&path), title_buffer(out, size))
+}
+
+/// The title's buffer of `size` elements; none for a null pointer (a slice
+/// may not start at null, even an empty one, so `(NULL, 0)` would be
+/// undefined behaviour).
+fn title_buffer<'a, T>(out: *mut T, size: u32) -> &'a mut [T] {
+    if out.is_null() {
+        return &mut [];
+    }
+    // SAFETY: the title passes a buffer of `size` elements.
+    unsafe { std::slice::from_raw_parts_mut(out, size as usize) }
 }
 
 /// `text` in the ANSI code page (characters it lacks as `?`, as the host
@@ -809,6 +814,22 @@ mod tests {
                 GetLastError()
             };
             assert_eq!(err, ERROR_PROC_NOT_FOUND);
+        }
+    }
+
+    /// No buffer: nothing written, the error says it was too small.
+    #[test]
+    fn a_title_image_name_into_no_buffer() {
+        let base = 0x7300_0000_0000;
+        runtime::set_image_path(base, std::path::Path::new(r"C:\title\game.exe"));
+        let module = base as *mut c_void;
+        assert_eq!(GetModuleFileNameW(module, std::ptr::null_mut(), 0), 0);
+        assert_eq!(GetModuleFileNameA(module, std::ptr::null_mut(), 0), 0);
+        #[cfg(windows)]
+        {
+            // SAFETY: reads this thread's last error.
+            let last = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            assert_eq!(last, ERROR_INSUFFICIENT_BUFFER);
         }
     }
 }
