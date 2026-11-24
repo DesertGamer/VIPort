@@ -11,6 +11,9 @@ use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::{io, ir, range, resource, structure};
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -85,12 +88,19 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    try_lower_valu_cs(&words, 16, 1)
+}
 
+fn try_lower_valu_cs(
+    words: &[u32],
+    vgprs: u16,
+    threads_x: u32,
+) -> Result<HostShader, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 16,
+        vgprs,
         layout: vec![
             RootParam {
                 root: RootType::Constants,
@@ -121,7 +131,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [threads_x, 1, 1],
         }),
         code,
     };
@@ -163,6 +173,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         let ours = copy[4..20].to_vec();
         v.validate(&mut copy).expect("DXIL validation failed");
         assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+        eprintln!("DXIL validation passed");
     }
 
     Ok(shader)
@@ -218,6 +229,92 @@ fn run_cases(
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A uniform branch joins a restored VGPR spill with a directly computed
+/// mask. Each branch selects a different set of lanes in the same workgroup.
+#[test]
+fn wave32_spilled_mask_at_join() {
+    const THREADS: usize = 64;
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend(s_load_dwordx4(8, 4));
+    words.extend([
+        vop1(0x001, 10, vgpr(0)), // keep the thread ID
+        vop1(0x001, 0, 0x81),     // unselected lanes store 1
+    ]);
+    words.extend(vop3(0x0C4, 6, 128 + 40, vgpr(10), 0)); // s6 = thread ID < 40
+    words.extend(vop3(0x361, 20, sgpr(6), 0x81, 0)); // spill s6 into v20 lane 1
+    words.extend(vop3(0x0C4, 14, 128 + 24, vgpr(10), 0)); // s14 = thread ID < 24
+    words.extend([
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF84_0003, // s_cbranch_scc0 to the direct mask
+    ]);
+    words.extend(vop3(0x360, 12, vgpr(20), 0x81, 0)); // restore s12
+    words.extend([
+        0xBF82_0001,              // s_branch to the join
+        s_mov_b32(12, 14),        // direct mask on the other edge
+        0xBE90_3C0C,              // s_and_saveexec_b32 s16, s12
+        vop1(0x001, 0, 0x85),     // selected lanes store 5
+        sop2(0x10, 126, 126, 16), // s_or_b32 exec_lo, exec_lo, s16
+        0x3412_1482,              // v_lshlrev_b32 v9, 2, v10
+    ]);
+    let [lo, hi] = buffer_store_dword(0, 8, 0);
+    words.extend([lo | 1 << 12, hi | 9, S_ENDPGM]); // offen, byte address in v9
+    let shader = try_lower_valu_cs(&words, 32, THREADS as u32).expect("build");
+    let branch = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Constants && u.slot == 0 && u.dword == 0)
+        .expect("the shader reads the branch selector")
+        .index as usize;
+    let mut data = vec![0; shader.user_data_dwords().max(1) as usize];
+
+    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("WARP", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("{label}: no SM 6.6 device for the Wave32 mask-join test");
+            continue;
+        };
+        let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the feature query writes the matching options structure.
+        let support = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut waves).cast(),
+                size_of_val(&waves) as u32,
+            )
+        };
+        if support.is_err()
+            || !waves.WaveOps.as_bool()
+            || !(waves.WaveLaneCountMin..=waves.WaveLaneCountMax).contains(&32)
+        {
+            eprintln!("{label}: Wave32 unavailable for the mask-join test");
+            continue;
+        }
+        let (root, pipeline) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (selector, cutoff) in [(0, 40), (1, 24)] {
+            data[branch] = selector;
+            let out = host
+                .dispatch(
+                    &root,
+                    &pipeline,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(data.clone()))],
+                        views: &[View::RawUav(THREADS as u32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            for (lane, &value) in out[0][..THREADS].iter().enumerate() {
+                let expected = if lane < cutoff { 5 } else { 1 };
+                assert_eq!(value, expected, "{label}: branch {selector}, lane {lane}");
+            }
+            eprintln!("{label}: branch {selector}, all {THREADS} lane values matched");
+        }
+    }
 }
 
 fn is_f16_nan(bits: u16) -> bool {
