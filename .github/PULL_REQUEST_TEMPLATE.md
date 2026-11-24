@@ -10,7 +10,7 @@
 - [ ] No download, no started program, no network connection added (or an issue explains why)
 - [ ] `cargo test --workspace` passes
 - [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings` passes
-- [ ] `cargo fmt --all -- --check` passes
+- [ ] The code I wrote is formatted with `rustfmt`; I did not reformat lines I did not change
 
 ## What I ran
 

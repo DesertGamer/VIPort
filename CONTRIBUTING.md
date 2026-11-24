@@ -27,8 +27,11 @@ cargo xtask install-hooks
 copy victory.example.toml victory.toml
 cargo test --workspace
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo fmt --all -- --check
 ```
+
+The tree is not fully `rustfmt`-clean and CI does not check it. Format the
+code you write (`rustfmt.toml` is in the repository) but do not reformat files
+or lines you did not change.
 
 `cargo test --workspace` needs no game data. `victory.toml` is ignored by git;
 keep every path in it outside the repository.
