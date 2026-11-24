@@ -49,7 +49,10 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         })
         .filter(|e| e.file_type().is_file() && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE))
         .filter_map(|e| Some((e.path().to_owned(), std::fs::read(e.path()).ok()?)))
-        .filter(|(_, d)| d.starts_with(shaderpack::MAGIC) || !sources(d).is_empty())
+        // An archive may hold the pack without any discoverable shader containers.
+        .filter(|(_, d)| {
+            d.starts_with(shaderpack::MAGIC) || sgd5::is_sgd5(d) || !sources(d).is_empty()
+        })
         .collect();
     // It ships beside the shader databases.
     let found = (files.iter())
