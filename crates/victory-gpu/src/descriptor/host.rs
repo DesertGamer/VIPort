@@ -977,6 +977,10 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
+        if unordered && !typeless && !typed_store(own) {
+            once!(own, "an unordered view of a texture in a format the host cannot store");
+            return false;
+        }
         return !typeless;
     }
     let cast = castable.contains(&view);
@@ -984,7 +988,8 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         once!(view, own, "view format of another family");
         return false;
     }
-    if cast && family(view) != family(own) && unordered && !typed_store(view) {
+    let stored = if cast || typeless { view } else { own };
+    if unordered && !typed_store(stored) {
         once!(view, own, "an unordered view in a format the host cannot store");
         return false;
     }
