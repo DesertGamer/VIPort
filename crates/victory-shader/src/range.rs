@@ -411,7 +411,7 @@ mod tests {
                 vop1(0x43, 4, V + 8),         // v_movrels_b32 v4, v8
                 S_ENDPGM,
             ]);
-            let reads = vgprs(&p.blocks[0].insts[3].reads);
+            let reads = vgprs(p.blocks[0].insts[3].reads(&p));
             assert_eq!(reads, expected, "vector shift {shift}");
 
             let p = build_words(&[
@@ -421,7 +421,7 @@ mod tests {
                 S_ENDPGM,
             ]);
             assert_eq!(
-                vgprs(&p.blocks[0].insts[2].reads),
+                vgprs(p.blocks[0].insts[2].reads(&p)),
                 expected,
                 "scalar shift {shift}"
             );
@@ -437,7 +437,7 @@ mod tests {
             S_ENDPGM,
         ]);
         assert_eq!(
-            vgprs(&p.blocks[0].insts[4].reads),
+            vgprs(p.blocks[0].insts[4].reads(&p)),
             (8..16).chain([4]).collect::<Vec<u8>>()
         );
     }
