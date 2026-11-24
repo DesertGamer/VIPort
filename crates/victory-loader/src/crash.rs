@@ -9,16 +9,22 @@
 //! (`report_unhandled`, which the runtime calls ahead of the title's own)
 //! and appended to the crash log, with the title's last debug output, which
 //! often states the reason. Panics of ours go to the crash log too.
+//!
+//! The vectored handler also does the job of AMD-only instructions Intel
+//! CPUs lack, and an emulated `clzero` whose write faults gives that fault to
+//! the title at its own instruction.
 
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
+    STATUS_GUARD_PAGE_VIOLATION, STATUS_IN_PAGE_ERROR,
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
-    RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_POINTERS,
+    EXCEPTION_RECORD, M128A, RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter,
+    UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -115,9 +121,11 @@ pub fn report_crashes() {
         unsafe { report_unhandled(info) };
         EXCEPTION_CONTINUE_SEARCH
     }
-    // SAFETY: registers handlers that only read the exception they are
-    // given; the title's own filter, once it sets one, takes the place of
-    // ours and calls `report_unhandled` first.
+    // SAFETY: registers a handler that reads the exception it is given and,
+    // for an instruction it emulates or a store of `zero_line` it recovers,
+    // rewrites that thread's context and record, which belong to the
+    // dispatch for its duration; the title's own filter, once it sets one,
+    // takes the place of ours and calls `report_unhandled` first.
     unsafe {
         AddVectoredExceptionHandler(0, Some(handler));
         SetUnhandledExceptionFilter(Some(filter));
@@ -137,19 +145,45 @@ const FATAL: [i32; 6] = [
 /// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
 /// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
 /// line at `rax`; `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so
-/// a spin loop around them works with mwaitx as a yield.
+/// a spin loop around them works with mwaitx as a yield. Where `clzero`'s
+/// write faults, the emulated write raises the fault the real instruction
+/// raised on Zen 5 (see [`zero_line`]): the emulation then declines and puts
+/// that fault, the hardware's own, in the title's record, so the handlers
+/// after ours see it at the title's `clzero`. An attached debugger (first
+/// chance) and any vectored handler registered ahead of ours (the GPU
+/// write-watch handler) see only the nested fault inside
+/// `victory_zero_line`, never the one at the title's `clzero`. That one goes
+/// to the vectored handlers after ours, the title's frame handlers and the
+/// unhandled-exception filter.
+///
+/// # Safety
+/// `info` points at an exception being dispatched; for a `clzero` whose line
+/// may fault, the vectored handler is installed (it is the only caller
+/// outside tests).
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
-    // SAFETY: the system passes valid exception pointers; the faulting
-    // instruction's bytes are readable, as the CPU just fetched them.
+    // SAFETY: the caller passes valid exception pointers; the faulting
+    // instruction's bytes are readable, as the CPU just fetched them. The
+    // exception and context records belong to this thread's dispatch for the
+    // handler's duration and nothing else touches them, so writing them
+    // through `&mut` is sound. `zero_line` stores only to the line the
+    // title's `clzero` names, as the instruction itself would, and the
+    // caller installed the handler that recovers that store if it faults.
     unsafe {
-        let record = &*(*info).ExceptionRecord;
+        let record = &mut *(*info).ExceptionRecord;
         let context = &mut *(*info).ContextRecord;
         if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION {
             return false;
         }
         let code = context.Rip as *const u8;
         match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
+            [0x0f, 0x01, 0xfc] => {
+                if let Err(fault) = zero_line(context.Rax) {
+                    record.ExceptionCode = fault.ExceptionCode;
+                    record.NumberParameters = fault.NumberParameters;
+                    record.ExceptionInformation = fault.ExceptionInformation;
+                    return false;
+                }
+            }
             [0x0f, 0x01, 0xfa] => {}
             [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
             _ => {
@@ -189,6 +223,131 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         }
         context.Rip += 3;
     }
+    true
+}
+
+/// The bytes `clzero` zeroes, aligned to their size (AMD's manual allows other
+/// sizes; Zen's is 64).
+const CLZERO_LINE_BYTES: u64 = 64;
+
+// `victory_zero_line(line: u64 /* rcx */, fault: *mut EXCEPTION_RECORD /* rdx */)
+// -> bool`: eight 8-byte stores of zero to `line`, then true. A store that
+// faults is resumed at `victory_zero_line_recovered` by `recover_line_fault`,
+// which has written `*fault` (`rdx` is left alone for it), and returns false.
+// A leaf that touches no stack and no nonvolatile register, so it needs no
+// unwind data. A line aligned to its 64 bytes lies inside one page, so the
+// stores fault together unless another thread changes the page between them,
+// which can leave the line partly zeroed.
+std::arch::global_asm!(
+    ".text",
+    ".p2align 4",
+    ".globl victory_zero_line",
+    "victory_zero_line:",
+    "    xor eax, eax",
+    ".globl victory_zero_line_stores",
+    "victory_zero_line_stores:",
+    "    mov qword ptr [rcx], rax",
+    "    mov qword ptr [rcx + 8], rax",
+    "    mov qword ptr [rcx + 16], rax",
+    "    mov qword ptr [rcx + 24], rax",
+    "    mov qword ptr [rcx + 32], rax",
+    "    mov qword ptr [rcx + 40], rax",
+    "    mov qword ptr [rcx + 48], rax",
+    "    mov qword ptr [rcx + 56], rax",
+    ".globl victory_zero_line_stored",
+    "victory_zero_line_stored:",
+    "    mov eax, 1",
+    "    ret",
+    ".globl victory_zero_line_recovered",
+    "victory_zero_line_recovered:",
+    "    xor eax, eax",
+    "    ret",
+);
+
+// The routine's eight 8-byte stores write exactly one line.
+const _: () = assert!(CLZERO_LINE_BYTES == 8 * 8);
+
+unsafe extern "C" {
+    fn victory_zero_line(line: u64, fault: *mut EXCEPTION_RECORD) -> bool;
+    /// The routine's first store.
+    #[link_name = "victory_zero_line_stores"]
+    static ZERO_LINE_STORES: u8;
+    /// Just past the routine's last store.
+    #[link_name = "victory_zero_line_stored"]
+    static ZERO_LINE_STORED: u8;
+    /// Where a faulting store resumes, to return false.
+    #[link_name = "victory_zero_line_recovered"]
+    static ZERO_LINE_RECOVERED: u8;
+}
+
+/// The faults a store of [`zero_line`]'s routine recovers. A stack overflow
+/// (a store into this thread's last stack guard page) is not one of them and
+/// ends the process as before. Anything else inside the routine (a data
+/// breakpoint's single step) is not the store's.
+const STORE_FAULTS: [i32; 3] = [
+    EXCEPTION_ACCESS_VIOLATION,
+    STATUS_GUARD_PAGE_VIOLATION,
+    STATUS_IN_PAGE_ERROR,
+];
+
+/// Zeroes the line that holds `rax` (its [`CLZERO_LINE_BYTES`] bytes, aligned
+/// to their size) as `clzero` would, or returns the record of the fault its
+/// write raised, the
+/// hardware's own. On a Ryzen 7 9800X3D (Zen 5), with `rax` = line + 5, the
+/// real `clzero` raised the same records: a write access violation
+/// `[1, line]` for a no-access, read-only or kernel-half line,
+/// `[0, usize::MAX]` for a non-canonical `rax`, and a guard-page violation
+/// `[1, line]` that clears the guard bit, after which a retry faults or
+/// writes as the page allows. The console's Zen 2 is not measured. A guard
+/// page on this thread's stack is grown by the kernel as it would be for the
+/// title.
+///
+/// # Safety
+/// The title may write the line (a store there is what its `clzero` does).
+/// If the store may fault, the vectored handler, which calls
+/// [`recover_line_fault`], is installed; otherwise the fault goes on
+/// unrecovered.
+#[expect(
+    clippy::result_large_err,
+    reason = "only a faulting clzero returns it, and its code and parameters go to the title's \
+              record; boxing it would allocate inside an exception handler"
+)]
+unsafe fn zero_line(rax: u64) -> Result<(), EXCEPTION_RECORD> {
+    let line = rax & !(CLZERO_LINE_BYTES - 1);
+    // SAFETY: a zeroed EXCEPTION_RECORD is valid.
+    let mut fault: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+    // SAFETY: the routine stores only to the line's `CLZERO_LINE_BYTES`, which the caller
+    // lets it write; a store that faults is recovered by `recover_line_fault`
+    // in the vectored handler, which the caller installed if the store may
+    // fault, and which writes `fault`, alive until the call returns.
+    let zeroed = unsafe { victory_zero_line(line, &raw mut fault) };
+    if zeroed { Ok(()) } else { Err(fault) }
+}
+
+/// For a store fault in [`zero_line`]'s routine: writes the fault's record
+/// through the routine's `fault` argument and resumes it at its recovery
+/// label, which returns false. It runs nested inside the handler that called
+/// the routine, so it neither logs, allocates nor locks.
+///
+/// # Safety
+/// `info` comes from the system, for an exception being dispatched.
+unsafe fn recover_line_fault(info: *mut EXCEPTION_POINTERS) -> bool {
+    let stores = (&raw const ZERO_LINE_STORES).addr();
+    let stored = (&raw const ZERO_LINE_STORED).addr();
+    // SAFETY: the system passes valid exception pointers; the records belong
+    // to this thread's dispatch for the handler's duration.
+    let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+    if !STORE_FAULTS.contains(&record.ExceptionCode)
+        || !(stores..stored).contains(&(context.Rip as usize))
+    {
+        return false;
+    }
+    // SAFETY: the handler recognises the routine by the address of its
+    // stores, which run only inside `zero_line`'s call; the routine leaves
+    // `rdx` as `zero_line` passed it, an `EXCEPTION_RECORD` alive until that
+    // call returns.
+    unsafe { (context.Rdx as *mut EXCEPTION_RECORD).write(*record) };
+    context.Rip = (&raw const ZERO_LINE_RECOVERED).addr() as u64;
     true
 }
 
@@ -358,8 +517,8 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
-    if unsafe { emulate_amd_only(info) } {
-        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    if unsafe { recover_line_fault(info) || emulate_amd_only(info) } {
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
     // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
@@ -652,8 +811,9 @@ fn memory_at(address: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Foundation::EXCEPTION_SINGLE_STEP;
     use windows_sys::Win32::System::Diagnostics::Debug::{
-        EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
+        RtlCaptureContext, RtlCaptureStackBackTrace,
     };
 
     #[test]
@@ -818,14 +978,28 @@ mod tests {
     /// the number of bytes that the emulation skipped, or `None` if it did
     /// not emulate the instruction. `xmm` gets the saved registers after.
     fn emulate_as(exception: i32, code: &[u8], rax: u64, xmm: &mut [M128A; 16]) -> Option<u64> {
+        let (emulated, skipped, _) = emulate_with_record(exception, code, rax, xmm);
+        emulated.then_some(skipped)
+    }
+
+    /// [`emulate_as`], also returning whether the emulation took the
+    /// instruction, the bytes it moved `Rip` by either way, and the exception
+    /// record it leaves.
+    fn emulate_with_record(
+        exception: i32,
+        code: &[u8],
+        rax: u64,
+        xmm: &mut [M128A; 16],
+    ) -> (bool, u64, EXCEPTION_RECORD) {
         // `int3` after the instruction, so that a decoder that reads too
         // far sees no valid bytes.
         let mut bytes = [0xcc_u8; 16];
         bytes[..code.len()].copy_from_slice(code);
         let start = bytes.as_ptr() as u64;
         // SAFETY: a zeroed record and context are valid; the emulation
-        // reads only `bytes` and writes only `context` (and memory at
-        // `rax` for clzero, which the caller owns).
+        // reads only `bytes` and writes only the record and `context` (and
+        // the line at `rax` for clzero, which the caller may write, or whose
+        // store faults and is recovered by the handler the caller installed).
         unsafe {
             let mut record: EXCEPTION_RECORD = std::mem::zeroed();
             record.ExceptionCode = exception;
@@ -839,7 +1013,7 @@ mod tests {
             };
             let emulated = emulate_amd_only(&mut pointers);
             *xmm = context.Anonymous.FltSave.XmmRegisters;
-            emulated.then(|| context.Rip - start)
+            (emulated, context.Rip - start, record)
         }
     }
 
@@ -861,6 +1035,274 @@ mod tests {
         assert_eq!(emulate(&[0x0f, 0x01, 0xfc], at, &mut xmm), Some(3));
         assert!(line.0[..64].iter().all(|&b| b == 0));
         assert!(line.0[64..].iter().all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn zero_line_zeroes_the_whole_line_that_holds_its_address() {
+        #[repr(align(64))]
+        struct Line([u8; 128]);
+        let mut line = Line([0xff; 128]);
+        let inside = line.0.as_mut_ptr().wrapping_add(5) as u64;
+        // SAFETY: the store goes to the first 64 bytes of `line`, ours and writable.
+        let zeroed = unsafe { zero_line(inside) };
+        assert!(zeroed.is_ok());
+        assert!(line.0[..64].iter().all(|&b| b == 0));
+        assert!(line.0[64..].iter().all(|&b| b == 0xff));
+    }
+
+    /// Gives `record` to `recover_line_fault` as if raised at `rip`, with the
+    /// routine's `fault` argument pointing at a record of code 0x1234.
+    /// Returns whether it recovered, `Rip` after, and the argument's record.
+    fn recover_as(mut record: EXCEPTION_RECORD, rip: u64) -> (bool, u64, EXCEPTION_RECORD) {
+        // SAFETY: zeroed records and context are valid; `recover_line_fault`
+        // reads the record and context and writes only the context and
+        // through `Rdx`, at `fault`, ours.
+        unsafe {
+            let mut fault: EXCEPTION_RECORD = std::mem::zeroed();
+            fault.ExceptionCode = 0x1234;
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = rip;
+            context.Rdx = (&raw mut fault).addr() as u64;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut context,
+            };
+            let recovered = recover_line_fault(&mut pointers);
+            (recovered, context.Rip, fault)
+        }
+    }
+
+    #[test]
+    fn a_single_step_inside_the_line_stores_is_not_a_store_fault() {
+        // A data breakpoint on the first store leaves `Rip` at the second.
+        let second_store = (&raw const ZERO_LINE_STORES).addr() as u64 + 3;
+        // SAFETY: a zeroed record is valid.
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = EXCEPTION_SINGLE_STEP;
+        let (recovered, rip, fault) = recover_as(record, second_store);
+        assert!(!recovered);
+        assert_eq!(rip, second_store);
+        assert_eq!(fault.ExceptionCode, 0x1234);
+    }
+
+    #[test]
+    fn a_store_fault_keeps_its_whole_record() {
+        let first_store = (&raw const ZERO_LINE_STORES).addr() as u64;
+        // SAFETY: a zeroed record is valid.
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = STATUS_IN_PAGE_ERROR;
+        record.NumberParameters = 3;
+        // A write at 0x1000 whose page read failed with STATUS_DEVICE_NOT_CONNECTED.
+        record.ExceptionInformation[..3].copy_from_slice(&[1, 0x1000, 0xc000_009d]);
+        let (recovered, rip, fault) = recover_as(record, first_store);
+        assert!(recovered);
+        assert_eq!(rip, (&raw const ZERO_LINE_RECOVERED).addr() as u64);
+        assert_eq!(fault.ExceptionCode, STATUS_IN_PAGE_ERROR);
+        assert_eq!(fault.NumberParameters, 3);
+        assert_eq!(fault.ExceptionInformation[..3], [1, 0x1000, 0xc000_009d]);
+    }
+
+    // `victory_test_clzero(rax: u64)`: `ud2`, then a `clzero` of `rax`, then
+    // returns. A leaf without stack use, so it needs no unwind data.
+    std::arch::global_asm!(
+        ".text",
+        ".globl victory_test_clzero",
+        "victory_test_clzero:",
+        "    mov rax, rcx",
+        ".globl victory_test_clzero_ud2",
+        "victory_test_clzero_ud2:",
+        "    ud2",
+        ".globl victory_test_clzero_instruction",
+        "victory_test_clzero_instruction:",
+        "    .byte 0x0f, 0x01, 0xfc",
+        "    ret",
+    );
+
+    unsafe extern "C" {
+        fn victory_test_clzero(rax: u64);
+        #[link_name = "victory_test_clzero_ud2"]
+        static TEST_CLZERO_UD2: u8;
+        #[link_name = "victory_test_clzero_instruction"]
+        static TEST_CLZERO_INSTRUCTION: u8;
+    }
+
+    /// Ahead of ours: turns the stub's `ud2` into the illegal instruction an
+    /// Intel CPU raises at its `clzero`, which this CPU would run natively.
+    unsafe extern "system" fn clzero_is_illegal(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: the system passes valid exception pointers, for this
+        // thread's dispatch.
+        let (record, context) =
+            unsafe { (&mut *(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+        let ud2 = (&raw const TEST_CLZERO_UD2).addr() as u64;
+        if record.ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && context.Rip == ud2 {
+            let clzero = (&raw const TEST_CLZERO_INSTRUCTION).cast_mut();
+            context.Rip = clzero.addr() as u64;
+            record.ExceptionAddress = clzero.cast();
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    /// What the title's handler saw at the stub's `clzero`: code, parameter
+    /// count, the first two parameters, exception address, `Rip`.
+    type TitleSaw = (i32, u32, [usize; 2], usize, u64);
+    static TITLE_SAW: std::sync::Mutex<Option<TitleSaw>> = std::sync::Mutex::new(None);
+    static TITLE_CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// After ours, as the title's: notes the fault at the stub's `clzero`,
+    /// makes its page writable and goes back to the `ud2`, so the `clzero`
+    /// is emulated again.
+    unsafe extern "system" fn title_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        // SAFETY: the system passes valid exception pointers, for this
+        // thread's dispatch.
+        let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+        if context.Rip != (&raw const TEST_CLZERO_INSTRUCTION).addr() as u64 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // A second call means the first did not fix the fault: decline, so
+        // the child dies rather than loops.
+        if TITLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let [kind, address, ..] = record.ExceptionInformation;
+        let saw = (
+            record.ExceptionCode,
+            record.NumberParameters,
+            [kind, address],
+            record.ExceptionAddress.addr(),
+            context.Rip,
+        );
+        *TITLE_SAW.lock().unwrap_or_else(|e| e.into_inner()) = Some(saw);
+        let mut old = 0;
+        // SAFETY: changes the protection of the test's own page at `address`.
+        unsafe { VirtualProtect(address as *const _, 1, PAGE_READWRITE, &mut old) };
+        context.Rip = (&raw const TEST_CLZERO_UD2).addr() as u64;
+        EXCEPTION_CONTINUE_EXECUTION
+    }
+
+    /// In a child process of the next test (a store that faults in the
+    /// emulation would end the test process): gives the emulation `clzero`s
+    /// whose write faults. The expected records are those the real
+    /// instruction gave on a Ryzen 7 9800X3D (Zen 5) with `rax` = line + 5.
+    #[test]
+    fn clzero_child() {
+        use windows_sys::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+            VirtualAlloc, VirtualProtect,
+        };
+        if std::env::var_os("VICTORY_CLZERO_CHILD").is_none() {
+            return;
+        }
+        // The handler recovers a store of the emulation that faults.
+        report_crashes();
+        // The exception the emulation leaves for a clzero with `rax`, or
+        // `None` when it zeroed the line and stepped past the instruction.
+        let clzero = |rax: u64| {
+            let mut xmm = [reg(0, 0); 16];
+            let code = [0x0f, 0x01, 0xfc];
+            let (emulated, skipped, record) =
+                emulate_with_record(EXCEPTION_ILLEGAL_INSTRUCTION, &code, rax, &mut xmm);
+            if emulated {
+                assert_eq!(skipped, 3, "rax {rax:#x}");
+                return None;
+            }
+            assert_eq!(skipped, 0, "rax {rax:#x}");
+            assert_eq!(record.NumberParameters, 2, "rax {rax:#x}");
+            let [kind, address, ..] = record.ExceptionInformation;
+            Some((record.ExceptionCode, [kind, address]))
+        };
+        let violation = |information| Some((EXCEPTION_ACCESS_VIOLATION, information));
+        let guard = |line| Some((STATUS_GUARD_PAGE_VIOLATION, [1, line]));
+        // SAFETY: reserves three pages of ours and commits two, then
+        // allocates three more pages; only the emulation's stores, the
+        // handlers above and this test touch them.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x3000, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!base.is_null());
+            let commit = |i: usize, protect| {
+                let at = base.cast::<u8>().add(i * 0x1000);
+                assert!(!VirtualAlloc(at.cast(), 0x1000, MEM_COMMIT, protect).is_null());
+            };
+            commit(1, PAGE_NOACCESS);
+            commit(2, PAGE_READONLY);
+            // Each its own allocation: a guard page committed inside a
+            // no-access reservation gives an access violation without the
+            // guard fault, for the real instruction too.
+            let allocate = |protect| {
+                let at = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, protect);
+                assert!(!at.is_null());
+                at.cast::<u8>()
+            };
+            let pages = [
+                base.cast::<u8>(),
+                base.cast::<u8>().add(0x1000),
+                base.cast::<u8>().add(0x2000),
+                allocate(PAGE_READONLY | PAGE_GUARD),
+                allocate(PAGE_READWRITE),
+                allocate(PAGE_READWRITE),
+            ];
+            let page = |i: usize| pages[i];
+            // Pages 4 and 5 hold 0xff; page 4 then becomes a guard page,
+            // not on this thread's stack, and page 5 no-access.
+            page(4).write_bytes(0xff, 0x1000);
+            page(5).write_bytes(0xff, 0x1000);
+            let mut old = 0;
+            let (guarded, closed) = (PAGE_READWRITE | PAGE_GUARD, PAGE_NOACCESS);
+            assert_ne!(VirtualProtect(page(4).cast(), 0x1000, guarded, &mut old), 0);
+            assert_ne!(VirtualProtect(page(5).cast(), 0x1000, closed, &mut old), 0);
+            let line = |i: usize| page(i) as usize + 0x40;
+            let rax = |i: usize| line(i) as u64 + 5;
+            for i in 0..3 {
+                assert_eq!(clzero(rax(i)), violation([1, line(i)]), "page {i}");
+            }
+            // Not canonical with 48-bit or with 57-bit addresses.
+            assert_eq!(clzero(0x8000_0000_0000_0005), violation([0, usize::MAX]));
+            // Canonical, in the kernel half.
+            let kernel_line = 0xffff_8000_0000_0000;
+            assert_eq!(clzero(kernel_line as u64 + 5), violation([1, kernel_line]));
+            // A guard page faults first and loses its guard bit; then the
+            // page's own protection decides.
+            assert_eq!(clzero(rax(3)), guard(line(3)));
+            assert_eq!(clzero(rax(3)), violation([1, line(3)]));
+            assert_eq!(clzero(rax(4)), guard(line(4)));
+            assert_eq!(page(4).add(0x40).read(), 0xff);
+            assert_eq!(clzero(rax(4)), None);
+            let page4 = std::slice::from_raw_parts(page(4), 0x1000);
+            assert!(page4[0x40..0x80].iter().all(|&b| b == 0));
+            assert!(page4[0x80..].iter().all(|&b| b == 0xff));
+            // Through the real handlers, as on an Intel CPU: the title's
+            // handler sees the fault at its clzero, makes the page writable,
+            // and the clzero runs again.
+            let front = AddVectoredExceptionHandler(1, Some(clzero_is_illegal));
+            let back = AddVectoredExceptionHandler(0, Some(title_handler));
+            assert!(!front.is_null() && !back.is_null());
+            victory_test_clzero(rax(5));
+            assert_ne!(RemoveVectoredExceptionHandler(front), 0);
+            assert_ne!(RemoveVectoredExceptionHandler(back), 0);
+            let at = (&raw const TEST_CLZERO_INSTRUCTION).addr();
+            let saw = *TITLE_SAW.lock().unwrap();
+            let expected = (EXCEPTION_ACCESS_VIOLATION, 2, [1, line(5)], at, at as u64);
+            assert_eq!(saw, Some(expected));
+            assert_eq!(TITLE_CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let page5 = std::slice::from_raw_parts(page(5), 0x1000);
+            assert!(page5[..0x40].iter().all(|&b| b == 0xff));
+            assert!(page5[0x40..0x80].iter().all(|&b| b == 0));
+            assert!(page5[0x80..].iter().all(|&b| b == 0xff));
+        }
+    }
+
+    #[test]
+    fn emulated_clzero_raises_the_fault_of_its_write() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash::tests::clzero_child", "--nocapture"])
+            .env("VICTORY_CLZERO_CHILD", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{:?}: {text}", out.status);
+        let ran = "test crash::tests::clzero_child ... ok";
+        assert!(text.contains(ran), "expected `{ran}` in: {text}");
     }
 
     #[test]
