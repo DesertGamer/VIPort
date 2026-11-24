@@ -641,6 +641,10 @@ struct Deferred {
     resolves: Vec<Resolved>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Texture read-backs, copied into title memory once the list has run:
+    /// mapped read-back memory, title address, bytes. Their buffers are in
+    /// `uploads`.
+    readbacks: Vec<(usize, usize, usize)>,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
@@ -988,6 +992,16 @@ impl Host {
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // Textures the title copied into its buffers: the GPU has written
+        // the read-back buffers by now.
+        for list in runs {
+            for &(from, to, len) in &list.deferred().readbacks {
+                // SAFETY: a mapped read-back buffer of at least `len` bytes,
+                // kept by the list, and a range inside a title buffer.
+                unsafe { std::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, len) };
+                COPY_BACK[1].fetch_add(len as u64, Ordering::Relaxed);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
         for list in runs {
@@ -1720,6 +1734,17 @@ impl HostList {
         Some((buffer, data))
     }
 
+    /// A read-back buffer of `size` bytes, alive until the list is reset,
+    /// whose contents go to title memory at `to` once the list has run.
+    pub(crate) fn read_back(&self, host: &Host, size: u64, to: *mut u8) -> Option<ID3D12Resource> {
+        let (buffer, data) = host.read_back_buffer(size)?;
+        name(&buffer, || format!("list read-back {size:#x}"));
+        let mut deferred = self.deferred();
+        deferred.uploads.push(buffer.clone());
+        deferred.readbacks.push((data as usize, to as usize, size as usize));
+        Some(buffer)
+    }
+
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
@@ -2121,8 +2146,22 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_buffer(size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)
+    }
+
+    /// A buffer in the read-back heap, mapped for reading.
+    pub(crate) fn read_back_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_buffer(size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST)
+    }
+
+    fn mapped_buffer(
+        &self,
+        size: u64,
+        kind: D3D12_HEAP_TYPE,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
+            Type: kind,
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
@@ -2147,7 +2186,7 @@ impl Host {
                     &heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    state,
                     None,
                     &mut buffer,
                 )
@@ -2159,7 +2198,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
+                tracing::warn!(error = %e, size, kind = kind.0, "no mapped buffer");
                 None
             }
         }
