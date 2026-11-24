@@ -1453,3 +1453,71 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+#[test]
+fn valu_bit_and_pack_ops_match_rdna2() {
+    // VOP3: v_bfm_b32 = 0x363, v_bcnt_u32_b32 = 0x364, v_cvt_pk_u8_f32 = 0x15e.
+    // VOP1: v_ffbl_b32 = 0x03a.
+    let bfm = build_valu_cs(&vop3(0x363, 0, vgpr(1), vgpr(2), 0));
+    let bcnt = build_valu_cs(&vop3(0x364, 0, vgpr(1), vgpr(2), 0));
+    let ffbl = build_valu_cs(&[vop1(0x03a, 0, vgpr(1))]);
+    let pk_u8 = build_valu_cs(&vop3(0x15e, 0, vgpr(1), vgpr(2), vgpr(3)));
+
+    let bfm_cases: &[([u32; 4], u32)] = &[
+        ([0, 0, 0, 0], 0),
+        ([1, 0, 0, 0], 1),
+        ([8, 16, 0, 0], 0x00FF_0000),
+        ([31, 1, 0, 0], 0xFFFF_FFFE),
+        ([32, 0, 0, 0], 0), // src0[4:0] == 0
+        ([33, 33, 0, 0], 2),
+    ];
+    let bfm_in: Vec<[u32; 4]> = bfm_cases.iter().map(|c| c.0).collect();
+    run_cases(&bfm, &bfm_in, |backend, i, inp, got| {
+        let want = bfm_cases[i].1;
+        assert_eq!(got, want, "{backend}: v_bfm_b32({}, {})", inp[0], inp[1]);
+    });
+
+    let bcnt_cases: &[([u32; 4], u32)] = &[
+        ([0, 0, 0, 0], 0),
+        ([0, 42, 0, 0], 42),
+        ([u32::MAX, 10, 0, 0], 42),
+        ([0xA5A5_5A5A, u32::MAX, 0, 0], 15),
+    ];
+    let bcnt_in: Vec<[u32; 4]> = bcnt_cases.iter().map(|c| c.0).collect();
+    run_cases(&bcnt, &bcnt_in, |backend, i, inp, got| {
+        let want = bcnt_cases[i].1;
+        assert_eq!(got, want, "{backend}: v_bcnt_u32_b32({:#x}, {})", inp[0], inp[1]);
+    });
+
+    let ffbl_cases: &[([u32; 4], u32)] = &[
+        ([0, 0, 0, 0], u32::MAX),
+        ([1, 0, 0, 0], 0),
+        ([0x8000_0000, 0, 0, 0], 31),
+        ([0x0010_0000, 0, 0, 0], 20),
+        ([0xFFFF_FFF0, 0, 0, 0], 4),
+    ];
+    let ffbl_in: Vec<[u32; 4]> = ffbl_cases.iter().map(|c| c.0).collect();
+    run_cases(&ffbl, &ffbl_in, |backend, i, inp, got| {
+        let want = ffbl_cases[i].1;
+        assert_eq!(got, want, "{backend}: v_ffbl_b32({:#x})", inp[0]);
+    });
+
+    let pk_cases: &[([u32; 4], u32)] = &[
+        ([2.5f32.to_bits(), 0, 0x1122_3344, 0], 0x1122_3302), // round-to-even -> 2
+        ([3.5f32.to_bits(), 1, 0x1122_3344, 0], 0x1122_0444), // round-to-even -> 4
+        ([(-5.0f32).to_bits(), 2, 0x1122_3344, 0], 0x1100_3344), // clamp >= 0
+        ([300.0f32.to_bits(), 3, 0x1122_3344, 0], 0xFF22_3344), // clamp <= 255
+        ([255.0f32.to_bits(), 4, 0x1122_3344, 0], 0x1122_33FF), // byte index masked & 3
+    ];
+    let pk_in: Vec<[u32; 4]> = pk_cases.iter().map(|c| c.0).collect();
+    run_cases(&pk_u8, &pk_in, |backend, i, inp, got| {
+        let want = pk_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_pk_u8_f32({}, {}, {:#x}) = {got:#010x}, want {want:#010x}",
+            f32::from_bits(inp[0]),
+            inp[1],
+            inp[2],
+        );
+    });
+}
