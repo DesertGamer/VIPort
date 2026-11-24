@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security problem
+    url: https://github.com/DesertGamer/VIctory-V2/security/advisories/new
+    about: Report it privately, not in a public issue. See SECURITY.md.
+  - name: The original project
+    url: https://github.com/Marvisak/VIctory
+    about: A fix that is useful to everyone belongs there too.

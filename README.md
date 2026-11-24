@@ -1,4 +1,22 @@
-# VIctory
+# VIctory V2
+
+[![Telegram](https://img.shields.io/badge/Telegram-@desertdev-26A5E4?logo=telegram&logoColor=white)](https://t.me/desertdev)
+![Discord](https://img.shields.io/badge/Discord-desert__gamer-5865F2?logo=discord&logoColor=white)
+[![E-mail](https://img.shields.io/badge/E--mail-desert__gamer@icloud.com-3693F3?logo=icloud&logoColor=white)](mailto:desert_gamer@icloud.com)
+[![Issues](https://img.shields.io/github/issues/DesertGamer/VIctory-V2?logo=github)](https://github.com/DesertGamer/VIctory-V2/issues)
+
+> **This is VIctory V2, an integration fork of
+> [Marvisak/VIctory](https://github.com/Marvisak/VIctory).**
+>
+> VIctory is developed in the open and receives a lot of community pull
+> requests (shader lowering, GPU fixes, HLE, formats, tooling). A big queue of
+> them builds up faster than one maintainer can review. V2 exists to put those
+> contributions together in one tree that builds, passes the tests, and can be
+> tried today, without waiting for each one to land upstream.
+>
+> **V2 is not the official project and is not endorsed by its author.** The
+> original lives at the link above; its history is kept here intact, and V2 is
+> synchronized from it.
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
@@ -8,10 +26,61 @@ the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
 
+## What V2 changes
+
+- **Community pull requests, merged.** Open upstream PRs are merged into V2 in
+  batches. The authors of the original commits stay the authors in the history.
+- **Reviewed before merging.** Every PR is checked first for things that do not
+  belong in a code change: binary files and archives, build scripts
+  (`build.rs`), git hooks, `.cargo` configuration, shell/PowerShell/batch
+  scripts, downloads, and new dependencies. PRs with such content are not taken
+  without a manual read of the diff.
+- **Tested after every batch.** `cargo test --workspace` runs after each batch.
+  If a batch fails, the PR that caused it is found and dealt with before
+  anything else is merged.
+- **Conflicts are resolved, not hidden.** When two PRs are fine alone but
+  contradict each other (they change the same behaviour in different ways), V2
+  keeps one and records why in the commit message of the change that removes
+  the other.
+
+## What V2 does not do
+
+- It does not contain, and will never contain, any game data. The asset policy
+  from upstream applies unchanged: see
+  [docs/asset-policy.md](docs/asset-policy.md). You supply your own files.
+- It does not promise that the game is playable. See *Status* below.
+
+## Where to talk
+
+- [#1: entering the world fails with a GPU device removed](https://github.com/DesertGamer/VIctory-V2/issues/1): the main blocker; post diagnostics and findings here.
+- [#2: what is merged into V2 and what is not](https://github.com/DesertGamer/VIctory-V2/issues/2): the list of merged bundles and of those that still need a hand merge.
+- [#3: single upstream pull requests](https://github.com/DesertGamer/VIctory-V2/issues/3): how to take one and how to report a clash.
+- [#4: hardware reports](https://github.com/DesertGamer/VIctory-V2/issues/4): how far it gets on your machine.
+
+Outside GitHub: Telegram `desertdev`, Discord `desert_gamer`, e-mail
+desert_gamer@icloud.com.
+
+## Contributing, security, upstream
+
+- How to contribute: [CONTRIBUTING.md](CONTRIBUTING.md).
+- Found a security problem: [SECURITY.md](SECURITY.md). This code runs inside a
+  process with your user's rights, so please read it before reporting in public.
+- V2 keeps the upstream repository as a remote and merges its `main` regularly.
+  A fix that is useful to everyone belongs upstream too: if you send a change
+  to V2, consider sending it to the original project as well.
+
 ## Status (2026-11-24)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps,
 loads the world and shows it: slowly, and with rendering defects.
+
+V2, 2026-11-25: on entering the world the host GPU still fails with a device
+removed error, as on upstream, and frames still take seconds. Frame figures
+differ a lot from one log line to the next, so V2 makes no claim that it
+renders more than upstream; that needs a measurement under the same conditions.
+
+The tables below are upstream's findings of 2026-11-23; V2 has not re-measured
+them.
 
 | Stage | State |
 |-------|-------|
