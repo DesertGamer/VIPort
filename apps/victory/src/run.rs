@@ -47,9 +47,17 @@ pub fn run(
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
+    // The exe may sit apart from the dump; the manifest and the package's
+    // virtual drive belong to the configured game directory then.
+    let content_dir = cfg
+        .game_dir
+        .as_deref()
+        .filter(|d| d.is_dir())
+        .unwrap_or(title_dir);
     // A missing manifest leaves id 0 and no storage quota.
-    let manifest =
-        std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
+    let manifest = std::fs::read_to_string(title_dir.join("MicrosoftGame.config"))
+        .or_else(|_| std::fs::read_to_string(content_dir.join("MicrosoftGame.config")))
+        .unwrap_or_default();
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
@@ -59,7 +67,7 @@ pub fn run(
         title.storage_bytes >> 20
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
-    victory_hle::modules::files::mount_at('G', title_dir);
+    victory_hle::modules::files::mount_at('G', content_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
@@ -68,10 +76,20 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
-    let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
+    let dlls = victory_loader::load_title_dlls(
+        image.info(),
+        &[title_dir, content_dir],
+        &images,
+        &wanted,
+    )?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
-        victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        let path = [title_dir, content_dir]
+            .into_iter()
+            .map(|d| d.join(name))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| title_dir.join(name));
+        victory_hle::runtime::set_image_path(dll.base(), &path);
     }
 
     let policy = match unimplemented {
@@ -110,7 +128,7 @@ pub fn run(
     diagnostics(&image, &cfg);
     let late = LateDlls {
         host: resolver.host.clone(),
-        title_dir: title_dir.to_owned(),
+        title_dirs: vec![title_dir.to_owned(), content_dir.to_owned()],
         cache_dir: images,
         policy,
         mapped: std::sync::Mutex::new(dlls.clone()),
@@ -222,7 +240,9 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
-    title_dir: std::path::PathBuf,
+    /// Where the title's DLLs live, in search order (beside the exe, then
+    /// the configured dump).
+    title_dirs: Vec<std::path::PathBuf>,
     cache_dir: std::path::PathBuf,
     policy: victory_loader::UnimplementedPolicy,
     /// Every title DLL mapped so far, to bind new ones against.
@@ -251,9 +271,11 @@ impl LateDlls {
             let new = {
                 let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
                 let wanted = |dll: &str| title_dll(&self.host, dll) && image_named(dll).is_none();
+                let dirs: Vec<&std::path::Path> =
+                    self.title_dirs.iter().map(|d| d.as_path()).collect();
                 let new = victory_loader::load_title_dll(
                     file,
-                    &self.title_dir,
+                    &dirs,
                     &self.cache_dir,
                     &wanted,
                 )?;
@@ -272,7 +294,13 @@ impl LateDlls {
                         dll.base()
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
-                    set_image_path(dll.base(), &self.title_dir.join(name));
+                    let path = self
+                        .title_dirs
+                        .iter()
+                        .map(|d| d.join(name))
+                        .find(|p| p.is_file())
+                        .unwrap_or_else(|| self.title_dirs[0].join(name));
+                    set_image_path(dll.base(), &path);
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());

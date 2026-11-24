@@ -150,9 +150,13 @@ fn loads_binds_and_calls_probe() {
         title_dir.path().join("victory-probe-title.dll"),
     )
     .unwrap();
-    let dlls =
-        victory_loader::load_title_dlls(image.info(), title_dir.path(), dir.path(), &|_| true)
-            .unwrap();
+    let dlls = victory_loader::load_title_dlls(
+        image.info(),
+        &[title_dir.path()],
+        dir.path(),
+        &|_| true,
+    )
+    .unwrap();
     let names: Vec<_> = dlls.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, ["victory-probe-title.dll"]);
     let resolver = WithTitleDlls {
@@ -272,7 +276,7 @@ fn maps_a_title_dll_the_title_loads_itself() {
     )
     .unwrap();
     let load = |name: &str, wanted: &dyn Fn(&str) -> bool| {
-        victory_loader::load_title_dll(name, title_dir.path(), cache.path(), wanted).unwrap()
+        victory_loader::load_title_dll(name, &[title_dir.path()], cache.path(), wanted).unwrap()
     };
     let dlls = load("LATE.DLL", &|_| true);
     let names: Vec<_> = dlls.iter().map(|(n, _)| n.as_str()).collect();
