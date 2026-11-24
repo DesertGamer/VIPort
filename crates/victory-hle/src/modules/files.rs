@@ -84,18 +84,11 @@ pub fn mount_at(letter: char, root: &Path) {
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
-/// `C:\` or verbatim drive root `\\?\C:\` keeps its own).
+/// keeps its own).
 fn root_wide(root: &Path) -> Vec<u16> {
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
-    let min_len = if wide.starts_with(&VERBATIM)
-        && wide.get(5).copied() == Some(u16::from(b':'))
-    {
-        7
-    } else {
-        3
-    };
-    while wide.len() > min_len && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
+    while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
         wide.pop();
     }
     wide
@@ -136,13 +129,9 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
             _ => parts.push(part),
         }
     }
-    if parts.is_empty() && out.len() == 6 && out[5] == u16::from(b':') {
+    for part in parts {
         out.push(backslash);
-    } else {
-        for part in parts {
-            out.push(backslash);
-            out.extend_from_slice(part);
-        }
+        out.extend_from_slice(part);
     }
     out
 }
@@ -165,26 +154,25 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
-    if !prefix.is_empty() || root.starts_with(&VERBATIM) || root.len() + tail.len() >= LONG {
+    if prefix.is_empty() && root.len() + tail.len() >= LONG {
         let mut out = verbatim(root, tail);
         out.push(0);
         return Some(out);
     }
-    let mut out = root.to_vec();
-    if out.last().is_some_and(|c| SEPARATORS.contains(c)) {
-        // `C:\` already ends with a separator: skip leading separators in `tail`.
-        let trimmed = tail
-            .iter()
-            .position(|c| !SEPARATORS.contains(c))
-            .map_or(&[][..], |i| &tail[i..]);
-        out.extend_from_slice(trimmed);
-    } else {
-        // `X:` and `X:name` are relative to the root.
-        if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
-            out.push(b'\\'.into());
-        }
-        out.extend_from_slice(tail);
+    let mut out = prefix.to_vec();
+    out.extend_from_slice(root);
+    // `X:` and `X:name` are relative to the root.
+    if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
+        out.push(b'\\'.into());
     }
+    let verbatim = !prefix.is_empty();
+    out.extend(tail.iter().map(|&c| {
+        if verbatim && c == u16::from(b'/') {
+            b'\\'.into()
+        } else {
+            c
+        }
+    }));
     out.push(0);
     Some(out)
 }
@@ -435,50 +423,6 @@ pub extern "system" fn GetDiskFreeSpaceExW(
     )
 }
 
-/// Extracts the NUL-terminated volume root (`C:\`, `\\?\C:\`, `\\server\share\`,
-/// or `\\?\UNC\server\share\`) from a translated NUL-terminated host path.
-fn volume_root(host: &[u16]) -> Option<Vec<u16>> {
-    let host = host.strip_suffix(&[0]).unwrap_or(host);
-    let bs = u16::from(b'\\');
-    if let Some(unc) = host.strip_prefix(&[bs, bs, u16::from(b'?'), bs, u16::from(b'U'), u16::from(b'N'), u16::from(b'C'), bs]) {
-        let mut parts = unc.split(|c| SEPARATORS.contains(c)).filter(|p| !p.is_empty());
-        let (server, share) = (parts.next()?, parts.next()?);
-        let mut out = VERBATIM.to_vec();
-        out.extend("UNC\\".encode_utf16());
-        out.extend_from_slice(server);
-        out.push(bs);
-        out.extend_from_slice(share);
-        out.push(bs);
-        out.push(0);
-        return Some(out);
-    }
-    if let Some(rest) = host.strip_prefix(&VERBATIM[..])
-        && let [letter, colon, ..] = rest
-        && *colon == u16::from(b':')
-    {
-        let mut out = VERBATIM.to_vec();
-        out.extend([*letter, *colon, bs, 0]);
-        return Some(out);
-    }
-    if let Some(unc) = host.strip_prefix(&[bs, bs]) {
-        let mut parts = unc.split(|c| SEPARATORS.contains(c)).filter(|p| !p.is_empty());
-        let (server, share) = (parts.next()?, parts.next()?);
-        let mut out = vec![bs, bs];
-        out.extend_from_slice(server);
-        out.push(bs);
-        out.extend_from_slice(share);
-        out.push(bs);
-        out.push(0);
-        return Some(out);
-    }
-    if let [letter, colon, ..] = host
-        && *colon == u16::from(b':')
-    {
-        return Some(vec![*letter, *colon, bs, 0]);
-    }
-    None
-}
-
 /// Wants a volume root: a virtual drive answers for the host volume its
 /// folder is on.
 pub extern "system" fn GetDiskFreeSpaceW(
@@ -490,9 +434,11 @@ pub extern "system" fn GetDiskFreeSpaceW(
 ) -> i32 {
     let mut p = wide(root);
     if let Some(host) = &mut p.1
-        && let Some(vol) = volume_root(host)
+        && let [letter, colon, sep, ..] = host[..]
+        && colon == u16::from(b':')
+        && SEPARATORS.contains(&sep)
     {
-        *host = vol;
+        *host = vec![letter, colon, sep, 0];
     }
     host!("kernel32.dll", "GetDiskFreeSpaceW": extern "system" fn(*const u16, *mut u32, *mut u32, *mut u32, *mut u32) -> i32)(
         p.ptr(),
@@ -1002,49 +948,5 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
-    }
-
-    #[test]
-    fn verbatim_and_drive_root_mounts_translate_cleanly() {
-        let decode = |v: Vec<u16>| {
-            let v = v.strip_suffix(&[0]).unwrap_or(&v);
-            String::from_utf16_lossy(v)
-        };
-        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
-
-        // 1. Verbatim drive root (`\\?\C:\`) keeps its trailing backslash.
-        mount_at('V', Path::new(r"\\?\C:\"));
-        assert_eq!(decode(translate(&w(r"V:\")).unwrap()), r"\\?\C:\");
-        assert_eq!(decode(translate(&w(r"\\?\V:\a.txt")).unwrap()), r"\\?\C:\a.txt");
-        assert_eq!(decode(translate(&w("V:/sub/../b.txt")).unwrap()), r"\\?\C:\b.txt");
-
-        // 2. Plain drive root (`C:\`) does not double separators.
-        mount_at('U', Path::new(r"C:\"));
-        assert_eq!(decode(translate(&w(r"U:\")).unwrap()), r"C:\");
-        assert_eq!(decode(translate(&w("U:")).unwrap()), r"C:\");
-        assert_eq!(decode(translate(&w(r"U:\foo")).unwrap()), r"C:\foo");
-        assert_eq!(decode(translate(&w(r"\\?\U:\foo")).unwrap()), r"\\?\C:\foo");
-
-        // 3. UNC host root (`\\server\share\dir`) translates `\\?\` paths to `\\?\UNC\...`.
-        mount_at('W', Path::new(r"\\server\share\dir"));
-        assert_eq!(
-            decode(translate(&w(r"\\?\W:\foo")).unwrap()),
-            r"\\?\UNC\server\share\dir\foo"
-        );
-    }
-
-    #[test]
-    fn volume_root_extracts_drive_and_unc_roots() {
-        let check = |input: &str, want: &str| {
-            let mut wide: Vec<u16> = input.encode_utf16().collect();
-            wide.push(0);
-            let got = volume_root(&wide).unwrap();
-            let got = String::from_utf16_lossy(got.strip_suffix(&[0]).unwrap());
-            assert_eq!(got, want, "input={input}");
-        };
-        check(r"C:\folder\file.dat", r"C:\");
-        check(r"\\?\C:\folder\file.dat", r"\\?\C:\");
-        check(r"\\server\share\dir\file.dat", r"\\server\share\");
-        check(r"\\?\UNC\server\share\dir\file.dat", r"\\?\UNC\server\share\");
     }
 }
