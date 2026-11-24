@@ -770,6 +770,13 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn only_a_texture_with_the_render_target_flag_has_a_render_target_state() {
+        assert_eq!(super::legal_for(0, 0x4), 0);
+        assert_eq!(super::legal_for(0x2, 0x4), 0);
+        assert_eq!(super::legal_for(0x1, 0x4), 0x4);
+    }
+
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -2844,6 +2851,10 @@ fn title_window() -> Option<HWND> {
 pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     // SAFETY: a plain query.
     legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
+}
+
+pub(crate) fn can_render_to(texture: &ID3D12Resource) -> bool {
+    legal_state(texture, 0x4) != 0
 }
 
 /// [`legal_state`] for a texture with resource flags `flags`.
