@@ -41,6 +41,9 @@ use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
 use crate::shadow::Shadow;
 
+mod precise_ranges;
+use precise_ranges::PreciseRanges;
+
 /// Pages per level-2 block: 4096 pages of 64 KiB, 256 MiB.
 const BLOCK: usize = 4096;
 /// Level-1 entries: 2^40 bytes in 256 MiB blocks.
@@ -401,7 +404,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     });
     list.defer_after(move || {
         let Layout { copies, blocks, owner } = &*layout(key);
-        let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
+        // Freeze the same declared ranges for this readback. The index
+        // replaces a full linear scan for every GPU-written page.
+        let precise = PreciseRanges::new(
+            &byte_for_byte.lock().unwrap_or_else(|e| e.into_inner()),
+        );
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
@@ -420,7 +427,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 };
                 let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
-                    Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
+                    Some(_) if precise.overlaps(at, at + (1 << 16)) => {}
                     Some(Some(k)) => writes.push((*k, at)),
                     _ => {
                         pages += 1;
