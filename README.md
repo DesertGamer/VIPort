@@ -13,6 +13,14 @@
 > original lives at the link above; its history is kept here intact, and V2 is
 > synchronized from it.
 
+Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
+the user supplies.
+
+The title's x86-64 code runs unchanged inside our process; VIctory supplies
+the platform underneath it and converts the title's data, ahead of time where
+it can and on first use where it must (shaders). See
+[docs/architecture.md](docs/architecture.md).
+
 ## What V2 changes
 
 - **Community pull requests, merged.** Open upstream PRs are merged into V2 in
@@ -37,16 +45,6 @@
   [docs/asset-policy.md](docs/asset-policy.md). You supply your own files.
 - It does not promise that the game is playable. See *Status* below.
 
-## Status of V2 (2026-11-25)
-
-**Not playable yet, like upstream.** The title boots, runs its menus at 30 fps
-and loads the world. On entering the world the host GPU still fails with a
-device removed error. Compared with upstream `main` on the same run, more
-shaders translate (about 3050 draws per frame reach the GPU instead of 2430,
-and 688 are dropped for lack of a host pipeline instead of 1408), but frames
-still take seconds. The upstream *Status* section further down describes the
-rest.
-
 ## Where to talk
 
 - [#1: entering the world fails with a GPU device removed](https://github.com/DesertGamer/VIctory-V2/issues/1): the main blocker; post diagnostics and findings here.
@@ -63,29 +61,19 @@ rest.
   A fix that is useful to everyone belongs upstream too: if you send a change
   to V2, consider sending it to the original project as well.
 
-## License
-
-GPL-3.0-or-later, as upstream. See [LICENSE](LICENSE).
-
----
-
-The rest of this file is the upstream README, kept as the technical reference.
-Its *Status* section describes upstream's state on the date shown there.
-
-# VIctory
-
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
-
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
-
-## Status (2026-11-23)
+## Status
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
 loads the world, where rendering fails.
+
+V2, 2026-11-25: on entering the world the host GPU still fails with a device
+removed error. Compared with upstream `main` on the same run, more shaders
+translate (about 3050 draws per frame reach the GPU instead of 2430, and 688
+are dropped for lack of a host pipeline instead of 1408), but frames still
+take seconds.
+
+The tables below are upstream's findings of 2026-11-23; V2 has not re-measured
+them.
 
 | Stage | State |
 |-------|-------|
