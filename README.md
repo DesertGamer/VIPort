@@ -1,5 +1,10 @@
 # VIctory V2
 
+[![Telegram](https://img.shields.io/badge/Telegram-@desertdev-26A5E4?logo=telegram&logoColor=white)](https://t.me/desertdev)
+![Discord](https://img.shields.io/badge/Discord-desert__gamer-5865F2?logo=discord&logoColor=white)
+[![E-mail](https://img.shields.io/badge/E--mail-desert__gamer@icloud.com-3693F3?logo=icloud&logoColor=white)](mailto:desert_gamer@icloud.com)
+[![Issues](https://img.shields.io/github/issues/DesertGamer/VIctory-V2?logo=github)](https://github.com/DesertGamer/VIctory-V2/issues)
+
 > **This is VIctory V2, an integration fork of
 > [Marvisak/VIctory](https://github.com/Marvisak/VIctory).**
 >
