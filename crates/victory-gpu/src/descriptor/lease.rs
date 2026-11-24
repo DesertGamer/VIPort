@@ -15,7 +15,7 @@
 //! how much that frees.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Dynamic slots: the title heap they belong to (its address), the first
@@ -26,6 +26,8 @@ pub(crate) type Range = (usize, u32, u32);
 #[derive(Default)]
 pub(crate) struct Lease {
     ranges: Mutex<Vec<Range>>,
+    /// Active submissions referencing this lease, updated under [`FINISHED`].
+    in_flight: AtomicUsize,
     /// The slots were taken back after the list ran.
     lost: AtomicBool,
 }
@@ -74,20 +76,26 @@ impl Lease {
     }
 
     /// Before the list is submitted: false if its slots were taken back
-    /// (it must not run); else it cannot be taken back until
-    /// [`Lease::finish`].
+    /// (it must not run); else it cannot be taken back until every started
+    /// submission calls [`Lease::finish`].
     pub(crate) fn start(self: &Arc<Self>) -> bool {
         let mut queue = finished_queue();
         if self.is_lost() {
             return false;
         }
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
         queue.retain(|l| !Arc::ptr_eq(l, self));
         true
     }
 
-    /// After the list ran: its slots may be taken back if a heap runs short.
+    /// After the list ran: once every active submission finishes, its slots
+    /// may be taken back if a heap runs short.
     pub(crate) fn finish(self: &Arc<Self>) {
-        if self.is_lost()
+        let mut queue = finished_queue();
+        let left = self.in_flight.load(Ordering::Relaxed).saturating_sub(1);
+        self.in_flight.store(left, Ordering::Relaxed);
+        if left > 0
+            || self.is_lost()
             || self
                 .ranges
                 .lock()
@@ -96,7 +104,6 @@ impl Lease {
         {
             return;
         }
-        let mut queue = finished_queue();
         queue.retain(|l| !Arc::ptr_eq(l, self));
         queue.push_back(self.clone());
         // Lists that were reset hold nothing and only take room here.
@@ -116,7 +123,10 @@ impl Lease {
 pub(crate) fn reclaim(heap: usize, mut release: impl FnMut(Range)) -> bool {
     let ranges = {
         let mut queue = finished_queue();
-        let Some(at) = queue.iter().position(|l| l.holds(heap)) else {
+        let Some(at) = queue
+            .iter()
+            .position(|l| l.in_flight.load(Ordering::Relaxed) == 0 && l.holds(heap))
+        else {
             return false;
         };
         let lease = queue.remove(at).expect("a position of the queue");
@@ -201,5 +211,28 @@ mod tests {
         assert_eq!(given, [(heap, 50, 5)]);
         assert!(!reset.is_lost() && kept.is_lost());
         assert!(!reclaim(heap, |_| panic!("one entry was kept, once")));
+    }
+
+    /// Two overlapping submissions of the same list (concurrent or listed
+    /// twice) keep its slots un-reclaimable until both have finished.
+    #[test]
+    fn overlapping_submissions_keep_slots_until_all_finish() {
+        let heap = 0x1000_0005;
+        let l = lease(heap, &[(10, 4)]);
+        assert!(l.start());
+        assert!(l.start());
+        // The first submission ended, but the second is still running.
+        l.finish();
+        assert!(
+            !reclaim(heap, |_| panic!("still running in the second submission")),
+            "a lease still in flight must not be reclaimed"
+        );
+        assert!(!l.is_lost());
+        // Once the second submission also ends, its slots may be taken back.
+        l.finish();
+        let mut given = Vec::new();
+        assert!(reclaim(heap, |r| given.push(r)));
+        assert_eq!(given, [(heap, 10, 4)]);
+        assert!(l.is_lost());
     }
 }

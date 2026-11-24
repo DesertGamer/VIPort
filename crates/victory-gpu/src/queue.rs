@@ -120,15 +120,18 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let mut skipped = 0;
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter(|&&l| {
-                let may = crate::list::may_run(l);
-                skipped += usize::from(!may);
-                may
-            })
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
+        let mut host_lists = Vec::with_capacity(lists.len());
+        let mut leases = Vec::with_capacity(lists.len());
+        for &l in lists {
+            match crate::list::start(l) {
+                crate::list::Submission::Run(host_list, lease) => {
+                    host_lists.push(host_list);
+                    leases.push(lease);
+                }
+                crate::list::Submission::Lost => skipped += 1,
+                crate::list::Submission::None => {}
+            }
+        }
         if skipped > 0 {
             static LOST: AtomicBool = AtomicBool::new(false);
             if !LOST.swap(true, Ordering::Relaxed) {
@@ -139,8 +142,8 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             }
         }
         host.execute(&host_lists);
-        for &l in lists {
-            crate::list::finished(l);
+        for lease in leases {
+            lease.finish();
         }
         return;
     }
