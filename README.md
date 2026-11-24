@@ -37,6 +37,23 @@
   [docs/asset-policy.md](docs/asset-policy.md). You supply your own files.
 - It does not promise that the game is playable. See *Status* below.
 
+## Status of V2 (2026-11-25)
+
+**Not playable yet, like upstream.** The title boots, runs its menus at 30 fps
+and loads the world. On entering the world the host GPU still fails with a
+device removed error. Compared with upstream `main` on the same run, more
+shaders translate (about 3050 draws per frame reach the GPU instead of 2430,
+and 688 are dropped for lack of a host pipeline instead of 1408), but frames
+still take seconds. The upstream *Status* section further down describes the
+rest.
+
+## Where to talk
+
+- [#1: entering the world fails with a GPU device removed](https://github.com/DesertGamer/VIctory-V2/issues/1): the main blocker; post diagnostics and findings here.
+- [#2: what is merged into V2 and what is not](https://github.com/DesertGamer/VIctory-V2/issues/2): the list of merged bundles and of those that still need a hand merge.
+- [#3: single upstream pull requests](https://github.com/DesertGamer/VIctory-V2/issues/3): how to take one and how to report a clash.
+- [#4: hardware reports](https://github.com/DesertGamer/VIctory-V2/issues/4): how far it gets on your machine.
+
 ## Contributing, security, upstream
 
 - How to contribute: [CONTRIBUTING.md](CONTRIBUTING.md).
