@@ -550,7 +550,7 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            read_back_texture(&list, dst, (x, y, z), src, source_box);
+            read_back_texture(list, dst, (x, y, z), src, source_box);
             return;
         };
         let mut from = src;

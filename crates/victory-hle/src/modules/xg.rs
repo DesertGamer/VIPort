@@ -736,6 +736,7 @@ mod tests {
         render.flags = ALLOW_RENDER_TARGET;
         let mut depth = plain;
         depth.flags = ALLOW_DEPTH_STENCIL;
+        #[allow(clippy::undocumented_unsafe_blocks)]
         let layout = |d: &ResourceDesc| {
             let c = create(d);
             let mut out: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });

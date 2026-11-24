@@ -2188,14 +2188,16 @@ fn coalesce_ranges(ranges: &mut Vec<(usize, usize)>, gap: usize) {
     ranges.truncate(out + 1);
 }
 
+type Refresh = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+    refreshes: Vec<Refresh>,
     /// Where each copy's refresh is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
     /// The ranges of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+    current: std::collections::HashMap<usize, Refresh>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }

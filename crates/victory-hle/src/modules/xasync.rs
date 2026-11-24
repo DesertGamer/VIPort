@@ -1200,7 +1200,7 @@ mod tests {
             S_OK
         );
         // The title changes the block's queue before the call finishes.
-        block.queue = second;
+        std::hint::black_box(&mut block).queue = second;
         assert!(XTaskQueueDispatch(first, WORK, 0), "work is on the first queue");
         assert_eq!(PINNED_COMPLETED.load(Ordering::SeqCst), before);
         assert!(!XTaskQueueDispatch(second, COMPLETION, 0), "not the new queue");

@@ -427,6 +427,7 @@ impl Context {
         self.word(word).load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     fn set(self, word: usize, value: u32) {
         self.word(word).store(value, Ordering::Release);
     }
@@ -1181,7 +1182,7 @@ mod tests {
 
         let start = xma::PACKET_BYTES * 8 - 20;
         let bits = 31usize;
-        let mut put = |data: &mut [u8], at: usize, value: u32, width: usize| {
+        let put = |data: &mut [u8], at: usize, value: u32, width: usize| {
             for i in 0..width {
                 if value >> (width - 1 - i) & 1 == 1 {
                     data[(at + i) / 8] |= 1 << (7 - (at + i) % 8);
