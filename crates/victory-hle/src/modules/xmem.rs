@@ -433,14 +433,14 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
-        return 0;
-    };
     if n > (PAGE_NUMBER_LIMIT - FIRST_PAGE_NUMBER) / FRAMES {
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
         return 0;
     }
+    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+        return 0;
+    };
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
@@ -1203,36 +1203,67 @@ mod tests {
 
     #[test]
     fn freed_page_numbers_can_be_reused_at_the_limit() {
-        let section = || {
-            let numbers = allocate(1);
-            let section = physical().pages[&numbers[0]].section.clone();
-            assert_eq!(XMemFreePhysicalPages(1, numbers.as_ptr()), 1);
-            section
-        };
-        let mut table = Physical {
-            next_page: PAGE_NUMBER_LIMIT - FRAMES,
-            ..Physical::default()
-        };
-        let mut number = [MaybeUninit::new(0)];
-        assert!(table.allocate(section(), &mut number));
-        // SAFETY: the initialized slot was filled by allocate.
-        let last = unsafe { number[0].assume_init() };
-        assert_eq!(last >> 4, (1 << 21) - 1);
-        assert!(!table.allocate(section(), &mut number));
+        const CHILD: &str = "VICTORY_TEST_XMEM_PAGE_REUSE";
+        if std::env::var_os(CHILD).is_none() {
+            // Keep the seeded page allocator out of the other XMem tests.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "modules::xmem::tests::freed_page_numbers_can_be_reused_at_the_limit",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
 
-        let mut old_view = View::map(&table.pages[&last], 1).unwrap();
-        old_view.bytes()[0] = 7;
-        table.free(last);
-        table.free(last);
+        physical().next_page = PAGE_NUMBER_LIMIT - FRAMES;
+        let reserve = || {
+            let address = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!address.is_null());
+            address
+        };
+        let (old, new, alias) = (reserve(), reserve(), reserve());
+        let pages = allocate(1);
+        assert_eq!(pages[0] >> 4, (1 << 21) - 1);
+        assert_eq!(XMemMapPhysicalPages(old, 1, pages.as_ptr()), old);
+        assert!(write_physical(&pages, 0, &[7]));
+
+        let refused = |requested| {
+            let mut count = requested;
+            let mut output = [1, 2];
+            assert_eq!(
+                XMemAllocatePhysicalPages(0, &mut count, output.as_mut_ptr()),
+                0
+            );
+            assert_eq!(count, 0);
+            assert_eq!(output, [1, 2]);
+        };
+        refused(1);
+        refused(usize::MAX);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
         // A second free must not grant another use of the same number.
-        let mut two = [MaybeUninit::new(0); 2];
-        assert!(!table.allocate(section(), &mut two));
-        assert!(table.allocate(section(), &mut number));
-        // SAFETY: the initialized slot was filled by allocate.
-        assert_eq!(unsafe { number[0].assume_init() }, last);
-        let mut new_view = View::map(&table.pages[&last], 1).unwrap();
-        assert_eq!(new_view.bytes()[0], 0);
-        assert_eq!(old_view.bytes()[0], 7);
+        refused(2);
+        assert_eq!(allocate(1), pages);
+        assert_eq!(XMemMapPhysicalPages(new, 1, pages.as_ptr()), new);
+        assert!(map_alias(alias as u64, old as u64, PAGE as u64));
+        // SAFETY: the new view has just been mapped read-write.
+        assert_eq!(unsafe { new.cast::<u8>().read() }, 0);
+        assert!(write_physical(&pages, 0, &[9]));
+        // SAFETY: all three views are still mapped read-write.
+        unsafe {
+            assert_eq!(old.cast::<u8>().read(), 7);
+            assert_eq!(alias.cast::<u8>().read(), 7);
+            assert_eq!(new.cast::<u8>().read(), 9);
+        }
     }
 
     #[test]
