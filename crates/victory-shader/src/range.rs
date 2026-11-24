@@ -6,7 +6,8 @@
 //! A value is bounded when it is a constant; a copy (`s_mov_b32`,
 //! `v_mov_b32`, or an unguarded `v_readfirstlane_b32`: the first active
 //! lane is then a lane that runs there) of a bounded value; `min`, `and` or
-//! `med3` (unsigned) with a bounded operand; a sum of bounded values that
+//! `med3` (unsigned) with a bounded operand; an unsigned right shift by a
+//! known constant; a sum of bounded values that
 //! cannot wrap; or a phi whose every incoming value is bounded on its edge,
 //! where an unsigned compare of that value with a bounded one (`v_cmp*`,
 //! `s_cmp*`: `lt`, `le`, `eq` true or `gt`, `ge` false) that every lane
@@ -280,6 +281,10 @@ impl Ranges<'_> {
             ("s_mov_b32" | "v_mov_b32" | "v_readfirstlane_b32", &[x]) => x,
             ("s_min_u32" | "v_min_u32" | "s_and_b32" | "v_and_b32", &[x, y]) => x.min(y),
             ("s_max_u32" | "v_max_u32", &[x, y]) => x.max(y),
+            // Unsigned right shift is monotone for a fixed shift amount.
+            // A shift count's upper bound alone is not enough to narrow it.
+            ("s_lshr_b32", &[x, _]) => constant_shift(&src[1]).map_or(u32::MAX, |n| x >> n),
+            ("v_lshrrev_b32", &[_, x]) => constant_shift(&src[0]).map_or(u32::MAX, |n| x >> n),
             // The median is at most the larger of any two operands.
             ("v_med3_u32", &[x, y, z]) => x.max(y).min(x.max(z)).min(y.max(z)),
             // A sum that may wrap is unbounded.
@@ -294,6 +299,15 @@ impl Ranges<'_> {
             Operand::Literal(x) => x,
             _ => value(self.p, inst, op).map_or(u32::MAX, |v| self.hi(v)),
         }
+    }
+}
+
+/// A known shift count in the unambiguous 32-bit range.
+fn constant_shift(op: &Operand) -> Option<u32> {
+    match *op {
+        Operand::Const(c @ 128..=159) => Some(u32::from(c - 128)),
+        Operand::Literal(n) if n < 32 => Some(n),
+        _ => None,
     }
 }
 
@@ -381,6 +395,51 @@ mod tests {
             assert_eq!(vgprs(i[4].writes(&p)), [2, 3, 4, 5]);
             assert_eq!(vgprs(i[7].reads(&p)), second, "index in v{n}");
         }
+    }
+
+    #[test]
+    fn constant_right_shifts_bound_relative_register_reads() {
+        for (shift, expected) in [
+            (30, vec![8, 9, 10, 11, 4]),
+            (31, vec![8, 9, 4]),
+            (0, (8..16).chain([4]).collect()),
+        ] {
+            let p = build_words(&[
+                vop2(0x16, 1, 128 + shift, 0), // v_lshrrev_b32 v1, shift, v0
+                vop1(0x02, 0, V + 1),         // v_readfirstlane_b32 s0, v1
+                M0_S0,
+                vop1(0x43, 4, V + 8),         // v_movrels_b32 v4, v8
+                S_ENDPGM,
+            ]);
+            let reads = vgprs(&p.blocks[0].insts[3].reads);
+            assert_eq!(reads, expected, "vector shift {shift}");
+
+            let p = build_words(&[
+                0x9000_000A | ((128 + shift) << 8), // s_lshr_b32 s0, s10, shift
+                M0_S0,
+                vop1(0x43, 4, V + 8),
+                S_ENDPGM,
+            ]);
+            assert_eq!(
+                vgprs(&p.blocks[0].insts[2].reads),
+                expected,
+                "scalar shift {shift}"
+            );
+        }
+
+        // A variable shift can be zero, even if its upper bound is small.
+        let p = build_words(&[
+            vop2(0x1B, 2, 159, 3),    // v_and_b32 v2, 31, v3
+            vop2(0x16, 1, V + 2, 0), // v_lshrrev_b32 v1, v2, v0
+            vop1(0x02, 0, V + 1),
+            M0_S0,
+            vop1(0x43, 4, V + 8),
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            vgprs(&p.blocks[0].insts[4].reads),
+            (8..16).chain([4]).collect::<Vec<u8>>()
+        );
     }
 
     #[test]
