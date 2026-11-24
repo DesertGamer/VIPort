@@ -406,9 +406,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let Layout { copies, blocks, owner } = &*layout(key);
         // Freeze the same declared ranges for this readback. The index
         // replaces a full linear scan for every GPU-written page.
-        let precise = PreciseRanges::new(
-            &byte_for_byte.lock().unwrap_or_else(|e| e.into_inner()),
-        );
+        let declared = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
+        let precise = PreciseRanges::new(&declared);
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
