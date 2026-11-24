@@ -424,14 +424,13 @@ fn peek(when: &str) {
 }
 
 /// In a listed frame: copies an indirect execution's records (`args`:
-/// buffer, offset; in the indirect-argument state) and its count (in the
-/// unordered-access state unless in the same buffer) to readback memory,
-/// logged once the list has run: how many records ask for work, and the
-/// first ones.
+/// buffer, offset) and its count (unless in the same buffer) to readback
+/// memory, logged once the list has run: how many records ask for work, and
+/// the first ones. Their states are those the list leaves them in.
 pub(crate) fn read_indirect(
     list: &crate::host::HostList,
-    args: (&ID3D12Resource, u64),
-    count: Option<(&ID3D12Resource, u64)>,
+    args: (&std::sync::Arc<crate::shadow::Shadow>, u64),
+    count: Option<(&std::sync::Arc<crate::shadow::Shadow>, u64)>,
     (kind, stride, max): (u32, u32, u32),
     name: String,
 ) {
@@ -457,7 +456,12 @@ pub(crate) fn read_indirect(
     let l = &list.list;
     use crate::host::transition;
     use windows::core::Interface;
-    let (arg_state, copy) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    let arg_state = list.buffer_state_of(args.0);
+    let count_state = count.map_or(0, |(c, _)| list.buffer_state_of(c));
+    if arg_state == 0 || count.is_some() && count_state == 0 {
+        return;
+    }
+    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // SAFETY: plain creation; an open list and live buffers in the states
     // named, put back after the copies.
     unsafe {
@@ -469,20 +473,20 @@ pub(crate) fn read_indirect(
             return;
         }
         let Some(buffer) = buffer else { return };
-        l.ResourceBarrier(&[transition(args.0, arg_state, copy)]);
-        l.CopyBufferRegion(&buffer, 0, args.0, args.1, len);
+        l.ResourceBarrier(&[transition(&args.0.buffer, D3D12_RESOURCE_STATES(arg_state as i32), copy)]);
+        l.CopyBufferRegion(&buffer, 0, &args.0.buffer, args.1, len);
         if let Some((c, at)) = count {
-            let same = c.as_raw() == args.0.as_raw();
-            let state = if same { copy } else { D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+            let same = c.buffer.as_raw() == args.0.buffer.as_raw();
+            let state = if same { copy } else { D3D12_RESOURCE_STATES(count_state as i32) };
             if !same {
-                l.ResourceBarrier(&[transition(c, state, copy)]);
+                l.ResourceBarrier(&[transition(&c.buffer, state, copy)]);
             }
-            l.CopyBufferRegion(&buffer, len, c, at, 4);
+            l.CopyBufferRegion(&buffer, len, &c.buffer, at, 4);
             if !same {
-                l.ResourceBarrier(&[transition(c, copy, state)]);
+                l.ResourceBarrier(&[transition(&c.buffer, copy, state)]);
             }
         }
-        l.ResourceBarrier(&[transition(args.0, copy, arg_state)]);
+        l.ResourceBarrier(&[transition(&args.0.buffer, copy, D3D12_RESOURCE_STATES(arg_state as i32))]);
         list.keep(&buffer);
         let buffer = Readback(buffer);
         let counted = count.is_some();

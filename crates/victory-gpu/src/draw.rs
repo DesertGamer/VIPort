@@ -208,6 +208,16 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
         .min(if srv || uav { 1 << 20 } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || uav || gpu % 256 == 0 {
+        list.buffer_state(
+            &shadow,
+            if uav {
+                crate::host::BUFFER_UNORDERED_ACCESS
+            } else if srv {
+                crate::host::BUFFER_SHADER_RESOURCE
+            } else {
+                crate::host::BUFFER_VERTEX
+            },
+        );
         shadow.refresh(list, address, len);
         if uav {
             shadow.gpu_writes(list, address, len);
@@ -477,6 +487,7 @@ impl State {
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
                 continue;
             };
+            list.buffer_state(&shadow, crate::host::BUFFER_VERTEX);
             shadow.refresh(list, v.address, u64::from(v.size));
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -496,6 +507,7 @@ impl State {
                 not_run("index buffer outside title buffers");
                 return false;
             };
+            list.buffer_state(&shadow, crate::host::BUFFER_INDEX);
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -1652,7 +1664,7 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(list, &args, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -1673,7 +1685,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1693,6 +1705,9 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        if let Some((counter, _)) = &counter {
+            list.buffer_state(counter, crate::host::BUFFER_INDIRECT_ARGUMENT);
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1708,11 +1723,11 @@ impl State {
         // A listed frame: what the records held (after the clamp).
         #[cfg(feature = "diagnostics")]
         if crate::capture::dump_on() {
-            let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            let count = counter.as_ref().map(|(s, at)| (s, s.offset(*at)));
             let name = crate::pipeline::shaders_of(pipeline);
-            crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
+            crate::capture::read_indirect(list, (&args, args.offset(arguments)), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1788,6 +1803,15 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     if let Some((shadow, address, len)) = range
         && len > 0
     {
+        let state = match u.kind {
+            ResourceType::Cbv => crate::host::BUFFER_VERTEX,
+            ResourceType::Srv => crate::host::BUFFER_SHADER_RESOURCE,
+            ResourceType::Uav => crate::host::BUFFER_UNORDERED_ACCESS,
+            _ => 0,
+        };
+        if state != 0 {
+            list.buffer_state(&shadow, state);
+        }
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);

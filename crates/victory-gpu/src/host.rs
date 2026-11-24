@@ -604,6 +604,9 @@ pub(crate) struct HostList {
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
     twins: Mutex<std::collections::HashMap<usize, crate::twin::Use>>,
+    /// Buffer states have the same submission ordering, but live on the
+    /// persistent shadow buffers rather than on title texture copies.
+    buffer_states: Mutex<BufferStates>,
     /// A copy of ours replaced the list's compute root signature and
     /// pipeline: draws and dispatches set theirs again.
     rebind: std::sync::atomic::AtomicBool,
@@ -643,6 +646,18 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+type BufferStates =
+    std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::shadow::Shadow>)>;
+
+pub(crate) const BUFFER_VERTEX: u32 = 0x1;
+pub(crate) const BUFFER_INDEX: u32 = 0x2;
+pub(crate) const BUFFER_SHADER_RESOURCE: u32 = 0x40 | 0x80;
+pub(crate) const BUFFER_UNORDERED_ACCESS: u32 = 0x8;
+pub(crate) const BUFFER_INDIRECT_ARGUMENT: u32 = 0x200;
+
+const BUFFER_READ_STATES: u32 =
+    BUFFER_VERTEX | BUFFER_INDEX | BUFFER_SHADER_RESOURCE | BUFFER_INDIRECT_ARGUMENT;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -914,6 +929,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                buffer_states: Mutex::default(),
                 rebind: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
@@ -1567,6 +1583,10 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.buffer_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1628,6 +1648,61 @@ impl HostList {
         }
     }
 
+    /// Moves a shadow buffer to `wanted` in this list. Read-only states are
+    /// combined when a buffer is used for more than one purpose in a draw.
+    pub(crate) fn buffer_state(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        wanted: u32,
+    ) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let next = {
+            let mut states = self
+                .buffer_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match states.entry(key) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((wanted, wanted, shadow.clone()));
+                    return;
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    let state = &mut o.get_mut().1;
+                    let before = *state;
+                    *state = if before != 0
+                        && wanted != 0
+                        && before & !BUFFER_READ_STATES == 0
+                        && wanted & !BUFFER_READ_STATES == 0
+                    {
+                        before | wanted
+                    } else {
+                        wanted
+                    };
+                    (before != *state).then_some((before, *state))
+                }
+            }
+        };
+        if let Some((before, after)) = next {
+            // SAFETY: this list and its shadow buffer are live.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    &shadow.buffer,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATES(after as i32),
+                )])
+            };
+        }
+    }
+
+    /// The state this list leaves `shadow` in, 0 if it does not use it.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn buffer_state_of(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) -> u32 {
+        let states = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .get(&(std::sync::Arc::as_ptr(shadow) as usize))
+            .map_or(0, |(_, last, _)| *last)
+    }
+
     /// [`HostList::transition`] for a host texture of ours (a twin's
     /// plane), without twins: the barrier to record, if one is needed.
     pub(crate) fn move_texture(
@@ -1677,8 +1752,9 @@ impl HostList {
 
     /// Runs `copy_twin` for each depth texture whose side this list's
     /// prelude must copy while textures still hold their pre-list states,
-    /// then advances those states to where this list leaves them and returns
-    /// the entry transitions (`None` when the prelude has nothing to record).
+    /// then advances those states, and each shadow buffer's, to where this
+    /// list leaves them and returns the entry transitions (`None` when the
+    /// prelude has nothing to record).
     fn plan_prelude(
         &self,
         mut copy_twin: impl FnMut(
@@ -1691,12 +1767,19 @@ impl HostList {
         let copies = crate::twin::at_submission(twins.values());
         drop(twins);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let buffers = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
         let moves = states
             .values()
-            .any(|(first, _, copy)| copy.state.load(Ordering::Relaxed) != *first);
+            .any(|(first, _, copy)| copy.state.load(Ordering::Relaxed) != *first)
+            || buffers
+                .values()
+                .any(|(first, _, shadow)| shadow.state.load(Ordering::Relaxed) != *first);
         if !moves && copies.is_empty() {
             for (_, last, copy) in states.values() {
                 copy.state.store(*last, Ordering::Relaxed);
+            }
+            for (_, last, shadow) in buffers.values() {
+                shadow.state.store(*last, Ordering::Relaxed);
             }
             return None;
         }
@@ -1705,26 +1788,35 @@ impl HostList {
                 copy_twin(depth, twin, *to_depth);
             }
         }
-        Some(
-            states
-                .values()
-                .filter_map(|(first, last, copy)| {
-                    let real = copy.state.swap(*last, Ordering::Relaxed);
-                    (real != *first).then(|| {
-                        transition(
-                            &copy.texture,
-                            D3D12_RESOURCE_STATES(real as i32),
-                            D3D12_RESOURCE_STATES(*first as i32),
-                        )
-                    })
+        let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+            .values()
+            .filter_map(|(first, last, copy)| {
+                let real = copy.state.swap(*last, Ordering::Relaxed);
+                (real != *first).then(|| {
+                    transition(
+                        &copy.texture,
+                        D3D12_RESOURCE_STATES(real as i32),
+                        D3D12_RESOURCE_STATES(*first as i32),
+                    )
                 })
-                .collect(),
-        )
+            })
+            .collect();
+        barriers.extend(buffers.values().filter_map(|(first, last, shadow)| {
+            let real = shadow.state.swap(*last, Ordering::Relaxed);
+            (real != *first).then(|| {
+                transition(
+                    &shadow.buffer,
+                    D3D12_RESOURCE_STATES(real as i32),
+                    D3D12_RESOURCE_STATES(*first as i32),
+                )
+            })
+        }));
+        Some(barriers)
     }
 
-    /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
+    /// At submission: the list that moves each texture and shadow buffer
+    /// this list uses from its real state to the one the list starts with;
+    /// their real states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         let (allocator, list) = &self.prelude;
         let mut opened: Option<windows::core::Result<()>> = None;
