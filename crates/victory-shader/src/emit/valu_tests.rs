@@ -1453,3 +1453,41 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+#[test]
+fn v_mul_hi_u32_and_i32_match_rdna2() {
+    // VOP3 opcodes: v_mul_hi_u32 = 0x16a, v_mul_hi_i32 = 0x16c.
+    let mul_u = build_valu_cs(&vop3(0x16a, 0, vgpr(1), vgpr(2), 0));
+    let mul_i = build_valu_cs(&vop3(0x16c, 0, vgpr(1), vgpr(2), 0));
+
+    let pairs: &[[u32; 4]] = &[
+        [0, 0, 0, 0],
+        [1, u32::MAX, 0, 0],
+        [0x0001_0000, 0x0001_0000, 0, 0],
+        [u32::MAX, u32::MAX, 0, 0],
+        [i32::MIN as u32, i32::MIN as u32, 0, 0],
+        [i32::MIN as u32, u32::MAX, 0, 0],
+        [i32::MAX as u32, i32::MAX as u32, 0, 0],
+        [i32::MAX as u32, i32::MIN as u32, 0, 0],
+        [0x1234_5678, 0x9ABC_DEF0, 0, 0],
+        [0xFFFF_0001, 0x8000_FFFF, 0, 0],
+    ];
+
+    run_cases(&mul_u, pairs, |backend, _, inp, got| {
+        let want = (((inp[0] as u64) * (inp[1] as u64)) >> 32) as u32;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mul_hi_u32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+
+    run_cases(&mul_i, pairs, |backend, _, inp, got| {
+        let want = ((((inp[0] as i32) as i64) * ((inp[1] as i32) as i64)) >> 32) as u32;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mul_hi_i32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+}
