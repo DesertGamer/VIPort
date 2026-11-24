@@ -75,10 +75,9 @@ desert_gamer@icloud.com.
 loads the world, where rendering fails.
 
 V2, 2026-11-25: on entering the world the host GPU still fails with a device
-removed error. Compared with upstream `main` on the same run, more shaders
-translate (about 3050 draws per frame reach the GPU instead of 2430, and 688
-are dropped for lack of a host pipeline instead of 1408), but frames still
-take seconds.
+removed error, as on upstream, and frames still take seconds. Frame figures
+differ a lot from one log line to the next, so V2 makes no claim that it
+renders more than upstream; that needs a measurement under the same conditions.
 
 The tables below are upstream's findings of 2026-11-23; V2 has not re-measured
 them.
