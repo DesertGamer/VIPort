@@ -214,8 +214,9 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
         }
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
+    let padded = len.next_multiple_of(256);
+    let (gpu, to) = list.scratch(padded)?;
+    list.defer_fill_padded(to, address as *const u8, len as usize, padded as usize);
     Some(gpu)
 }
 
@@ -2010,6 +2011,70 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    fn compile_compute(
+        host: &crate::host::Host,
+        source: &str,
+    ) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: source and entry-point strings live through the call.
+        let compiled = unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("cbv_test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(e) = compiled {
+            let text = errors
+                .as_ref()
+                .map(|b| {
+                    // SAFETY: the compiler's own error blob.
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(
+                            b.GetBufferPointer().cast::<u8>(),
+                            b.GetBufferSize(),
+                        )
+                    };
+                    String::from_utf8_lossy(slice).into_owned()
+                })
+                .unwrap_or_default();
+            panic!("test compute shader failed to compile ({e}): {text}");
+        }
+        let code = code.expect("compiled shader blob");
+        // SAFETY: compiled DXBC blob containing its embedded root signature.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host
+                .device
+                .CreateRootSignature(0, bytes)
+                .expect("test root signature");
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("test compute pso");
+            (root, pso)
+        }
+    }
+
     /// A title buffer of `bytes` in memory of its own.
     fn buffer(bytes: u64) -> This {
         let desc: [u32; 14] = [1, 0, 0, 0, bytes as u32, (bytes >> 32) as u32, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
@@ -2573,6 +2638,89 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    /// An unaligned root CBV copied to scratch near the end of a title buffer
+    /// zeroes its `[len..padded)` tail instead of exposing stale scratch bytes.
+    #[test]
+    fn unaligned_root_cbv_zeroes_scratch_padding_on_gpu() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        const SOURCE: &str = r#"
+#define RS "CBV(b0), UAV(u0)"
+cbuffer RootC : register(b0) { uint4 root_c[16]; };
+RWByteAddressBuffer out_buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    for (uint i = 0; i < 16; ++i) {
+        out_buf.Store4(i * 16, root_c[i]);
+    }
+}
+"#;
+        let (root, pso) = compile_compute(host, SOURCE);
+        let list = host.new_list().expect("host command list");
+
+        // Pass 1: poison scratch[0..256) and reset.
+        let (_, poison_ptr) = list.scratch(256).expect("scratch poison");
+        // SAFETY: mapped scratch chunk of at least 256 bytes.
+        unsafe { poison_ptr.write_bytes(0xCC, 256) };
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+
+        #[repr(align(256))]
+        struct Aligned([u32; 16]);
+        let mut backing = Aligned([0; 16]);
+        for (i, w) in backing.0.iter_mut().enumerate() {
+            *w = 0xAA55_0000 + i as u32;
+        }
+        let base = backing.0.as_ptr() as u64;
+        let resource_id = (&raw const backing) as usize;
+        // Register 64 bytes at `base`; binding `base + 16` gives a 16-byte
+        // unaligned GPU address with `left == 48` bytes before buffer end.
+        crate::shadow::register(resource_id, base, 64);
+        struct Unregister(usize, u64);
+        impl Drop for Unregister {
+            fn drop(&mut self) {
+                crate::shadow::unregister(self.0, self.1);
+            }
+        }
+        let _guard = Unregister(resource_id, base);
+
+        let root_gpu = root_view(&list, base + 16, false, false).expect("unaligned root cbv");
+        let (out_buf, out_ptr) = host.shared_buffer(256).expect("output buffer");
+        // SAFETY: mapped 256-byte buffer.
+        unsafe { out_ptr.write_bytes(0x77, 256) };
+        // SAFETY: live D3D12 buffer.
+        let out_gpu = unsafe { out_buf.GetGPUVirtualAddress() };
+
+        // SAFETY: open command list, live root signature, PSO and buffers.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootConstantBufferView(0, root_gpu);
+            list.list.SetComputeRootUnorderedAccessView(1, out_gpu);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: GPU execution has completed and `out_ptr` holds 64 dwords.
+        let got = unsafe { std::slice::from_raw_parts(out_ptr.cast::<u32>(), 64) };
+        assert_eq!(
+            &got[..12],
+            &backing.0[4..16],
+            "in-bounds root CBV bytes must match title memory"
+        );
+        assert!(
+            got[12..64].iter().all(|&w| w == 0),
+            "root CBV scratch tail [48..256) must read as zero, got {:x?}",
+            &got[12..20]
+        );
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
 
