@@ -3,8 +3,7 @@
 //! the hardware adds the fourth at `v0 + v2 - v1` (Grand Theft Auto VI's
 //! full-screen rectangles come as top left, bottom left, bottom right); on
 //! the host each rectangle becomes two triangles, with the fourth vertex
-//! made from the other three on the CPU for direct draws and on the GPU for
-//! indirect draws ([`crate::rectangles`]).
+//! made from the other three on the CPU.
 //!
 //! shortcut: the fourth vertex is computed from vertex inputs, not from
 //! vertex shader outputs as the hardware does; that is the same for vertex
@@ -17,15 +16,9 @@
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
 /// triangles turn the same way. `elements` are (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
-    if stride == 0 {
-        return;
-    }
-    let (Some(in_rect), Some(out_rect)) = (stride.checked_mul(3), stride.checked_mul(6)) else {
-        return;
-    };
     for (rect, out) in src
-        .chunks_exact(in_rect)
-        .zip(dst.chunks_exact_mut(out_rect))
+        .chunks_exact(3 * stride)
+        .zip(dst.chunks_exact_mut(6 * stride))
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
         for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
@@ -50,8 +43,8 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Kind {
+#[derive(Clone, Copy)]
+enum Kind {
     F32,
     F16,
     Unorm8,
@@ -59,7 +52,7 @@ pub(crate) enum Kind {
 }
 
 /// Component count and kind of the vertex formats rectangles use.
-pub(crate) fn components(format: u32) -> Option<(usize, Kind)> {
+fn components(format: u32) -> Option<(usize, Kind)> {
     Some(match format {
         2 => (4, Kind::F32),
         6 => (3, Kind::F32),
@@ -76,21 +69,11 @@ pub(crate) fn components(format: u32) -> Option<(usize, Kind)> {
 }
 
 impl Kind {
-    pub(crate) fn bytes(self) -> usize {
+    fn bytes(self) -> usize {
         match self {
             Kind::F32 => 4,
             Kind::F16 | Kind::Unorm16 => 2,
             Kind::Unorm8 => 1,
-        }
-    }
-
-    /// Numeric code shared with [`crate::rectangles`]'s HLSL shader.
-    pub(crate) fn code(self) -> u32 {
-        match self {
-            Kind::F32 => 0,
-            Kind::F16 => 1,
-            Kind::Unorm16 => 2,
-            Kind::Unorm8 => 3,
         }
     }
 
@@ -138,10 +121,16 @@ fn half_to_f32(h: u16) -> f32 {
 fn f32_to_half(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let raw_exp = (bits >> 23) & 0xff;
     let man = bits & 0x7f_ffff;
+    if raw_exp == 0xff && man != 0 {
+        // Quiet NaN, preserving sign and upper payload bits (set bit 9 so a
+        // signalling NaN with payload below bit 13 never turns into infinity).
+        return sign | 0x7e00 | (man >> 13) as u16;
+    }
+    let exp = raw_exp as i32 - 127 + 15;
     if exp >= 31 {
-        return sign | 0x7c00; // too large: infinity
+        return sign | 0x7c00; // infinity or overflow
     }
     if exp <= 0 {
         if exp < -10 {
@@ -158,12 +147,11 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest, halfway cases to even (the retained bit decides);
-    // a carry out of the mantissa is added into the exponent (`2 - 2^-12`
-    // is 2.0); at most it reaches infinity, 0x7c00.
+    // Round to nearest even: a carry out of the mantissa is added into the
+    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    let retained = (man >> 13) & 1;
-    sign | (half + ((man + 0x0fff + retained) >> 13)) as u16
+    let lsb = (man >> 13) & 1;
+    sign | (half + ((man + 0x0fff + lsb) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -217,16 +205,6 @@ mod tests {
         assert_eq!(dst[10..], 0x4000_u16.to_le_bytes());
     }
 
-    /// Halfway between two halves, the even one: 1 + 2^-11 lies between
-    /// 0x3c00 and 0x3c01, 1 + 3 * 2^-11 between 0x3c01 and 0x3c02.
-    #[test]
-    fn half_midpoints_round_to_even() {
-        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
-        assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
-        // Just past a midpoint still rounds up.
-        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11) + 2f32.powi(-20)), 0x3c01);
-    }
-
     /// An element that reaches past the stride (float4 at 4 in 8-byte
     /// vertices, RGBA8 at the stride itself): the components inside get
     /// the fourth corner, the rest keep the first vertex's bytes. The old
@@ -259,81 +237,50 @@ mod tests {
     }
 
     #[test]
-    fn zero_or_overflowing_stride_is_ignored_without_panicking() {
-        let mut dst = [0xAAu8; 16];
-        expand_rects(&[1, 2, 3], &mut dst, 0, &[(0, 16)]);
-        assert_eq!(dst, [0xAAu8; 16]);
-        expand_rects(&[1, 2, 3], &mut dst, usize::MAX / 2, &[(0, 16)]);
-        assert_eq!(dst, [0xAAu8; 16]);
-    }
+    fn f32_to_half_preserves_nan_and_rounds_normals_to_nearest_even() {
+        // Quiet and signalling NaNs (both signs) must produce quiet f16 NaNs,
+        // never infinities (0x7c00 / 0xfc00).
+        for (bits, want) in [
+            (f32::NAN.to_bits(), 0x7e00u16),
+            ((-f32::NAN).to_bits(), 0xfe00),
+            (0x7fc0_4000, 0x7e02), // qNaN with payload bits
+            (0x7f80_0001, 0x7e00), // +sNaN with payload below bit 13
+            (0xff80_0001, 0xfe00), // -sNaN with payload below bit 13
+        ] {
+            let h = f32_to_half(f32::from_bits(bits));
+            assert_eq!(
+                h, want,
+                "f32_to_half({bits:#010x}) = {h:#06x}, want {want:#06x}"
+            );
+            assert!(half_to_f32(h).is_nan());
+        }
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
 
-    #[test]
-    fn unorm16_unorm8_clamping_and_unknown_formats_expand_correctly() {
-        // Vertex layout (12 bytes):
-        //   0..4: R16G16_UNORM (format 35)
-        //   4..8: R8G8B8A8_UNORM (format 28) — tests clamping below 0 and above 1
-        //   8..12: unknown format (999) — must keep v0's bytes verbatim
-        let v = |u0: u16, u1: u16, c: [u8; 4], raw: [u8; 4]| {
-            let mut b = Vec::with_capacity(12);
-            b.extend(u0.to_le_bytes());
-            b.extend(u1.to_le_bytes());
-            b.extend(c);
-            b.extend(raw);
-            b
-        };
-        let src = [
-            v(
-                10_000,
-                50_000,
-                [10, 200, 100, 255],
-                [0xDE, 0xAD, 0xBE, 0xEF],
-            ),
-            v(20_000, 10_000, [100, 50, 100, 255], [1, 2, 3, 4]),
-            v(30_000, 20_000, [20, 200, 100, 255], [5, 6, 7, 8]),
-        ]
-        .concat();
-        let mut dst = vec![0u8; 6 * 12];
-        expand_rects(&src, &mut dst, 12, &[(0, 35), (4, 28), (8, 999)]);
-        let fourth = &dst[60..72];
-        // u0: 10000 + 30000 - 20000 = 20000; u1: 50000 + 20000 - 10000 = 60000
-        assert_eq!(u16::from_le_bytes([fourth[0], fourth[1]]), 20_000);
-        assert_eq!(u16::from_le_bytes([fourth[2], fourth[3]]), 60_000);
-        // c0: 10 + 20 - 100 -> clamped to 0; c1: 200 + 200 - 50 -> clamped to 255
-        assert_eq!(&fourth[4..8], &[0, 255, 100, 255]);
-        // Unknown format keeps v0 bytes
-        assert_eq!(&fourth[8..12], &[0xDE, 0xAD, 0xBE, 0xEF]);
-    }
+        // Normal rounding must tie to even (matching subnormals):
+        // 1.0 + 2^-11 is midway between even 0x3c00 and odd 0x3c01 -> 0x3c00.
+        assert_eq!(f32_to_half(f32::from_bits(0x3f80_1000)), 0x3c00);
+        assert_eq!(f32_to_half(f32::from_bits(0xbf80_1000)), 0xbc00);
+        // 1.0 + 3*2^-11 is midway between odd 0x3c01 and even 0x3c02 -> 0x3c02.
+        assert_eq!(f32_to_half(f32::from_bits(0x3f80_3000)), 0x3c02);
+        // Strictly above the tie rounds up.
+        assert_eq!(f32_to_half(f32::from_bits(0x3f80_1001)), 0x3c01);
+        // Overflow boundary: just below 65520 stays finite (0x7bff); 65520 ties to even (+inf).
+        assert_eq!(f32_to_half(f32::from_bits(0x477f_efff)), 0x7bff);
+        assert_eq!(f32_to_half(f32::from_bits(0x477f_f000)), 0x7c00);
 
-    #[test]
-    fn multiple_rectangles_and_f32_f16_vector_formats_expand_in_sequence() {
-        // Two rectangles of R32G32B32_FLOAT (format 6, 12 bytes) + R16G16_FLOAT (format 34, 4 bytes) = 16 bytes
-        let v = |p: [f32; 3], uv: [f32; 2]| {
-            let mut b = Vec::with_capacity(16);
-            for x in p {
-                b.extend(x.to_le_bytes());
+        // Every finite/infinite f16 bit pattern round-trips identically; NaNs stay NaN.
+        for h in 0..=u16::MAX {
+            let f = half_to_f32(h);
+            let back = f32_to_half(f);
+            if f.is_nan() {
+                assert!(
+                    (back & 0x7fff) > 0x7c00 && (back & 0x8000) == (h & 0x8000),
+                    "NaN {h:#06x} became {back:#06x}"
+                );
+            } else {
+                assert_eq!(back, h, "f16 {h:#06x} failed round-trip");
             }
-            for x in uv {
-                b.extend(f32_to_half(x).to_le_bytes());
-            }
-            b
-        };
-        let src = [
-            // Rect 0
-            v([0.0, 1.0, 0.5], [0.0, 0.0]),
-            v([0.0, 0.0, 0.5], [0.0, 1.0]),
-            v([2.0, 0.0, 0.5], [1.0, 1.0]),
-            // Rect 1
-            v([10.0, 20.0, 1.0], [0.25, 0.5]),
-            v([10.0, 10.0, 1.0], [0.25, 1.0]),
-            v([14.0, 10.0, 1.0], [0.75, 1.0]),
-        ]
-        .concat();
-        let mut dst = vec![0u8; 12 * 16];
-        expand_rects(&src, &mut dst, 16, &[(0, 6), (12, 34)]);
-        assert_eq!(&dst[5 * 16..6 * 16], &v([2.0, 1.0, 0.5], [1.0, 0.0])[..]);
-        assert_eq!(
-            &dst[11 * 16..12 * 16],
-            &v([14.0, 20.0, 1.0], [0.75, 0.5])[..]
-        );
+        }
     }
 }

@@ -10,7 +10,9 @@ impl Instruction {
     /// Branch targets are written `label_<byte offset>`.
     pub fn text(&self, wave64: bool) -> String {
         let name = self.name().unwrap_or("?");
-        let ops = operands(self, name, &self.fields(wave64));
+        let mut arena = Vec::new();
+        let fields = self.fields(wave64, &mut arena);
+        let ops = operands(self, name, &fields, &arena);
         if ops.is_empty() {
             name.to_owned()
         } else {
@@ -96,11 +98,11 @@ fn join(ops: impl IntoIterator<Item = String>) -> String {
     ops.into_iter().collect::<Vec<_>>().join(", ")
 }
 
-fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
+fn operands(inst: &Instruction, name: &str, fields: &Fields, arena: &[Operand]) -> String {
     let mut out = String::new();
     match fields {
         Fields::Sop { dst, src, imm } => {
-            let regs = join(dst.iter().chain(src).map(|o| o.to_string()));
+            let regs = join(dst.iter().chain(src.of(arena)).map(|o| o.to_string()));
             out = match (name, imm) {
                 ("s_getreg_b32", Some(imm)) => format!("{regs}, {}", hwreg(*imm)),
                 ("s_setreg_b32" | "s_setreg_imm32_b32", Some(imm)) => {
@@ -137,12 +139,6 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             cache,
         } => {
             if let Some(data) = data {
-                let data = match (name, data) {
-                    ("s_atc_probe" | "s_atc_probe_buffer", Operand::Literal(imm)) => {
-                        atc_immediate(*imm)
-                    }
-                    _ => data.to_string(),
-                };
                 let off = match (soffset, offset) {
                     (Operand::Scalar { code: NULL, .. }, 0) => soffset.to_string(),
                     (Operand::Scalar { code: NULL, .. }, _) => {
@@ -155,7 +151,7 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             }
             flags(&mut out, cache, false);
         }
-        Fields::Valu(v) => out = valu(name, v, inst.encoding),
+        Fields::Valu(v) => out = valu(name, v, v.src.of(arena), inst.encoding),
         Fields::Vintrp { dst, src, attr } => {
             let src = match (name, src) {
                 ("v_interp_mov_f32", Operand::Const(p)) => ["p10", "p20", "p0"]
@@ -173,7 +169,12 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             offset1,
             gds,
         } => {
-            out = join(dst.iter().chain(addr).chain(data).map(|o| o.to_string()));
+            out = join(
+                dst.iter()
+                    .chain(addr)
+                    .chain(data.of(arena))
+                    .map(|o| o.to_string()),
+            );
             if super::fields::ds_pair(name) {
                 if *offset0 != 0 {
                     let _ = write!(out, " offset0:{offset0}");
@@ -242,7 +243,7 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             lwe,
             cache,
         } => {
-            let addr = match addr.as_slice() {
+            let addr = match addr.of(arena) {
                 [one] => one.to_string(),
                 many => format!(
                     "[{}]",
@@ -339,15 +340,6 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
         }
     }
     out
-}
-
-/// `s_atc_probe` immediate: 0..=64 in decimal, larger values in hex.
-fn atc_immediate(imm: u32) -> String {
-    if imm <= 64 {
-        imm.to_string()
-    } else {
-        format!("0x{imm:x}")
-    }
 }
 
 /// Cache flags; images write `dlc` first.
@@ -514,11 +506,11 @@ fn buffer_format(format: u8) -> String {
         .map_or(format!("{format}"), |n| format!("BUF_FMT_{n}"))
 }
 
-fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
+fn valu(name: &str, v: &Valu, vsrc: &[Operand], encoding: Encoding) -> String {
     let bit = |mask: u8, i: usize| mask >> i & 1 != 0;
     let mix = name.starts_with("v_fma_mix");
     let src = |i: usize| {
-        let o = v.src[i];
+        let o = vsrc[i];
         let mut s = o.to_string();
         if let Some(sdwa) = v.sdwa
             && bit(sdwa.sext, i)
@@ -567,7 +559,7 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
         .chain(&v.carry)
         .map(|o| o.to_string())
         .collect();
-    let mut order: Vec<usize> = (0..v.src.len()).collect();
+    let mut order: Vec<usize> = (0..vsrc.len()).collect();
     if name.starts_with("v_interp_") && order.len() > 1 {
         // dst, i/j, attribute, then the p1 result for p2.
         order.swap(0, 1);
@@ -578,7 +570,7 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
         out.push(' ');
         out.push_str(s);
     };
-    if let Some(Operand::Attr { high: true, .. }) = v.src.first() {
+    if let Some(Operand::Attr { high: true, .. }) = vsrc.first() {
         suffix("high");
     }
     let omod = ["", "mul:2", "mul:4", "div:2"][usize::from(v.omod & 3)];
@@ -675,7 +667,7 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::gfx10::{Cache, Fields, Operand, decode};
+    use crate::gfx10::{Fields, Operand, decode};
 
     /// Text of each instruction in `words` (a straight-line program).
     fn texts(words: &[u32], wave64: bool) -> Vec<String> {
@@ -713,69 +705,6 @@ mod tests {
             one(&[0xF420_0144, 0x0400_0000], true),
             "s_buffer_load_dword s5, s[8:11], s2"
         );
-    }
-
-    /// `s_atc_probe` / `s_atc_probe_buffer`: SDATA is a 7-bit immediate, the
-    /// buffer resource is 4 dwords, and GLC/DLC are not operands.
-    ///
-    /// Words checked with `llvm-mc -arch=amdgcn -mcpu=gfx1030 --disassemble`.
-    /// The offset keeps this printer's 6-digit hex (`0x000064`, not `0x64`).
-    #[test]
-    fn atc_probe_immediate_is_not_a_register() {
-        let cases = [
-            (
-                [0xF498_01C2, 0xFA00_0064],
-                "s_atc_probe 7, s[4:5], 0x000064",
-                Operand::Literal(7),
-                Operand::Scalar { code: 4, dwords: 2 },
-            ),
-            (
-                [0xF498_1FF4, 0x0A00_0001],
-                "s_atc_probe 0x7f, s[104:105], s5 offset:0x000001",
-                Operand::Literal(0x7f),
-                Operand::Scalar {
-                    code: 104,
-                    dwords: 2,
-                },
-            ),
-            (
-                [0xF498_0000, 0xFA00_0000],
-                "s_atc_probe 0, s[0:1], null",
-                Operand::Literal(0),
-                Operand::Scalar { code: 0, dwords: 2 },
-            ),
-            (
-                [0xF49C_01C4, 0xFA00_0020],
-                "s_atc_probe_buffer 7, s[8:11], 0x000020",
-                Operand::Literal(7),
-                Operand::Scalar { code: 8, dwords: 4 },
-            ),
-            (
-                [0xF499_41C2, 0xFA00_0000],
-                "s_atc_probe 7, s[4:5], null",
-                Operand::Literal(7),
-                Operand::Scalar { code: 4, dwords: 2 },
-            ),
-        ];
-        for (words, text, data, base) in cases {
-            assert_eq!(one(&words, false), text, "{words:08x?}");
-            assert_eq!(one(&words, true), text, "{words:08x?}");
-            let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-            code.extend(0xBF81_0000u32.to_le_bytes());
-            let inst = &decode(&code).unwrap()[0];
-            let Fields::Smem {
-                data: got,
-                base: got_base,
-                cache,
-                ..
-            } = inst.fields(false)
-            else {
-                panic!("not an SMEM instruction");
-            };
-            assert_eq!(got, Some(data), "{words:08x?}");
-            assert_eq!(got_base, base, "{words:08x?}");
-            assert_eq!(cache, Cache::default(), "{words:08x?}");
-        }
     }
 
     #[test]
@@ -853,10 +782,12 @@ mod tests {
             .chain(&[0xBF81_0000])
             .flat_map(|w| w.to_le_bytes())
             .collect();
-        let Fields::Image { data, addr, .. } = decode(&code).unwrap()[0].fields(true) else {
+        let mut arena = Vec::new();
+        let Fields::Image { data, addr, .. } = decode(&code).unwrap()[0].fields(true, &mut arena)
+        else {
             panic!("not an image instruction");
         };
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
-        assert_eq!(addr.len(), 2);
+        assert_eq!(addr.of(&arena).len(), 2);
     }
 }

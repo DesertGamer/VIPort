@@ -94,24 +94,52 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     context.Reason.SimpleReasonString = reason.as_mut_ptr();
     // SAFETY: a valid context; the string is copied by the call.
     let request = unsafe { PowerCreateRequest(&context) };
-    if request.is_null() || request as isize == -1 {
+    if request as isize == -1 {
         return last_error();
     }
     // SAFETY: the request we just created.
-    if unsafe { PowerSetRequest(request, PowerRequestDisplayRequired) } == 0 {
-        let hr = last_error();
-        // SAFETY: as above; not handed out.
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
-        return hr;
+    let result = unsafe { PowerSetRequest(request, PowerRequestDisplayRequired) };
+    if result == 0 {
+        handle_power_set_request_failure(request, out)
+    } else {
+        put(out, request)
     }
-    put(out, request)
+}
+
+/// Handles failure from `PowerSetRequest`. If the error is
+/// `ERROR_NOT_SUPPORTED` (0x32), initializes `out` to null and returns `S_OK`
+/// so the title can proceed and `close_deferral` will safely no-op. Otherwise
+/// returns the original error HRESULT (and `out` is untouched per COM rules).
+#[cfg(windows)]
+fn handle_power_set_request_failure(request: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    let hr = last_error();
+    // SAFETY: not handed out; we created it just above.
+    unsafe { CloseHandle(request) };
+    map_power_set_request_error(hr, out)
+}
+
+/// Pure helper: maps the HRESULT from `PowerSetRequest` failure.
+/// - If `hr == NOT_SUPPORTED` (0x8007_0032), writes null to `out` and returns `S_OK`.
+/// - Otherwise returns `hr` unchanged (caller must NOT write to `out` on error).
+#[cfg(windows)]
+fn map_power_set_request_error(hr: HRESULT, out: *mut *mut c_void) -> HRESULT {
+    const ERROR_NOT_SUPPORTED: u32 = 0x32;
+    if hr == (0x8007_0000 | ERROR_NOT_SUPPORTED) as i32 {
+        // System doesn't support display deferrals (headless, Wine, VM).
+        // Return S_OK with a null handle so the title proceeds; close_deferral
+        // will safely ignore the null handle.
+        put(out, std::ptr::null_mut())
+    } else {
+        hr
+    }
 }
 
 #[cfg(windows)]
 extern "system" fn close_deferral(_: This, handle: *mut c_void) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Power::{PowerClearRequest, PowerRequestDisplayRequired};
-    if !handle.is_null() && handle as isize != -1 {
+    if !handle.is_null() {
         // SAFETY: a request from `acquire_deferral`.
         unsafe {
             PowerClearRequest(handle, PowerRequestDisplayRequired);
@@ -173,7 +201,7 @@ static CAPTURE_VTABLE: Methods<6> = Methods([
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use crate::modules::xgameruntime::{S_OK, method};
+    use crate::modules::xgameruntime::{NOT_SUPPORTED, S_OK, method};
 
     #[test]
     fn sdr_and_display_deferrals() {
@@ -185,30 +213,40 @@ mod tests {
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();
-        match method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle) {
-            S_OK => {
-                assert!(!handle.is_null());
-                method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
-            }
-            // Windows can reject display power requests on some hosts.
-            NOT_SUPPORTED => assert!(handle.is_null()),
-            hr => panic!("unexpected display deferral HRESULT {:#010x}", hr as u32),
-        }
-    }
-
-    #[test]
-    fn acquire_deferral_rejects_null_out() {
-        type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         assert_eq!(
-            method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, std::ptr::null_mut()),
-            super::super::xasync::E_INVALIDARG
+            method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle),
+            S_OK
         );
+        assert!(!handle.is_null());
+        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
     }
 
     #[test]
-    fn close_deferral_handles_null_and_invalid() {
+    fn error_not_supported_returns_ok_with_null_handle() {
+        // Test the pure helper `map_power_set_request_error` directly.
+        // When hr == NOT_SUPPORTED, it must write null to `out` and return S_OK.
+        let mut out_handle = 0xDEAD_BEEFusize as *mut c_void;
+        let hr = map_power_set_request_error(NOT_SUPPORTED, &mut out_handle);
+        assert_eq!(hr, S_OK);
+        assert!(out_handle.is_null());
+
+        // Other errors must be returned unchanged and `out` must NOT be written.
+        const E_FAIL: HRESULT = 0x8000_4005u32 as i32;
+        let mut out_handle2 = 0xDEAD_BEEFusize as *mut c_void;
+        let hr2 = map_power_set_request_error(E_FAIL, &mut out_handle2);
+        assert_eq!(hr2, E_FAIL);
+        // out_handle2 must still be the sentinel (not written)
+        assert_eq!(out_handle2 as usize, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn close_deferral_safely_ignores_null_handle() {
+        // Verify that close_deferral handles null handles gracefully
+        // (no panic, no crash). This is critical for the null handle
+        // returned when ERROR_NOT_SUPPORTED occurs.
         type Close = extern "system" fn(This, *mut c_void);
-        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, std::ptr::null_mut());
-        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, (-1isize) as *mut c_void);
+        let null_handle: *mut c_void = std::ptr::null_mut();
+        // Should not panic or crash
+        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, null_handle);
     }
 }

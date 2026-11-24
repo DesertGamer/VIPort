@@ -17,6 +17,8 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod fidelityfx;
+#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -26,8 +28,6 @@ pub mod lifecycle;
 pub mod media;
 #[cfg(windows)]
 pub mod net;
-/// Lexical Windows path rules, host-independent so CI covers them.
-pub(crate) mod paths;
 pub mod speech;
 pub mod storage;
 pub mod xasync;
@@ -72,5 +72,9 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    #[cfg(windows)]
+    if fidelityfx::serving() {
+        all.push(fidelityfx::module());
+    }
     all
 }

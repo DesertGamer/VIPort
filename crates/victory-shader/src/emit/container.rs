@@ -25,32 +25,6 @@ pub(crate) struct SigElement {
 }
 
 impl SigElement {
-    /// Canonical DXIL semantic name for system values (`kind != 0`), matching
-    /// what `dxil.dll` writes when regenerating `ISG1`/`OSG1` during validation.
-    fn canonical_name(&self) -> &str {
-        match self.kind {
-            1 => "SV_VertexID",
-            2 => "SV_InstanceID",
-            3 => "SV_Position",
-            4 => "SV_RenderTargetArrayIndex",
-            5 => "SV_ViewportArrayIndex",
-            6 => "SV_ClipDistance",
-            7 => "SV_CullDistance",
-            10 => "SV_PrimitiveID",
-            12 => "SV_SampleIndex",
-            13 => "SV_IsFrontFace",
-            14 => "SV_Coverage",
-            15 => "SV_InnerCoverage",
-            16 => "SV_Target",
-            17 => "SV_Depth",
-            18 => "SV_DepthLessEqual",
-            19 => "SV_DepthGreaterEqual",
-            20 => "SV_StencilRef",
-            30 => "SV_CullPrimitive",
-            _ => &self.name,
-        }
-    }
-
     fn system_value(&self) -> u32 {
         match self.kind {
             1 => 6,  // vertex id
@@ -70,7 +44,6 @@ impl SigElement {
             18 => 68,
             19 => 67,
             20 => 69,
-            28 => 23, // barycentrics
             30 => 25, // cull primitive
             _ => 0,
         }
@@ -91,6 +64,30 @@ impl SigElement {
 }
 
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
+/// Gives the elements of a row whose interpolation mode nothing decided
+/// (float elements, unless `read` and read) the mode the row's other
+/// elements agree on: DXIL wants one mode per row, and the console's
+/// signature, packed by the source's modes, had one (an int or a system
+/// value beside a float means the float was `nointerpolation`).
+pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
+    let free = |e: &SigElement| e.kind == 0 && e.comp == 9 && !(read && e.usage != 0);
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let decided = |e: &&SigElement| e.row == Some(row) && !free(e) && e.interp != 0;
+        let mut modes = elements.iter().filter(decided).map(|e| e.interp);
+        let Some(mode) = modes.next() else { continue };
+        if modes.any(|m| m != mode) {
+            continue;
+        }
+        let undecided = |e: &&mut SigElement| e.row == Some(row) && free(e);
+        for e in elements.iter_mut().filter(undecided) {
+            e.interp = mode;
+        }
+    }
+}
+
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());
@@ -98,8 +95,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows are stably sorted by register (unallocated last), preserving
-    // element order within a row.
+    // the rows sorted by register (unallocated last).
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -110,10 +106,9 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         match shared {
             Some(j) => offsets.push(offsets[j]),
             None => {
-                let name = e.canonical_name();
                 offsets.push(next);
-                next += name.len() as u32 + 1;
-                names.push(name);
+                next += e.name.len() as u32 + 1;
+                names.push(&e.name);
             }
         }
     }
@@ -165,16 +160,15 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Geometry: its maximum output vertices (triangles in, strips out).
+    pub gs: Option<u32>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
-    /// Emit `PSVRuntimeInfo3` (52 bytes, with `EntryFunctionName`) for
-    /// validator 1.8 (required for SM 6.6 compute-shader derivatives).
-    pub valver_1_8: bool,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6) or 3 (validator 1.8).
+/// `PSV0` with runtime info version 2 (validator 1.6).
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -190,7 +184,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[if p.valver_1_8 { 52 } else { 48 }]);
+    u32s(&mut out, &[48]);
     let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
@@ -221,15 +215,16 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
     }
-    out.extend(info);
-    // Names of arbitrary semantics (system values use ""), then indices.
-    let mut strings = vec![0u8];
-    if p.valver_1_8 {
-        // EntryFunctionName offset into the PSV string table ("main\0").
-        let entry_name = strings.len() as u32;
-        strings.extend_from_slice(b"main\0");
-        u32s(&mut out, &[entry_name]);
+    if let Some(max) = p.gs {
+        // Input primitive (triangle), output topology (triangle strip),
+        // stream mask, then whether it writes a position.
+        for (k, v) in [3u32, 5, 1].into_iter().enumerate() {
+            info[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        info[12] = u8::from(p.flag);
+        info[26..28].copy_from_slice(&(max as u16).to_le_bytes());
     }
+    out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -240,6 +235,8 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
+    // Names of arbitrary semantics (system values use ""), then indices.
+    let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {

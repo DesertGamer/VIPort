@@ -4,8 +4,8 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
-mod compare;
 mod inspect;
+mod prebuild;
 mod run;
 mod shader;
 mod translate;
@@ -58,15 +58,21 @@ enum Command {
         list: bool,
     },
     /// Find shader containers in files or directories (also inside engine
-    /// archives, if uncompressed) and report their layout.
+    /// archives, if uncompressed) and report their layout. Shader packs
+    /// among the paths are listed last, their stages named from the
+    /// containers found.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found.
+        /// Print one line per container found (and per pack pipeline).
         #[arg(long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
+        /// Instead list the effects of shader databases: technique, pass,
+        /// shaders (name, container hash, engine hash) and pass state.
+        #[arg(long)]
+        effects: bool,
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
@@ -76,23 +82,23 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader.
+        /// Also create a host D3D12 pipeline for each emitted shader. With
+        /// `--cache`: then make every pipeline of the title's shader pack
+        /// into the host pipeline library `run` reads (on this GPU and
+        /// driver; a second time only what is not there yet).
         #[arg(long)]
         pipelines: bool,
-        /// Include runtime hashes and duplicate DXIL containers in the per-program listing.
+        /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
-    },
-    /// Compare two `translate --list` outputs program by program: what the
-    /// second run gained and lost, and where it stopped instead.
-    Compare {
-        /// The run to measure against.
-        before: PathBuf,
-        /// The changed run.
-        after: PathBuf,
+        /// Only translate into the shader cache `run` reads (the warm-up):
+        /// every container found, once, nothing else checked or listed
+        /// (with `--pipelines`, then the shader pack's pipelines).
+        #[arg(long, conflicts_with_all = ["validate", "list"])]
+        cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -154,15 +160,23 @@ fn main() -> Result<()> {
             paths,
             verbose,
             disasm,
-        } => shader::run(paths, verbose || disasm, disasm),
+            effects,
+        } => shader::run(paths, verbose || disasm, disasm, effects),
+        Command::Translate {
+            paths,
+            jobs,
+            pipelines,
+            cache: true,
+            ..
+        } => translate::warm(paths, jobs, pipelines),
         Command::Translate {
             paths,
             validate,
             pipelines,
             list,
             jobs,
+            cache: false,
         } => translate::run(paths, validate, pipelines, list, jobs),
-        Command::Compare { before, after } => compare::run(before, after),
         Command::Run {
             exe,
             unimplemented,
@@ -191,6 +205,7 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
@@ -218,35 +233,5 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         !all.is_empty(),
         "no paths given and none configured (see victory.example.toml)"
     );
-    for p in &all {
-        victory_core::ensure_outside_repo(p)?;
-    }
     Ok(all)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_paths_accepts_cli_paths() {
-        // CLI paths may include synthetic in-tree test fixtures.
-        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let res = default_paths(vec![inside.clone()]).unwrap();
-        assert_eq!(res, vec![inside]);
-    }
-
-    #[test]
-    fn default_paths_accepts_outside_path() {
-        let outside = std::env::temp_dir();
-        let res = default_paths(vec![outside.clone()]).unwrap();
-        assert_eq!(res, vec![outside]);
-    }
-
-    #[test]
-    fn default_paths_rejects_configured_inside_repo() {
-        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let err = victory_core::ensure_outside_repo(&inside).unwrap_err();
-        assert!(err.to_string().contains("inside"));
-    }
 }

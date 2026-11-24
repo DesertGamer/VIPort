@@ -5,7 +5,7 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -97,9 +97,6 @@ pub(crate) enum Cast {
 
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
-    // FALSE and TRUE are not emitted: WARP removes its device on them (and
-    // DXC folds them away), so constant compares lower as constants.
-    #[allow(dead_code)]
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;
@@ -118,7 +115,6 @@ pub(crate) mod pred {
     pub const ULT: u8 = 12;
     pub const ULE: u8 = 13;
     pub const UNE: u8 = 14;
-    #[allow(dead_code)]
     pub const TRUE: u8 = 15;
     pub const EQ: u8 = 32;
     pub const NE: u8 = 33;
@@ -212,6 +208,9 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// Structures chosen between by a condition: `(cond, other)` by the
+    /// one taken where `cond` holds. [`Module::extract`] chooses the field.
+    pub chosen: HashMap<V, (V, V)>,
 }
 
 impl Module {
@@ -312,10 +311,6 @@ impl Module {
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
-            if self.const_ids.get(&self.consts[o as usize]) == Some(&o) {
-                let prev = self.consts[o as usize].clone();
-                self.const_ids.remove(&prev);
-            }
             self.consts[o as usize] = self.consts[n as usize].clone();
         }
     }
@@ -414,7 +409,14 @@ impl Module {
             TypeDef::Array(_, t) => *t,
             t => panic!("extractvalue from {t:?}"),
         };
-        self.push(block, ty, Op::Extract(agg, index))
+        let x = self.push(block, ty, Op::Extract(agg, index));
+        match self.chosen.get(&agg).copied() {
+            Some((cond, other)) => {
+                let y = self.push(block, ty, Op::Extract(other, index));
+                self.select(block, cond, x, y)
+            }
+            None => x,
+        }
     }
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {
@@ -494,38 +496,12 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    /// Blocks reachable from entry (index 0) and their reverse postorder.
-    fn reachable(&self) -> (Vec<bool>, Vec<usize>) {
-        let succs = |b: usize| successors(self.blocks[b].term);
-        let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
-        seen[0] = true;
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            top.1 += 1;
-            match succs(b).get(k) {
-                Some(&s) if !seen[s] => {
-                    seen[s] = true;
-                    stack.push((s, 0));
-                }
-                Some(_) => {}
-                None => {
-                    post.push(b);
-                    stack.pop();
-                }
-            }
-        }
-        post.reverse();
-        (seen, post)
-    }
-
-    /// Which instructions are written: every body instruction in reachable
-    /// blocks, the branch conditions, and whatever they read, transitively
-    /// (a phi nothing reads, or an incoming edge from an unreachable block,
+    /// The module as bitcode.
+    /// Which instructions are written: every body instruction, the branch
+    /// conditions, and whatever they read, transitively (a phi nothing reads
     /// is dropped). A worklist visits each instruction once, so a long chain
     /// of merges costs one pass, not one pass per merge.
-    fn live(&self, reachable: &[bool]) -> Vec<bool> {
+    fn live(&self) -> Vec<bool> {
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
@@ -536,10 +512,7 @@ impl Module {
                 work.push(i);
             }
         };
-        for (b_idx, b) in self.blocks.iter().enumerate() {
-            if !reachable[b_idx] {
-                continue;
-            }
+        for b in &self.blocks {
             for &i in &b.body {
                 mark(&mut live, &mut work, V::Inst(i));
             }
@@ -548,16 +521,9 @@ impl Module {
             }
         }
         while let Some(i) = work.pop() {
-            match &self.insts[i as usize].op {
-                Op::Phi(inc) => {
-                    for &(v, pred) in inc {
-                        if reachable[pred] {
-                            mark(&mut live, &mut work, v);
-                        }
-                    }
-                }
-                op => for_each_operand(op, |v| mark(&mut live, &mut work, v)),
-            }
+            for_each_operand(&self.insts[i as usize].op, |v| {
+                mark(&mut live, &mut work, v)
+            });
         }
         live
     }
@@ -694,13 +660,33 @@ impl Module {
         }
         w.exit();
 
+        // Phis nothing reads are left out (one register per phi makes many).
+        let live = self.live();
+
         // Blocks are laid out in reverse postorder, so every block follows
         // its forward predecessors (drivers take a branch to an earlier
         // block for a loop's back edge).
-        let (seen, post) = self.reachable();
-        // Phis nothing reads (and operands from unreachable edges) are left out.
-        let live = self.live(&seen);
         let succs = |b: usize| successors(self.blocks[b].term);
+        let mut seen = vec![false; self.blocks.len()];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in post.iter().enumerate() {
             pos[b] = n as u64;
@@ -714,19 +700,15 @@ impl Module {
                 preds[s].push(b);
             }
         }
-        let mut fold: Vec<Option<(usize, usize)>> = vec![None; self.blocks.len()];
-        let mut folded_edges: HashSet<(usize, usize)> = HashSet::new();
+        let mut fold = vec![None; self.blocks.len()];
         for &b in &post {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
                 blk.term,
                 blk.phis.is_empty() && blk.body.is_empty(),
                 &preds[b][..],
-            ) && fold[*p].is_none()
-                && fold[h].is_none()
-                && pos[h] < pos[b]
+            ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
-                && folded_edges.insert((*p, h))
             {
                 fold[b] = Some((*p, h));
             }
@@ -851,9 +833,6 @@ impl Module {
                         r.clear();
                         r.push(u64::from(inst.ty.0));
                         for &(v, b) in incoming {
-                            if !seen[b] {
-                                continue;
-                            }
                             r.push(signed(i64::from(inst_id) - i64::from(abs(v))));
                             r.push(from(b));
                         }
@@ -1162,8 +1141,7 @@ mod tests {
     fn worklist_liveness_matches_passes() {
         for (regs, stages, read) in [(1, 0, 1), (1, 1, 1), (4, 3, 1), (8, 17, 3), (16, 40, 16)] {
             let m = synthetic(regs, stages, read);
-            let (reach, _) = m.reachable();
-            let live = m.live(&reach);
+            let live = m.live();
             assert_eq!(live, live_by_passes(&m), "{regs} regs x {stages} stages");
         }
     }
@@ -1190,23 +1168,10 @@ mod tests {
             V::Inst(i) => i as usize,
             _ => unreachable!(),
         };
-        let (reach, _) = m.reachable();
-        let live = m.live(&reach);
+        let live = m.live();
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
-    }
-
-    #[test]
-    fn replace_const_evicts_old_cache_key() {
-        let mut m = Module::default();
-        let c42 = m.i32(42);
-        let c99 = m.i32(99);
-        m.replace_const(c42, c99);
-        let fresh_42 = m.i32(42);
-        assert_ne!(fresh_42, c42);
-        assert_eq!(m.int_value(c42), Some(99));
-        assert_eq!(m.int_value(fresh_42), Some(42));
     }
 
     #[test]

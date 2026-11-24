@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -13,7 +13,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::Foundation::WAIT_TIMEOUT;
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -37,7 +38,6 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    caps: HostCaps,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -49,13 +49,16 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
+    /// A ring of CPU-only views, for the CPU handles of unordered access
+    /// clears, used as `rtvs`.
+    cpu_views: ID3D12DescriptorHeap,
+    cpu_view_size: u32,
+    next_cpu_view: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
-    /// Upload buffers kept for reuse across lists once reset.
-    upload_pool: Mutex<Vec<PooledUpload>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -67,52 +70,6 @@ unsafe impl Sync for Host {}
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
-/// Host objects the title let go of while a submission may still use them
-/// (a texture its descriptors name, a descriptor slot's old resource), by
-/// the submission count they wait for. The title's descriptor writes and
-/// releases reach the host at once, from its own threads, while the host
-/// runs a submission for most of a second in the world: freeing there was
-/// a GPU page fault on the freed texture (DXGI_ERROR_DEVICE_HUNG,
-/// 2026-11-24, RX 7600).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
-/// Submissions started and finished (waited for).
-static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// A retired object, dropped on whatever thread finishes the submission.
-struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
-// SAFETY: what is retired is D3D12 objects (free-threaded) and the
-// reference-counted wrappers holding them, dropped once.
-unsafe impl Send for Retired {}
-
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
-pub(crate) fn retire<T: 'static>(object: T) {
-    let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
-        drop(object);
-        return;
-    }
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
-}
-
-/// Drops what waited for submissions up to `finished`.
-fn bury(finished: u64) {
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        if retired.is_empty() {
-            return;
-        }
-        let (done, keep) = std::mem::take(&mut *retired).into_iter().partition(|(at, _)| *at <= finished);
-        *retired = keep;
-        done
-    };
-    drop(done);
-}
-
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
@@ -166,6 +123,71 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+/// How a wait for a submission ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waited {
+    /// The host signalled the submission's fence.
+    Done,
+    /// The device was removed while the submission ran.
+    Removed,
+    /// Neither after [`STALL_SECS`]: the GPU has faulted or hung and the
+    /// host has not said so.
+    Stalled,
+}
+
+/// How long one wait for a submission lasts before the device is asked
+/// whether it is still there.
+const WAIT_SLICE_MS: u32 = 250;
+
+/// A submission still running after this many seconds is said so, and again
+/// each time that time has doubled.
+const LONG_WAIT_SECS: u64 = 10;
+
+/// A submission still running after this many seconds is given up. A host
+/// whose GPU faults may neither finish the work nor report the device
+/// removed: vkd3d-proton waits on the driver without an end unless
+/// `VKD3D_CONFIG=fault` or `breadcrumbs` is set, and says itself that such
+/// a wait of over 5 s is a lost device. Windows resets a device whose
+/// submission runs for about 2 s. The title ends its own run when its main
+/// thread has waited 30 s for the render thread, which a submission that
+/// never finishes brings about; this is below that, so the run ends with
+/// our report of the cause and not with the title's.
+const STALL_SECS: u64 = 25;
+
+/// Waits for a submission: `signalled` waits one slice ([`WAIT_SLICE_MS`])
+/// for its fence and says whether it came. Between slices `removed` asks
+/// the device whether it was removed, because a host that loses its device
+/// need not signal the fences of the work it dropped (vkd3d-proton after a
+/// GPU fault does not), and a wait without an end then holds the title's
+/// submit thread until the title ends the run, with no report of ours.
+/// `long` is told the seconds waited so far, at [`LONG_WAIT_SECS`] and each
+/// doubling of it; at [`STALL_SECS`] the wait is given up.
+fn wait_for_submission(
+    mut signalled: impl FnMut() -> bool,
+    mut removed: impl FnMut() -> bool,
+    mut long: impl FnMut(u64),
+) -> Waited {
+    let mut slices = 0u64;
+    let mut report_at = LONG_WAIT_SECS;
+    loop {
+        if signalled() {
+            return Waited::Done;
+        }
+        if removed() {
+            return Waited::Removed;
+        }
+        slices += 1;
+        let secs = slices * u64::from(WAIT_SLICE_MS) / 1000;
+        if secs >= STALL_SECS {
+            return Waited::Stalled;
+        }
+        if secs >= report_at {
+            long(secs);
+            report_at *= 2;
+        }
+    }
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -180,7 +202,7 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
-fn create() -> anyhow::Result<Host> {
+fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -221,8 +243,6 @@ fn create() -> anyhow::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
-        let (device, adapter_desc) = create_device()?;
-        let caps = probe_caps(&device, &adapter_desc);
         let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
@@ -232,27 +252,9 @@ fn create() -> anyhow::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            // Not `D3D12CreateDevice(None, …)`: the adapter DXGI calls the
-            // default is the one driving the primary output, which on a
-            // hybrid laptop is the integrated GPU and can be a display-only
-            // adapter on a machine with a remote-desktop or emulator driver.
-            // `adapter` picks one that can run the title and says what every
-            // adapter offers when none can.
-            let (chosen, _) = crate::adapter::open()?;
-            device = Some(chosen);
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            // Whether a GPU hang ends the run or freezes the PC (#1054).
-            crate::tdr::log();
-            #[cfg(all(test, feature = "diagnostics"))]
-            let adapter = present_tests::adapter()?;
-            #[cfg(not(all(test, feature = "diagnostics")))]
-            let adapter: Option<windows::core::IUnknown> = None;
-            D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
-        let mem = adapter_memory(&device).unwrap_or(0);
-        DEVICE_MEMORY.store(mem, Ordering::Relaxed);
-        tracing::info!(bytes = mem, "host device memory");
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -276,10 +278,31 @@ fn create() -> anyhow::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        tracing::info!("host D3D12 device ready: {}", caps.summary());
+        let cpu_views: ID3D12DescriptorHeap =
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: RTV_RING,
+                ..Default::default()
+            })?;
+        let cpu_view_size =
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        tracing::info!("host D3D12 device ready");
+        // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
+        // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
+        // host chooses (the RX 6700 XT does, WARP does not).
+        match (victory_shader::emit::host::Host {
+            device: device.clone(),
+        })
+        .fuses_fmad()
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                "the host GPU does not fuse multiply-adds: results of the console's fused v_fma and v_fmac can differ in kind here"
+            ),
+            Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
+        }
         Ok(Host {
             device,
-            caps,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -289,459 +312,13 @@ fn create() -> anyhow::Result<Host> {
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
+            cpu_views,
+            cpu_view_size,
+            next_cpu_view: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
-            upload_pool: Mutex::new(Vec::new()),
         })
-    }
-}
-
-/// Optional adapter override parsed from `VICTORY_D3D12_ADAPTER`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum AdapterFilter {
-    /// 0-based index into the enumerated hardware adapter list.
-    Index(usize),
-    /// Lowercased substring matched case-insensitively against adapter name.
-    Name(String),
-}
-
-impl AdapterFilter {
-    fn parse(raw: &str) -> Option<Self> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        if trimmed.bytes().all(|b| b.is_ascii_digit())
-            && let Ok(index) = trimmed.parse::<usize>()
-        {
-            return Some(Self::Index(index));
-        }
-        Some(Self::Name(trimmed.to_lowercase()))
-    }
-
-    fn matches(&self, index: usize, description: &str) -> bool {
-        match self {
-            Self::Index(wanted) => index == *wanted,
-            Self::Name(needle) => description.to_lowercase().contains(needle),
-        }
-    }
-}
-
-/// Probed capabilities of the selected host D3D12 adapter and device.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) struct HostCaps {
-    pub(crate) adapter_description: String,
-    pub(crate) vendor_id: u32,
-    pub(crate) device_id: u32,
-    pub(crate) dedicated_vram_mb: u64,
-    pub(crate) is_software: bool,
-    pub(crate) resource_binding_tier: D3D12_RESOURCE_BINDING_TIER,
-    pub(crate) tiled_resources_tier: D3D12_TILED_RESOURCES_TIER,
-    pub(crate) wave_ops: bool,
-    pub(crate) wave_lane_count_min: u32,
-    pub(crate) wave_lane_count_max: u32,
-    pub(crate) mesh_shader_tier: D3D12_MESH_SHADER_TIER,
-    pub(crate) highest_shader_model: D3D_SHADER_MODEL,
-    pub(crate) atomic_int64_typed: bool,
-    pub(crate) atomic_int64_group_shared: bool,
-    pub(crate) atomic_int64_descriptor_heap: bool,
-    pub(crate) raytracing_tier: D3D12_RAYTRACING_TIER,
-}
-
-#[allow(dead_code)]
-impl HostCaps {
-    /// Whether the host supports 64-lane wave operations (console shaders
-    /// natively execute in 64-lane wavefronts).
-    pub(crate) fn supports_wave64(&self) -> bool {
-        self.wave_ops
-            && self.wave_lane_count_min > 0
-            && self.wave_lane_count_min <= 64
-            && self.wave_lane_count_max >= 64
-    }
-
-    pub(crate) fn wave_lane_count_min(&self) -> u32 {
-        self.wave_lane_count_min
-    }
-
-    pub(crate) fn wave_lane_count_max(&self) -> u32 {
-        self.wave_lane_count_max
-    }
-
-    pub(crate) fn supports_atomic_int64_typed(&self) -> bool {
-        self.atomic_int64_typed
-    }
-
-    pub(crate) fn supports_atomic_int64_group_shared(&self) -> bool {
-        self.atomic_int64_group_shared
-    }
-
-    pub(crate) fn supports_atomic_int64_descriptor_heap(&self) -> bool {
-        self.atomic_int64_descriptor_heap
-    }
-
-    pub(crate) fn resource_binding_tier(&self) -> D3D12_RESOURCE_BINDING_TIER {
-        self.resource_binding_tier
-    }
-
-    pub(crate) fn tiled_resources_tier(&self) -> D3D12_TILED_RESOURCES_TIER {
-        self.tiled_resources_tier
-    }
-
-    pub(crate) fn raytracing_tier(&self) -> D3D12_RAYTRACING_TIER {
-        self.raytracing_tier
-    }
-
-    pub(crate) fn mesh_shader_tier(&self) -> D3D12_MESH_SHADER_TIER {
-        self.mesh_shader_tier
-    }
-
-    pub(crate) fn highest_shader_model(&self) -> D3D_SHADER_MODEL {
-        self.highest_shader_model
-    }
-
-    /// Whether the host supports mesh shaders at shader model 6.6 or newer.
-    pub(crate) fn supports_mesh_shaders(&self) -> bool {
-        self.mesh_shader_tier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-            && self.highest_shader_model.0 >= D3D_SHADER_MODEL_6_6.0
-    }
-
-    fn summary(&self) -> String {
-        format!(
-            "{} (vendor={:#06x} device={:#06x}{}) | VRAM={} MB | SM={} | Wave={}..{} (ops={}) | BindingTier={} | TiledTier={} | Mesh={} | RT={} | AtomicI64(typed={}, shared={}, heap={})",
-            self.adapter_description,
-            self.vendor_id,
-            self.device_id,
-            if self.is_software { ", WARP" } else { "" },
-            self.dedicated_vram_mb,
-            format_shader_model(self.highest_shader_model),
-            self.wave_lane_count_min,
-            self.wave_lane_count_max,
-            self.wave_ops,
-            self.resource_binding_tier.0,
-            tiled_tier_label(self.tiled_resources_tier),
-            mesh_tier_label(self.mesh_shader_tier),
-            raytracing_tier_label(self.raytracing_tier),
-            self.atomic_int64_typed,
-            self.atomic_int64_group_shared,
-            self.atomic_int64_descriptor_heap,
-        )
-    }
-}
-
-fn decode_utf16_z(buf: &[u16]) -> String {
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    String::from_utf16_lossy(&buf[..len]).trim().to_owned()
-}
-
-fn is_software_adapter(desc: &DXGI_ADAPTER_DESC1) -> bool {
-    desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
-}
-
-fn format_shader_model(sm: D3D_SHADER_MODEL) -> String {
-    if sm == D3D_SHADER_MODEL_NONE {
-        "none".to_owned()
-    } else {
-        format!("{}.{}", sm.0 >> 4, sm.0 & 0xf)
-    }
-}
-
-fn tiled_tier_label(tier: D3D12_TILED_RESOURCES_TIER) -> &'static str {
-    match tier {
-        D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED => "none",
-        D3D12_TILED_RESOURCES_TIER_1 => "1",
-        D3D12_TILED_RESOURCES_TIER_2 => "2",
-        D3D12_TILED_RESOURCES_TIER_3 => "3",
-        D3D12_TILED_RESOURCES_TIER_4 => "4",
-        _ => "unknown",
-    }
-}
-
-fn mesh_tier_label(tier: D3D12_MESH_SHADER_TIER) -> &'static str {
-    match tier {
-        D3D12_MESH_SHADER_TIER_NOT_SUPPORTED => "none",
-        D3D12_MESH_SHADER_TIER_1 => "1.0",
-        _ => "unknown",
-    }
-}
-
-fn raytracing_tier_label(tier: D3D12_RAYTRACING_TIER) -> &'static str {
-    match tier {
-        D3D12_RAYTRACING_TIER_NOT_SUPPORTED => "none",
-        D3D12_RAYTRACING_TIER_1_0 => "1.0",
-        D3D12_RAYTRACING_TIER_1_1 => "1.1",
-        _ => "unknown",
-    }
-}
-
-/// Returns candidate indices matching `filter` (or all indices in preference
-/// order when `filter` is `None`).
-fn matching_adapter_indices(names: &[&str], filter: Option<&AdapterFilter>) -> Vec<usize> {
-    names
-        .iter()
-        .enumerate()
-        .filter(|&(index, name)| filter.is_none_or(|f| f.matches(index, name)))
-        .map(|(index, _)| index)
-        .collect()
-}
-
-/// Selects a DXGI adapter and creates a Feature Level 12.0 D3D12 device.
-///
-/// Honors `VICTORY_D3D12_WARP` (diagnostics builds only, verified software)
-/// and `VICTORY_D3D12_ADAPTER` (0-based hardware adapter index or
-/// case-insensitive name substring). Defaults to `IDXGIFactory6`
-/// high-performance ordering with `IDXGIFactory1` fallback, skipping software
-/// adapters.
-fn create_device() -> windows::core::Result<(ID3D12Device, DXGI_ADAPTER_DESC1)> {
-    // Diagnostics: the software adapter, on which a shader's wild access
-    // is an access violation in this process (a crash report with the
-    // address and instruction) instead of a GPU fault and driver reset.
-    if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
-        let adapter = warp_adapter()?;
-        // SAFETY: `adapter` is a valid COM adapter returned by `warp_adapter`.
-        unsafe {
-            let desc = adapter.cast::<IDXGIAdapter1>()?.GetDesc1()?;
-            let mut device: Option<ID3D12Device> = None;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            let device = device.ok_or_else(windows::core::Error::empty)?;
-            return Ok((device, desc));
-        }
-    }
-
-    let raw_override = std::env::var_os("VICTORY_D3D12_ADAPTER");
-    let filter = raw_override
-        .as_deref()
-        .and_then(|v| AdapterFilter::parse(&v.to_string_lossy()));
-
-    // SAFETY: plain DXGI factory creation and adapter enumeration.
-    let candidates = unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-        enumerate_hardware_adapters(&factory)?
-    };
-    let names: Vec<&str> = candidates
-        .iter()
-        .map(|(_, _, name)| name.as_str())
-        .collect();
-    let indices = matching_adapter_indices(&names, filter.as_ref());
-
-    let mut last_err = None;
-    for idx in indices {
-        let (adapter, desc, name) = &candidates[idx];
-        let mut device: Option<ID3D12Device> = None;
-        // SAFETY: `adapter` is a live DXGI adapter enumerated from the factory.
-        match unsafe { D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device) } {
-            Ok(()) => {
-                if let Some(device) = device {
-                    return Ok((device, *desc));
-                }
-            }
-            Err(e) => {
-                tracing::debug!(
-                    index = idx,
-                    adapter = %name,
-                    error = %e,
-                    "skipping adapter: D3D12 feature level 12.0 creation failed"
-                );
-                last_err = Some(e);
-            }
-        }
-    }
-
-    let available: Vec<String> = candidates
-        .iter()
-        .enumerate()
-        .map(|(i, (_, desc, name))| format!("{i}: {name} ({} MB)", desc.DedicatedVideoMemory >> 20))
-        .collect();
-    if let Some(raw) = raw_override.filter(|_| filter.is_some()) {
-        tracing::warn!(
-            requested = %raw.to_string_lossy(),
-            available = ?available,
-            "no hardware D3D12 adapter matched VICTORY_D3D12_ADAPTER"
-        );
-    } else {
-        tracing::warn!(
-            available = ?available,
-            "no hardware D3D12 adapter supported feature level 12.0"
-        );
-    }
-    Err(last_err.unwrap_or_else(|| windows::core::Error::from_hresult(DXGI_ERROR_NOT_FOUND)))
-}
-
-/// Enumerates non-software DXGI adapters in high-performance order using
-/// `IDXGIFactory6::EnumAdapterByGpuPreference` when available, falling back
-/// to `IDXGIFactory1::EnumAdapters1`.
-unsafe fn enumerate_hardware_adapters(
-    factory: &IDXGIFactory1,
-) -> windows::core::Result<Vec<(IDXGIAdapter1, DXGI_ADAPTER_DESC1, String)>> {
-    let mut raw_adapters: Vec<IDXGIAdapter1> = Vec::new();
-    let mut used_factory6 = false;
-
-    if let Ok(factory6) = factory.cast::<IDXGIFactory6>() {
-        let mut i = 0u32;
-        loop {
-            // SAFETY: `factory6` is a valid `IDXGIFactory6` COM interface.
-            match unsafe {
-                factory6.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
-                    i,
-                    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                )
-            } {
-                Ok(adapter) => {
-                    used_factory6 = true;
-                    raw_adapters.push(adapter);
-                    i += 1;
-                }
-                Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => {
-                    used_factory6 = true;
-                    break;
-                }
-                Err(e) if i == 0 => {
-                    tracing::debug!(
-                        error = %e,
-                        "EnumAdapterByGpuPreference unavailable; falling back to EnumAdapters1"
-                    );
-                    break;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    if !used_factory6 {
-        let mut i = 0u32;
-        loop {
-            // SAFETY: `factory` is a valid `IDXGIFactory1` COM interface.
-            match unsafe { factory.EnumAdapters1(i) } {
-                Ok(adapter) => {
-                    raw_adapters.push(adapter);
-                    i += 1;
-                }
-                Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    let mut hardware = Vec::with_capacity(raw_adapters.len());
-    for adapter in raw_adapters {
-        // SAFETY: `adapter` is a live `IDXGIAdapter1`.
-        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
-            continue;
-        };
-        if is_software_adapter(&desc) {
-            continue;
-        }
-        let name = decode_utf16_z(&desc.Description);
-        hardware.push((adapter, desc, name));
-    }
-    Ok(hardware)
-}
-
-/// Queries a D3D12 feature support struct on `device`.
-///
-/// # Safety
-/// `T` must be the exact `D3D12_FEATURE_DATA_*` struct corresponding to
-/// `feature`.
-unsafe fn check_feature<T>(device: &ID3D12Device, feature: D3D12_FEATURE, data: &mut T) -> bool {
-    // SAFETY: caller guarantees `data` matches `feature`'s ABI layout and size.
-    unsafe {
-        device
-            .CheckFeatureSupport(feature, (data as *mut T).cast(), size_of::<T>() as u32)
-            .is_ok()
-    }
-}
-
-/// Probes host D3D12 device capabilities once at device creation.
-fn probe_caps(device: &ID3D12Device, desc: &DXGI_ADAPTER_DESC1) -> HostCaps {
-    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
-    let mut options1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-    let mut options5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
-    let mut options7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
-    let mut options9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
-    let mut options11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
-
-    // SAFETY: each feature enum matches its corresponding `D3D12_FEATURE_DATA_*` struct.
-    unsafe {
-        let _ = check_feature(device, D3D12_FEATURE_D3D12_OPTIONS, &mut options);
-        let _ = check_feature(device, D3D12_FEATURE_D3D12_OPTIONS1, &mut options1);
-        let _ = check_feature(device, D3D12_FEATURE_D3D12_OPTIONS5, &mut options5);
-        let _ = check_feature(device, D3D12_FEATURE_D3D12_OPTIONS7, &mut options7);
-        let _ = check_feature(device, D3D12_FEATURE_D3D12_OPTIONS9, &mut options9);
-        let _ = check_feature(device, D3D12_FEATURE_D3D12_OPTIONS11, &mut options11);
-    }
-
-    // D3D12 returns E_INVALIDARG if the requested shader model is newer than
-    // what the installed runtime recognizes, so probe downward.
-    const SHADER_MODELS: &[D3D_SHADER_MODEL] = &[
-        D3D_SHADER_MODEL_6_9,
-        D3D_SHADER_MODEL_6_8,
-        D3D_SHADER_MODEL_6_7,
-        D3D_SHADER_MODEL_6_6,
-        D3D_SHADER_MODEL_6_5,
-        D3D_SHADER_MODEL_6_4,
-        D3D_SHADER_MODEL_6_3,
-        D3D_SHADER_MODEL_6_2,
-        D3D_SHADER_MODEL_6_1,
-        D3D_SHADER_MODEL_6_0,
-        D3D_SHADER_MODEL_5_1,
-    ];
-    let mut highest_shader_model = D3D_SHADER_MODEL_NONE;
-    for &candidate in SHADER_MODELS {
-        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-            HighestShaderModel: candidate,
-        };
-        // SAFETY: `D3D12_FEATURE_DATA_SHADER_MODEL` matches `D3D12_FEATURE_SHADER_MODEL`.
-        if unsafe { check_feature(device, D3D12_FEATURE_SHADER_MODEL, &mut sm) } {
-            highest_shader_model = sm.HighestShaderModel;
-            break;
-        }
-    }
-
-    HostCaps {
-        adapter_description: decode_utf16_z(&desc.Description),
-        vendor_id: desc.VendorId,
-        device_id: desc.DeviceId,
-        dedicated_vram_mb: (desc.DedicatedVideoMemory as u64) >> 20,
-        is_software: is_software_adapter(desc),
-        resource_binding_tier: options.ResourceBindingTier,
-        tiled_resources_tier: options.TiledResourcesTier,
-        wave_ops: options1.WaveOps.as_bool(),
-        wave_lane_count_min: options1.WaveLaneCountMin,
-        wave_lane_count_max: options1.WaveLaneCountMax,
-        mesh_shader_tier: options7.MeshShaderTier,
-        highest_shader_model,
-        atomic_int64_typed: options9.AtomicInt64OnTypedResourceSupported.as_bool(),
-        atomic_int64_group_shared: options9.AtomicInt64OnGroupSharedSupported.as_bool(),
-        atomic_int64_descriptor_heap: options11
-            .AtomicInt64OnDescriptorHeapResourceSupported
-            .as_bool(),
-        raytracing_tier: options5.RaytracingTier,
-    }
-}
-
-static DEVICE_MEMORY: AtomicU64 = AtomicU64::new(0);
-
-/// The memory of the adapter `device` runs on (`0` when DXGI does not name it).
-pub(crate) fn device_memory() -> u64 {
-    DEVICE_MEMORY.load(Ordering::Relaxed)
-}
-
-fn adapter_memory(device: &ID3D12Device) -> Option<u64> {
-    // SAFETY: plain DXGI adapter queries matching the device's adapter LUID.
-    unsafe {
-        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-        let luid = device.GetAdapterLuid();
-        let mut i = 0u32;
-        while let Ok(adapter) = factory.EnumAdapters1(i) {
-            i += 1;
-            if let Ok(desc) = adapter.GetDesc1()
-                && desc.AdapterLuid == luid
-            {
-                return Some(desc.DedicatedVideoMemory as u64);
-            }
-        }
-        None
     }
 }
 
@@ -753,7 +330,7 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
         let adapter: IDXGIAdapter = factory.EnumWarpAdapter()?;
         let desc = adapter.cast::<IDXGIAdapter1>()?.GetDesc1()?;
-        if !is_software_adapter(&desc) {
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
             tracing::warn!(
                 vendor = format_args!("{:#x}", desc.VendorId),
                 flags = format_args!("{:#x}", desc.Flags),
@@ -769,207 +346,74 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// A submission's wait ends when its fence comes, or when the device is
+    /// gone and the fence never will.
     #[test]
-    fn only_a_texture_with_the_render_target_flag_has_a_render_target_state() {
-        assert_eq!(super::legal_for(0, 0x4), 0);
-        assert_eq!(super::legal_for(0x2, 0x4), 0);
-        assert_eq!(super::legal_for(0x1, 0x4), 0x4);
-    }
-
-    #[test]
-    fn sparse_copies_preserve_islands_and_observe_remaps() {
-        use windows_sys::Win32::System::Memory::*;
-        const N: usize = 5 << 16;
-        // SAFETY: we reserve a private region, commit selected pages inside it,
-        // and only directly access the pages while they are writable.
-        unsafe {
-            let base = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
-            assert!(!base.is_null());
-            let mut expected = vec![0; N];
-            for (offset, value) in [(0, 9), (2 << 16, 37), (N - 4096, 85)] {
-                let at = base.add(offset);
-                assert_eq!(VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), at.cast());
-                at.write_bytes(value, 4096);
-                expected[offset..offset + 4096].fill(value);
-            }
-            for remap in [false, true] {
-                if remap {
-                    let mut old = 0;
-                    assert_ne!(VirtualProtect(base.cast(), 4096, PAGE_NOACCESS, &mut old), 0);
-                    expected[..4096].fill(0);
-                    let at = base.add(1 << 16);
-                    assert_eq!(VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), at.cast());
-                    at.write_bytes(0xc7, 4096);
-                    expected[1 << 16..(1 << 16) + 4096].fill(0xc7);
-                }
-                let mut out = vec![0xee; N];
-                super::copy_mapped(out.as_mut_ptr().add(27), base.add(27), N - 54, false);
-                assert_eq!(out[27..N - 27], expected[27..N - 27]);
-                assert!(out[..27].iter().chain(&out[N - 27..]).all(|&v| v == 0xee));
-            }
-            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
-        }
+    fn a_wait_for_a_submission_ends_when_the_device_is_removed() {
+        use super::{LONG_WAIT_SECS, STALL_SECS, WAIT_SLICE_MS, Waited, wait_for_submission};
+        let slices_per_sec = 1000 / u64::from(WAIT_SLICE_MS);
+        // The fence comes in the third slice: the device is asked twice.
+        let (mut waits, mut asked) = (0, 0);
+        let done = wait_for_submission(
+            || {
+                waits += 1;
+                waits == 3
+            },
+            || {
+                asked += 1;
+                false
+            },
+            |_| panic!("not a long wait"),
+        );
+        assert_eq!((done, waits, asked), (Waited::Done, 3, 2));
+        // The fence never comes and the device is removed in the fifth slice.
+        let mut asked = 0;
+        let lost = wait_for_submission(
+            || false,
+            || {
+                asked += 1;
+                asked == 5
+            },
+            |_| panic!("not a long wait"),
+        );
+        assert_eq!((lost, asked), (Waited::Removed, 5));
+        // A fence signalled together with the removal is a finished wait:
+        // the caller's check after the submission reports the removal.
+        assert_eq!(wait_for_submission(|| true, || true, |_| ()), Waited::Done);
+        // A long submission on a live device is waited for, and said so at
+        // 10 s and 20 s.
+        let (mut waits, mut said) = (0, Vec::new());
+        let done = wait_for_submission(
+            || {
+                waits += 1;
+                waits > 22 * slices_per_sec
+            },
+            || false,
+            |secs| said.push(secs),
+        );
+        assert_eq!(done, Waited::Done);
+        assert_eq!(said, [LONG_WAIT_SECS, 2 * LONG_WAIT_SECS]);
+        // One that neither finishes nor loses its device is given up, after
+        // every slice of the time allowed and no sooner.
+        let mut waits = 0;
+        let stalled = wait_for_submission(
+            || {
+                waits += 1;
+                false
+            },
+            || false,
+            |_| (),
+        );
+        assert_eq!((stalled, waits), (Waited::Stalled, STALL_SECS * slices_per_sec));
     }
 
     use super::*;
 
     #[test]
-    fn adapter_filter_parses_index_and_name() {
-        assert_eq!(AdapterFilter::parse(""), None);
-        assert_eq!(AdapterFilter::parse("   "), None);
-        assert_eq!(AdapterFilter::parse("0"), Some(AdapterFilter::Index(0)));
-        assert_eq!(AdapterFilter::parse(" 2 "), Some(AdapterFilter::Index(2)));
-        assert_eq!(
-            AdapterFilter::parse("RTX 5090"),
-            Some(AdapterFilter::Name("rtx 5090".to_owned()))
-        );
-        assert_eq!(
-            AdapterFilter::parse("  AMD  "),
-            Some(AdapterFilter::Name("amd".to_owned()))
-        );
-        // Signed strings are treated as name substrings, not indices.
-        assert_eq!(
-            AdapterFilter::parse("+1"),
-            Some(AdapterFilter::Name("+1".to_owned()))
-        );
-        assert_eq!(
-            AdapterFilter::parse("-1"),
-            Some(AdapterFilter::Name("-1".to_owned()))
-        );
-    }
-
-    #[test]
-    fn adapter_filter_matches_index_and_case_insensitive_substring() {
-        let adapters = ["NVIDIA GeForce RTX 5090", "AMD Radeon(TM) Graphics"];
-
-        assert_eq!(matching_adapter_indices(&adapters, None), vec![0, 1]);
-
-        let by_idx = AdapterFilter::parse("1").unwrap();
-        assert_eq!(matching_adapter_indices(&adapters, Some(&by_idx)), vec![1]);
-
-        let oob_idx = AdapterFilter::parse("5").unwrap();
-        assert!(matching_adapter_indices(&adapters, Some(&oob_idx)).is_empty());
-
-        let by_vendor = AdapterFilter::parse("nvidia").unwrap();
-        assert_eq!(
-            matching_adapter_indices(&adapters, Some(&by_vendor)),
-            vec![0]
-        );
-
-        let by_model = AdapterFilter::parse("RADEON").unwrap();
-        assert_eq!(
-            matching_adapter_indices(&adapters, Some(&by_model)),
-            vec![1]
-        );
-
-        let missing = AdapterFilter::parse("Intel Arc").unwrap();
-        assert!(matching_adapter_indices(&adapters, Some(&missing)).is_empty());
-    }
-
-    #[test]
-    fn decode_utf16_z_handles_nul_and_unterminated() {
-        let mut buf = [0u16; 16];
-        for (slot, ch) in buf.iter_mut().zip("Test GPU  ".encode_utf16()) {
-            *slot = ch;
-        }
-        assert_eq!(decode_utf16_z(&buf), "Test GPU");
-
-        let full: Vec<u16> = "NoNull".encode_utf16().collect();
-        assert_eq!(decode_utf16_z(&full), "NoNull");
-
-        assert_eq!(decode_utf16_z(&[]), "");
-        assert_eq!(decode_utf16_z(&[0, b'A' as u16]), "");
-    }
-
-    #[test]
-    fn is_software_adapter_checks_flag() {
-        let mut desc = DXGI_ADAPTER_DESC1::default();
-        assert!(!is_software_adapter(&desc));
-        desc.Flags = DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32;
-        assert!(is_software_adapter(&desc));
-        desc.Flags |= DXGI_ADAPTER_FLAG_REMOTE.0 as u32;
-        assert!(is_software_adapter(&desc));
-    }
-
-    #[test]
-    fn format_shader_model_renders_versions() {
-        assert_eq!(format_shader_model(D3D_SHADER_MODEL_NONE), "none");
-        assert_eq!(format_shader_model(D3D_SHADER_MODEL_5_1), "5.1");
-        assert_eq!(format_shader_model(D3D_SHADER_MODEL_6_0), "6.0");
-        assert_eq!(format_shader_model(D3D_SHADER_MODEL_6_6), "6.6");
-        assert_eq!(format_shader_model(D3D_SHADER_MODEL_6_8), "6.8");
-    }
-
-    #[test]
-    fn host_caps_helpers_cover_gpu_profiles() {
-        let wave32 = HostCaps {
-            adapter_description: "Discrete Wave32 GPU".to_owned(),
-            vendor_id: 0x10de,
-            device_id: 0x2b85,
-            dedicated_vram_mb: 32607,
-            is_software: false,
-            resource_binding_tier: D3D12_RESOURCE_BINDING_TIER_3,
-            tiled_resources_tier: D3D12_TILED_RESOURCES_TIER_3,
-            wave_ops: true,
-            wave_lane_count_min: 32,
-            wave_lane_count_max: 32,
-            mesh_shader_tier: D3D12_MESH_SHADER_TIER_1,
-            highest_shader_model: D3D_SHADER_MODEL_6_7,
-            atomic_int64_typed: true,
-            atomic_int64_group_shared: true,
-            atomic_int64_descriptor_heap: true,
-            raytracing_tier: D3D12_RAYTRACING_TIER_1_1,
-        };
-        assert!(!wave32.supports_wave64());
-        assert_eq!(wave32.wave_lane_count_min(), 32);
-        assert_eq!(wave32.wave_lane_count_max(), 32);
-        assert!(wave32.supports_atomic_int64_typed());
-        assert!(wave32.supports_atomic_int64_group_shared());
-        assert!(wave32.supports_atomic_int64_descriptor_heap());
-        assert_eq!(
-            wave32.resource_binding_tier(),
-            D3D12_RESOURCE_BINDING_TIER_3
-        );
-        assert!(wave32.supports_mesh_shaders());
-        let summary = wave32.summary();
-        assert!(summary.contains("Discrete Wave32 GPU"));
-        assert!(summary.contains("VRAM=32607 MB"));
-        assert!(summary.contains("SM=6.7"));
-        assert!(summary.contains("Wave=32..32"));
-        assert!(summary.contains("BindingTier=3"));
-        assert!(summary.contains("Mesh=1.0"));
-        assert!(summary.contains("RT=1.1"));
-        assert!(summary.contains("AtomicI64(typed=true"));
-
-        // Wave32/Wave64 dual-mode GPU (e.g. RDNA) supports wave64.
-        let mut wave32_64 = wave32.clone();
-        wave32_64.wave_lane_count_min = 32;
-        wave32_64.wave_lane_count_max = 64;
-        assert!(wave32_64.supports_wave64());
-
-        // Fixed Wave64 GPU supports wave64.
-        let mut wave64_only = wave32.clone();
-        wave64_only.wave_lane_count_min = 64;
-        wave64_only.wave_lane_count_max = 64;
-        assert!(wave64_only.supports_wave64());
-
-        // Wave ops disabled or zero min lane count must not claim wave64.
-        let mut no_wave_ops = wave64_only.clone();
-        no_wave_ops.wave_ops = false;
-        assert!(!no_wave_ops.supports_wave64());
-
-        let mut zero_min = wave64_only.clone();
-        zero_min.wave_lane_count_min = 0;
-        assert!(!zero_min.supports_wave64());
-
-        // Mesh shaders require both tier support and SM 6.6+.
-        let mut old_sm = wave32.clone();
-        old_sm.highest_shader_model = D3D_SHADER_MODEL_6_5;
-        assert!(!old_sm.supports_mesh_shaders());
-
-        let mut no_mesh = wave32.clone();
-        no_mesh.mesh_shader_tier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
-        assert!(!no_mesh.supports_mesh_shaders());
+    fn only_a_texture_with_the_render_target_flag_has_a_render_target_state() {
+        assert_eq!(super::legal_for(0, 0x4), 0);
+        assert_eq!(super::legal_for(0x2, 0x4), 0);
+        assert_eq!(super::legal_for(0x1, 0x4), 0x4);
     }
 
     #[test]
@@ -996,28 +440,6 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
-
-    #[test]
-    fn warp_device_creation_and_caps_probe() {
-        let Ok(adapter) = warp_adapter() else {
-            return;
-        };
-        // SAFETY: `adapter` is a verified software WARP adapter.
-        let (device, desc) = unsafe {
-            let desc = adapter.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap();
-            let mut device: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
-                return;
-            }
-            (device.unwrap(), desc)
-        };
-        let caps = probe_caps(&device, &desc);
-        assert!(caps.is_software);
-        assert!(!caps.adapter_description.is_empty());
-        assert!(caps.resource_binding_tier.0 >= D3D12_RESOURCE_BINDING_TIER_1.0);
-        assert_ne!(caps.highest_shader_model, D3D_SHADER_MODEL_NONE);
-        assert!(caps.summary().contains("WARP"));
-    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -1036,6 +458,13 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Depth textures with a writable twin the list uses (`crate::twin`),
+    /// by host copy: the side its first use needs and the side it leaves
+    /// newer.
+    twins: Mutex<std::collections::HashMap<usize, crate::twin::Use>>,
+    /// A copy of ours replaced the list's compute root signature and
+    /// pipeline: draws and dispatches set theirs again.
+    rebind: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -1043,14 +472,14 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
-    /// GPU-writable scratch for indirect rectangle expansion (`rectangles`):
-    /// expanded vertices, rewritten draw arguments and per-draw atomic
-    /// counters, reused across draws and across resets.
-    rect_scratch: Mutex<RectScratch>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+    /// In a frame `crate::capture` lists: the textures the list renders to
+    /// or writes, and the pipeline that first wrote each (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    targets: Mutex<Vec<(usize, String)>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -1113,43 +542,6 @@ unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
 
-/// An upload buffer mapped for writing, kept in a pool for reuse once its
-/// command list has finished executing.
-#[derive(Clone)]
-pub(crate) struct PooledUpload {
-    pub(crate) buffer: ID3D12Resource,
-    /// Mapped CPU pointer (`*mut u8` as usize).
-    pub(crate) data: usize,
-    pub(crate) size: u64,
-}
-
-// SAFETY: the data pointer is a persistent mapping of a live D3D12 upload buffer.
-unsafe impl Send for PooledUpload {}
-// SAFETY: as above.
-unsafe impl Sync for PooledUpload {}
-/// Per-list GPU-writable buffers for indirect rectangle expansion
-/// (`crate::rectangles`): one vertex scratch buffer (reused per draw after
-/// its VB -> UAV barrier), one rewritten-arguments buffer (grown if a draw
-/// has more records), and chunks of 4-byte atomic counters zeroed before
-/// submission.
-#[derive(Default)]
-struct RectScratch {
-    vertices: Option<ID3D12Resource>,
-    args: Option<(ID3D12Resource, u64)>,
-    counters: Vec<(ID3D12Resource, usize, u64)>,
-    counter_chunk: usize,
-    counter_used: u32,
-}
-
-// SAFETY: D3D12 resources are free-threaded; the counter pointers are
-// persistent mappings written only before submission.
-unsafe impl Send for RectScratch {}
-
-/// Counters per chunk (4 KiB = 1024 words).
-const RECT_COUNTER_CHUNK: u32 = 1024;
-/// Initial rewritten-arguments buffer size (64 KiB = 4096 draw records).
-const RECT_ARGS_MIN: u64 = 64 << 10;
-
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
@@ -1170,7 +562,22 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Brings every buffer range a view heap's views reach up to date
+    /// (`crate::bindless`).
+    Heap(std::sync::Arc<crate::bindless::Viewed>),
+    /// Shaders read title memory through a view heap's page table (the
+    /// heap's key, `crate::memory`): the table names every copy, each
+    /// brought up to date.
+    Memory(usize),
 }
+
+/// A piece of a query result: the title's address, the offset it has in
+/// the read-back buffer, and its width.
+type Target = (usize, u64, usize);
+
+/// A read-back buffer and the pieces of its resolved queries that go back
+/// into the title's memory.
+type Resolved = (ID3D12Resource, Vec<Target>);
 
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
@@ -1179,7 +586,7 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
-    uploads: Vec<PooledUpload>,
+    uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -1192,45 +599,88 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Query results the list resolved into a read-back buffer, written to
+    /// the title's memory once the list has run: the buffer, then each
+    /// (destination, offset in the buffer, bytes).
+    resolves: Vec<Resolved>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Work done once the list has run, before the bottom-of-pipe writes
+    /// (title memory shaders wrote at addresses they computed goes back).
+    after: Vec<Box<dyn Fn() + Send>>,
+    /// Asked once the list has run, before anything goes back: whether its
+    /// shaders read title memory with no copy (`crate::memory`); then what
+    /// they wrote through views does not go back either.
+    missed: Vec<Box<dyn Fn() -> bool + Send>>,
 }
 
 impl Host {
-    /// Probed capabilities of the selected host GPU.
-    #[allow(dead_code)]
-    pub(crate) fn caps(&self) -> &HostCaps {
-        &self.caps
-    }
-
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
-    /// mesh shaders need both).
+    /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
-        self.caps.supports_mesh_shaders()
+        static MESH: OnceLock<bool> = OnceLock::new();
+        *MESH.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+            };
+            // SAFETY: each query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS7,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+                    && self
+                        .device
+                        .CheckFeatureSupport(
+                            D3D12_FEATURE_SHADER_MODEL,
+                            (&raw mut model).cast(),
+                            size_of_val(&model) as u32,
+                        )
+                        .is_ok()
+            };
+            let mesh = ok
+                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+            tracing::info!(mesh, "host mesh shader support");
+            mesh
+        })
     }
 
-    /// Whether the host supports 64-lane wave operations.
-    #[allow(dead_code)]
-    pub(crate) fn supports_wave64(&self) -> bool {
-        self.caps.supports_wave64()
-    }
-
-    /// Maximum wave lane count supported by the host GPU.
-    #[allow(dead_code)]
-    pub(crate) fn wave_lane_count_max(&self) -> u32 {
-        self.caps.wave_lane_count_max()
-    }
-
-    /// Whether the host supports 64-bit integer atomics on typed resources.
-    #[allow(dead_code)]
-    pub(crate) fn supports_atomic_int64_typed(&self) -> bool {
-        self.caps.supports_atomic_int64_typed()
-    }
-
-    /// Host D3D12 resource binding tier.
-    #[allow(dead_code)]
-    pub(crate) fn resource_binding_tier(&self) -> D3D12_RESOURCE_BINDING_TIER {
-        self.caps.resource_binding_tier()
+    /// Whether the host runs 64-bit atomics on typed resources in the
+    /// descriptor heap (translated 64-bit image atomics); logged once.
+    pub(crate) fn heap_atomics64(&self) -> bool {
+        static ATOMICS: OnceLock<bool> = OnceLock::new();
+        *ATOMICS.get_or_init(|| {
+            let mut typed = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+            let mut heap = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+            // SAFETY: each query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS9,
+                        (&raw mut typed).cast(),
+                        size_of_val(&typed) as u32,
+                    )
+                    .is_ok()
+                    && self
+                        .device
+                        .CheckFeatureSupport(
+                            D3D12_FEATURE_D3D12_OPTIONS11,
+                            (&raw mut heap).cast(),
+                            size_of_val(&heap) as u32,
+                        )
+                        .is_ok()
+            };
+            let atomics = ok
+                && typed.AtomicInt64OnTypedResourceSupported.as_bool()
+                && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool();
+            tracing::info!(atomics, "host 64-bit atomics on typed heap resources");
+            atomics
+        })
     }
 
     /// A new list, open for recording.
@@ -1262,12 +712,15 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                twins: Mutex::default(),
+                rebind: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
-                rect_scratch: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
+                targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
@@ -1279,10 +732,62 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
+        let faults = crate::copystat::page_faults();
+        #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        // Descriptors the title copied into its heaps itself, before the
+        // heaps' views are brought up to date below.
+        crate::descriptor::sync_heaps();
+        // Textures heap-indexing shaders may read, uploaded first by a list
+        // of ours where their title memory changed.
+        let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
+            .iter()
+            .flat_map(|l| {
+                l.deferred()
+                    .copies
+                    .iter()
+                    .filter_map(|s| match s {
+                        Step::Heap(v) => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        #[cfg(feature = "diagnostics")]
+        let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        let uploads = (!heaps.is_empty())
+            .then(|| crate::bindless::uploads(&heaps))
+            .flatten();
+        #[cfg(feature = "diagnostics")]
+        drop(uploading);
+        let runs: Vec<&HostList> = uploads
+            .as_ref()
+            .map(|u| u.list())
+            .into_iter()
+            .chain(runs.iter().copied())
+            .collect();
+        let runs = &runs[..];
+        // A frame `crate::capture` lists: every command of every list, in
+        // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
+        // notes them).
+        #[cfg(feature = "diagnostics")]
+        let traced = crate::capture::listed(crate::queue::presented() + 1);
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            for (i, r) in runs.iter().enumerate() {
+                let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+                for (k, (note, _)) in notes.iter().enumerate() {
+                    tracing::info!(
+                        target: "victory_gpu::trace",
+                        "s{} l{i}/{} #{k}: {note}",
+                        *submitted + 1,
+                        runs.len()
+                    );
+                }
+            }
+        }
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
@@ -1290,6 +795,8 @@ impl Host {
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
@@ -1297,6 +804,8 @@ impl Host {
         }
         batch.flush();
         let prepared = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
@@ -1310,9 +819,13 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            let mut ended = Waited::Done;
             let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -1322,11 +835,31 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        ended = wait_for_submission(
+                            || WaitForSingleObject(self.event, WAIT_SLICE_MS) != WAIT_TIMEOUT,
+                            || self.device.GetDeviceRemovedReason().is_err(),
+                            |secs| {
+                                tracing::warn!(secs, lists = runs.len(), "host submission still on the GPU");
+                            },
+                        );
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
+            match ended {
+                Waited::Done => {}
+                // Nothing more runs on a removed device; reported below.
+                Waited::Removed => break,
+                Waited::Stalled => fail(format_args!(
+                    "host GPU has not finished a submission of {} lists in {STALL_SECS} s and reports \
+                     no removal: the GPU has most likely faulted or hung (on Linux the kernel log \
+                     names a fault){}",
+                    runs.len(),
+                    last_notes(runs)
+                )),
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
@@ -1337,11 +870,13 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
+            // SAFETY: a plain query.
+            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                removed_in = Some(i);
+            }
             let _ = (i, started);
         }
         let _ = &firsts;
-        FINISHED.store(this_submission, Ordering::Release);
-        bury(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1356,10 +891,11 @@ impl Host {
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}",
+                "host GPU device removed after a submission of {} lists{}{}{}",
                 runs.len(),
                 self.removal_data(runs),
-                last_notes(runs)
+                last_notes(runs),
+                removed_during(runs, removed_in)
             ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
@@ -1367,17 +903,107 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
-        for (shadow, address, len) in batch.gpu_writes {
-            let written = shadow.copy_back(address, len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let faults = crate::copystat::page_faults();
+        // One list's lock at a time: a submission may name a list twice.
+        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
+        let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
+        for list in runs {
+            let deferred = list.deferred();
+            // Shaders that read memory with no copy computed something else
+            // than the console's: it stays out of title memory, where it broke
+            // the title's own data (runs c1, c4).
+            let missed = deferred.missed.iter().any(|check| check());
+            for step in &deferred.copies {
+                if let Step::GpuWrite(shadow, address, len) = step {
+                    let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
+                    match index.get(&key) {
+                        Some(&i) => back[i].3 &= !missed,
+                        None => {
+                            index.insert(key, back.len());
+                            back.push((shadow.clone(), *address, *len, !missed));
+                        }
+                    }
+                }
+            }
+        }
+        for (shadow, address, len, goes_back) in &back {
+            let (address, len) = (*address, *len);
+            if *goes_back {
+                let written = shadow.copy_back(address, len);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            } else {
+                shadow.keep_writes(address, len);
+                crate::memory::note_withheld(len as u64);
+            }
+        }
+        for list in runs {
+            for work in &list.deferred().after {
+                work();
+            }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
         for list in runs {
+            // Query results first: a bottom-of-pipe write may name the same
+            // memory (a buffer the title both resolves into and advances).
+            for (readback, targets) in &list.deferred().resolves {
+                let mut data = std::ptr::null_mut();
+                let end = targets
+                    .iter()
+                    .map(|&(_, offset, bytes)| offset + bytes as u64)
+                    .max()
+                    .unwrap_or(0);
+                let range = D3D12_RANGE {
+                    Begin: 0,
+                    End: end as usize,
+                };
+                // SAFETY: a read-back buffer the finished list resolved
+                // into; `end` is inside it (the resolve checked the
+                // title's own buffer, and the buffer was made that size).
+                if unsafe { readback.Map(0, Some(&range), Some(&mut data)) }.is_err() {
+                    continue;
+                }
+                for &(at, offset, bytes) in targets {
+                    // SAFETY: reading a u64 at a checked offset of the
+                    // mapped buffer, and writing into title memory.
+                    unsafe {
+                        let value =
+                            std::ptr::read_unaligned(data.add(offset as usize).cast::<u64>());
+                        if bytes == 4 {
+                            (at as *mut u32).write_unaligned(value as u32);
+                        } else {
+                            (at as *mut u64).write_unaligned(value);
+                        }
+                    }
+                }
+                // SAFETY: the same buffer, unmapped once.
+                unsafe { readback.Unmap(0, None) };
+            }
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
         }
+        // The submission has run and the next waits for our lock.
+        release_retired();
         self.log_messages();
+        // A listed frame: what this submission's lists drew, as it is now
+        // (the dumps submit lists of their own).
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            let sub = *submitted;
+            drop(submitted);
+            let mut targets: Vec<(usize, String)> = Vec::new();
+            for r in runs {
+                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                    if !targets.iter().any(|x| x.0 == t.0) {
+                        targets.push(t.clone());
+                    }
+                }
+            }
+            crate::capture::dump_submission(sub, &targets);
+        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1420,6 +1046,10 @@ impl Host {
                     if !names.is_empty() {
                         text.push_str(&format!("; {what} {names:?}"));
                     }
+                    #[cfg(feature = "diagnostics")]
+                    for name in names.iter().filter(|_| what == "inside freed") {
+                        text.push_str(&crate::resource::life::of(name));
+                    }
                 }
                 text.push_str(&crate::shadow::near(va));
                 text.push_str(&crate::descriptor::host::near_heaps(va));
@@ -1443,11 +1073,7 @@ impl Host {
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
             }
-            if progress.is_empty() {
-                text.push_str("; no DRED breadcrumb nodes (GPU progress unknown)");
-            } else {
-                text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
-            }
+            text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
             let mut plain = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = plain.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
@@ -1540,6 +1166,15 @@ impl Host {
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
             handle
         }
+    }
+
+    /// A slot of CPU-only views, valid until it is recorded.
+    pub(crate) fn cpu_view(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let slot = self.next_cpu_view.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        // SAFETY: a live heap.
+        let mut handle = unsafe { self.cpu_views.GetCPUDescriptorHandleForHeapStart() };
+        handle.ptr += (slot * self.cpu_view_size) as usize;
+        handle
     }
 
     /// A host depth view of `resource`, valid until it is recorded.
@@ -1658,26 +1293,17 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        let old_uploads = {
-            let mut deferred = self.deferred();
-            let uploads = std::mem::take(&mut deferred.uploads);
-            *deferred = Deferred::default();
-            uploads
-        };
-        if let Some(host) = host() {
-            host.recycle_uploads(old_uploads);
-        }
+        *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
-        }
-        {
-            let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (rect.counter_chunk, rect.counter_used) = (0, 0);
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -1694,6 +1320,9 @@ impl HostList {
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
     /// the texture there at submission.
+    /// A depth texture with a writable twin (`crate::twin`) has the side
+    /// the use needs brought up to date first; unordered access moves the
+    /// twin, not the depth texture (nothing returned).
     pub(crate) fn transition(
         &self,
         resource: crate::object::This,
@@ -1701,37 +1330,89 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
+        if let Some(Some(twin)) = copy.twin.get()
+            && crate::twin::route(self, &copy, twin, wanted)
+        {
+            return None;
+        }
         let wanted = legal_state(texture, wanted);
+        self.track(&copy, wanted).map(|before| (texture, before))
+    }
+
+    /// The list's state for host texture `copy` becomes `wanted` (a legal
+    /// one): the state it leaves, if that is a change. Nothing for the
+    /// list's first use (its prelude moves the texture there).
+    fn track(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                copy.note_used();
+                v.insert((wanted, wanted, copy.clone()));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some(before)
             }
         }
     }
 
-    /// The current state established by this list. A texture the list has
-    /// never used can arrive in a different state at submission.
-    pub(crate) fn tracked_texture_state(
+    /// [`HostList::transition`] for a host texture of ours (a twin's
+    /// plane), without twins: the barrier to record, if one is needed.
+    pub(crate) fn move_texture(
         &self,
         copy: &std::sync::Arc<crate::resource::HostTexture>,
-    ) -> Option<u32> {
-        self.states
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(std::sync::Arc::as_ptr(copy) as usize))
-            .map(|&(_, last, _)| last)
+        wanted: u32,
+    ) -> Option<D3D12_RESOURCE_BARRIER> {
+        let wanted = legal_state(&copy.texture, wanted);
+        let before = self.track(copy, wanted)?;
+        Some(transition(
+            &copy.texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(wanted as i32),
+        ))
+    }
+
+    /// A use of the depth texture `depth` (with a twin) needing `side`
+    /// (`crate::twin::DEPTH` or `TWIN`): whether a copy must be recorded
+    /// now (true: into the depth texture). The list's first use is the
+    /// prelude's to prepare.
+    pub(crate) fn twin_use(
+        &self,
+        depth: &std::sync::Arc<crate::resource::HostTexture>,
+        side: u8,
+        writes: bool,
+    ) -> Option<bool> {
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        match twins.entry(std::sync::Arc::as_ptr(depth) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(crate::twin::Use::new(depth, side, writes));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => o.get_mut().again(side, writes),
+        }
+    }
+
+    /// A copy of ours replaced the compute root signature and pipeline.
+    pub(crate) fn need_rebind(&self) {
+        self.rebind.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the list's compute root signature and pipeline must be set
+    /// again (once).
+    pub(crate) fn take_rebind(&self) -> bool {
+        self.rebind.swap(false, Ordering::Relaxed)
     }
 
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
+        // Depth textures and their twins first, from their real states and
+        // back: the side each first use needs, made newer.
+        let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let copies = crate::twin::at_submission(twins.values());
+        drop(twins);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
@@ -1746,7 +1427,7 @@ impl HostList {
                 })
             })
             .collect();
-        if barriers.is_empty() {
+        if barriers.is_empty() && copies.is_empty() {
             return None;
         }
         let (allocator, list) = &self.prelude;
@@ -1755,7 +1436,29 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                list.ResourceBarrier(&barriers);
+                for (depth, to_depth) in &copies {
+                    let Some(Some(twin)) = depth.twin.get() else { continue };
+                    // From each texture's real state to the copy's and back.
+                    let mut back = Vec::new();
+                    twin.copy(list, depth, *to_depth, &mut |t, wanted| {
+                        let real = t.state.load(Ordering::Relaxed);
+                        let wanted = legal_state(&t.texture, wanted);
+                        (real != wanted).then(|| {
+                            back.push(transition(
+                                &t.texture,
+                                D3D12_RESOURCE_STATES(wanted as i32),
+                                D3D12_RESOURCE_STATES(real as i32),
+                            ));
+                            transition(&t.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(wanted as i32))
+                        })
+                    });
+                    if !back.is_empty() {
+                        list.ResourceBarrier(&back);
+                    }
+                }
+                if !barriers.is_empty() {
+                    list.ResourceBarrier(&barriers);
+                }
                 list.Close()
             })
         };
@@ -1790,6 +1493,7 @@ impl HostList {
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
             let what = what();
+            traced(&what);
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
             // SAFETY: an open list; the marker is copied when recorded.
@@ -1800,6 +1504,15 @@ impl HostList {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
+        }
+    }
+
+    /// Notes a texture the list renders to or writes, in a listed frame.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_target(&self, resource: usize, by: &str) {
+        let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
+        if !targets.iter().any(|t| t.0 == resource) {
+            targets.push((resource, by.to_owned()));
         }
     }
 
@@ -1863,19 +1576,60 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    /// Shaders of the list take views from the heap itself
+    /// (`crate::bindless`): what the heap's views reach is brought up to
+    /// date at submission (once until a title copy intervenes).
+    pub(crate) fn defer_heap(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>) {
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
+        if deferred.refreshed.insert(key) {
+            deferred.copies.push(Step::Heap(viewed.clone()));
+        }
+    }
+
+    /// Shaders of the list read title memory through the page table of
+    /// view heap `heap` (`crate::memory::prepare` at submission).
+    pub(crate) fn defer_memory(&self, heap: usize) {
+        self.deferred().copies.push(Step::Memory(heap));
+    }
+
+    /// After the list has run, before its writes go back: `check` says
+    /// whether its shaders read title memory with no copy.
+    pub(crate) fn defer_missed(&self, check: impl Fn() -> bool + Send + 'static) {
+        self.deferred().missed.push(Box::new(check));
+    }
+
+    /// Runs `work` once the list has run (each submission), before its
+    /// bottom-of-pipe writes.
+    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after.push(Box::new(work));
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes from the pool, alive until
-    /// the list is reset.
+    /// Records that the list resolved query results into `readback`, and
+    /// that each (destination, offset, bytes) of `targets` is written from
+    /// it once the list has run. The buffer is kept until the list is
+    /// reset, because its contents are only valid after the wait.
+    pub(crate) fn defer_resolve(
+        &self,
+        readback: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        targets: Vec<Target>,
+    ) {
+        self.deferred().resolves.push((readback, targets));
+    }
+
+    /// A mapped upload buffer of `size` bytes, alive until the list is
+    /// reset.
+    ///
+    /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let pooled = host.take_upload(size)?;
-        name(&pooled.buffer, || format!("list upload {size:#x}"));
-        let buffer = pooled.buffer.clone();
-        let data = pooled.data as *mut u8;
-        self.deferred().uploads.push(pooled);
+        let (buffer, data) = host.upload_buffer(size)?;
+        name(&buffer, || format!("list upload {size:#x}"));
+        self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
     }
 
@@ -1886,12 +1640,11 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let pooled = host.take_upload(len)?;
-            name(&pooled.buffer, || format!("list scratch {len:#x}"));
+            let (buffer, data) = host.upload_buffer(len)?;
+            name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
-            let gpu = unsafe { pooled.buffer.GetGPUVirtualAddress() };
-            let data = pooled.data as *mut u8;
-            self.deferred().uploads.push(pooled);
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.deferred().uploads.push(buffer);
             return Some((gpu, data));
         }
         if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
@@ -1934,69 +1687,6 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
-    /// The list's GPU-writable scratch buffer for expanded indirect
-    /// rectangle vertices (`capacity` bytes), created on first use.
-    pub(crate) fn rect_vertices(&self, capacity: u64) -> Option<ID3D12Resource> {
-        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
-        if rect.vertices.is_none() {
-            let buffer = host()?.default_buffer(capacity)?;
-            name(&buffer, || format!("rect scratch {capacity:#x}"));
-            rect.vertices = Some(buffer);
-        }
-        rect.vertices.clone()
-    }
-
-    /// A GPU-writable buffer of at least `bytes` for rewritten indirect
-    /// draw arguments, kept alive until the list is reset.
-    pub(crate) fn rect_args(&self, bytes: u64) -> Option<ID3D12Resource> {
-        let want = bytes.max(RECT_ARGS_MIN).next_multiple_of(256);
-        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buf, len)) = &rect.args
-            && *len >= want
-        {
-            return Some(buf.clone());
-        }
-        let buffer = host()?.default_buffer(want)?;
-        name(&buffer, || format!("rect args {want:#x}"));
-        let old = rect.args.replace((buffer.clone(), want));
-        drop(rect);
-        if let Some((old, _)) = old {
-            self.keep(&old);
-        }
-        Some(buffer)
-    }
-
-    /// The host GPU address of a 4-byte atomic counter for one indirect
-    /// rectangle draw, zeroed at each submission before the list runs.
-    pub(crate) fn rect_counter(&self) -> Option<u64> {
-        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
-        if rect.counter_used == RECT_COUNTER_CHUNK {
-            rect.counter_chunk += 1;
-            rect.counter_used = 0;
-        }
-        if rect.counter_chunk == rect.counters.len() {
-            let bytes = u64::from(RECT_COUNTER_CHUNK) * 4;
-            let (buffer, data) = host()?.shared_buffer(bytes)?;
-            name(&buffer, || "rect counters".into());
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            rect.counters.push((buffer, data as usize, gpu));
-            rect.counter_used = 0;
-        }
-        let (_, data, gpu) = rect.counters[rect.counter_chunk];
-        let slot = rect.counter_used;
-        rect.counter_used += 1;
-        drop(rect);
-        if slot == 0 {
-            let bytes = RECT_COUNTER_CHUNK as usize * 4;
-            // SAFETY: the list's own mapped chunk, zeroed before it runs.
-            self.defer_host(move || unsafe {
-                std::ptr::write_bytes(data as *mut u8, 0, bytes);
-            });
-        }
-        Some(gpu + u64::from(slot) * 4)
-    }
-
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
@@ -2035,7 +1725,20 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let mut started = std::time::Instant::now();
+            let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(
+                started,
+                match step {
+                    Step::Refresh(..) => C::StepRefreshUs,
+                    Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
+                    Step::Run(_) | Step::Host(_) => C::StepWorkUs,
+                    Step::GpuWrite(..) => C::StepGpuWriteUs,
+                    Step::Texture(_) => C::StepTextureUs,
+                    Step::Heap(_) => C::StepHeapUs,
+                    Step::Memory(_) => C::StepMemoryUs,
+                },
+            );
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -2044,8 +1747,6 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
-                    // The flush counted its own time; the copy starts here.
-                    started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -2070,10 +1771,6 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
-                        #[cfg(feature = "diagnostics")]
-                        {
-                            started = std::time::Instant::now();
-                        }
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -2084,13 +1781,23 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    batch.gpu_write(shadow, *address, *len);
+                    // The shaders start from the title's data.
+                    batch.flush();
+                    shadow.writing(*address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
+                    continue;
+                }
+                Step::Heap(viewed) => {
+                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    continue;
+                }
+                &Step::Memory(heap) => {
+                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
             };
@@ -2108,46 +1815,39 @@ impl HostList {
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+///
+/// A copy's range brought up to date is not copied again in the submission
+/// until a step writes title memory: every list of a world submission using
+/// title memory asks for every copy whole. What the title's threads write
+/// meanwhile is for later submissions (on the console it would race the
+/// GPU).
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    declared_writes: std::collections::HashSet<(usize, usize, usize)>,
+    /// Where each copy's refresh is in `refreshes`, by copy.
+    pending: std::collections::HashMap<usize, usize>,
+    /// The range of each copy brought up to date since the last title
+    /// write, by copy (held, so that its address names no other).
+    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
-    fn new_gpu_write<T>(&mut self, shadow: &std::sync::Arc<T>, address: usize, len: usize) -> bool {
-        self.declared_writes
-            .insert((std::sync::Arc::as_ptr(shadow) as usize, address, len))
-    }
-
-    fn gpu_write(
-        &mut self,
-        shadow: &std::sync::Arc<crate::shadow::Shadow>,
-        address: usize,
-        len: usize,
-    ) {
-        if self.new_gpu_write(shadow, address, len) {
-            // The first declaration needs the refreshed bytes for its snapshot.
-            // Another declaration of this exact range is already pending until
-            // the GPU submission finishes, so it needs no refresh boundary.
-            self.flush();
-            shadow.writing(address, len);
-            self.gpu_writes.push((shadow.clone(), address, len));
-        }
-    }
-
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
-        match self
-            .refreshes
-            .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
+        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+            return;
+        }
+        match self.pending.get(&key) {
+            Some(&i) => {
+                let (_, from, to) = &mut self.refreshes[i];
+                (*from, *to) = ((*from).min(address), (*to).max(end));
+            }
+            None => {
+                self.pending.insert(key, self.refreshes.len());
+                self.refreshes.push((shadow.clone(), address, end));
+            }
         }
     }
 
@@ -2162,9 +1862,15 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.current.clear();
     }
 
-    fn flush(&mut self) {
+    /// Does the refreshes; returns the bytes copied.
+    fn flush(&mut self) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
+        self.pending.clear();
+        let mut total = 0;
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
@@ -2173,23 +1879,30 @@ impl Batch {
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            total += copied;
+            // Kept: the union with what was current if they touch, else
+            // the larger.
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
+            if from <= *b && *a <= to {
+                (*a, *b) = ((*a).min(from), (*b).max(to));
+            } else if to - from > *b - *a {
+                (*a, *b) = (from, to);
+            }
         }
+        total
     }
 }
 
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
-/// destination (`title_dst`) that is not all mapped takes nothing from its
-/// first unmapped page on.
+/// destination (`title_dst`) that is not all mapped is left alone.
 ///
-/// The copy runs in the kernel (`ReadProcessMemory`), which reports an
-/// unmapped page of the source, or of the destination it writes, instead of
-/// faulting. Asking `VirtualQuery` first cost about 2 ms per copy in the
-/// title's big pools (it walks the page tables to the region's end), which
-/// made copies run at 100-200 MB/s; a title destination is asked only once
-/// its copy has failed (asked before each, the world's 80 copies per frame
-/// cost 60 ms).
+/// The source is read through the kernel (`ReadProcessMemory`), which
+/// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
+/// cost about 2 ms per copy in the title's big pools (it walks the page
+/// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -2201,13 +1914,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         2 => return,
         _ => {}
     }
-    if len == 0 {
+    if len == 0 || title_dst && !crate::texture::committed(dst, len) {
         return;
     }
-    if title_dst {
-        // The kernel writes the destination: it must not be guarded.
-        crate::watch::writing(dst as usize, len);
-    }
+    // The kernel writes the destination: it must not be guarded meanwhile.
+    let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
@@ -2216,58 +1927,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if whole {
         return;
     }
-    // The copy stopped at an unmapped page. One of a title destination ends
-    // it: the retries below write the destination themselves (zeros for
-    // what cannot be read), and would fault there.
-    if title_dst && !crate::texture::committed(dst, len) {
-        return;
-    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    if !title_dst && len >= 64 << 10 {
-        read_sparse(src, dst, len);
-    } else {
-        read_pieces(src, dst, len);
-    }
-}
-
-/// After a failed bulk read into host memory, skip contiguous holes. Never
-/// cache the query across copies: the title may remap the same address.
-fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
-    };
-    let mut offset = 0;
-    while offset < len {
-        let at = src.wrapping_add(offset);
-        let to = dst.wrapping_add(offset);
-        let remaining = len - offset;
-        // SAFETY: the query inspects an address and fills a local structure.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: VirtualQuery only reads the process address map for `at`
-        // (any address is allowed) and writes at most `size_of_val(&info)`
-        // bytes into `info`.
-        let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
-        let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
-            .saturating_sub(at as usize).min(remaining);
-        if size != size_of_val(&info) || n == 0 {
-            read_pieces(at, to, remaining);
-            break;
-        }
-        if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-            // SAFETY: this path is only used with a writable host destination.
-            unsafe { to.write_bytes(0, n) };
-        } else if !read(at, to, n) {
-            // A mapping may change between query and read.
-            read_pieces(at, to, n);
-        }
-        offset += n;
-    }
-}
-
-fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
@@ -2292,29 +1953,29 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
-/// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
-/// page is not readable or a destination page not writable (the bytes
-/// before that page may have been copied).
+/// Copies `len` bytes from `src` to `dst` unless a source page is not
+/// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
-    // SAFETY: the destination is `len` bytes the caller may write, host
-    // memory or title memory; the kernel checks both ranges, and a page it
-    // cannot read or write fails the call instead of faulting.
+    // SAFETY: the destination is mapped writable memory of `len` bytes; the
+    // kernel checks the source.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
-///
-/// Through [`read`]: the kernel refuses an unmapped destination page as it
-/// does a source page. `WriteProcessMemory` makes the same copy, but asks
-/// for the destination's region first, at `VirtualQuery`'s cost (see
-/// [`copy_mapped`]): 0.35 ms for each piece of the world's copy-back, 39 ms
-/// per frame.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let write = |at: usize, n: usize| {
+        let from = src.wrapping_add(at - dst as usize);
+        let mut done = 0;
+        // SAFETY: the source is our mapped host copy; the kernel checks the
+        // destination.
+        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+    };
     if len == 0 || write(dst as usize, len) {
         return;
     }
@@ -2339,103 +2000,39 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
     }
 }
 
-#[cfg(test)]
-mod title_copies {
-    use super::{copy_mapped, write_mapped};
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
-        VirtualAlloc, VirtualFree, VirtualProtect,
-    };
-
-    const BLOCK: usize = 64 << 10;
-
-    /// Three reserved blocks, the first and the last committed and filled
-    /// with `fill`: title memory with an unmapped block in it.
-    fn holed(fill: u8) -> *mut u8 {
-        // SAFETY: a fresh reservation; the committed blocks are ours to fill.
-        unsafe {
-            let base =
-                VirtualAlloc(std::ptr::null(), 3 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
-            assert!(!base.is_null());
-            for block in [0, 2] {
-                let at = base.add(block * BLOCK);
-                assert!(!VirtualAlloc(at.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
-                at.write_bytes(fill, BLOCK);
-            }
-            base
-        }
-    }
-
-    fn block<'a>(base: *const u8, n: usize) -> &'a [u8] {
-        // SAFETY: tests ask for committed blocks only.
-        unsafe { std::slice::from_raw_parts(base.add(n * BLOCK), BLOCK) }
-    }
-
-    fn release(base: *mut u8) {
-        // SAFETY: a reservation of `holed`.
-        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
-    }
-
-    fn pattern() -> Vec<u8> {
-        (0..3 * BLOCK).map(|i| (i % 251) as u8 + 1).collect()
-    }
-
-    #[test]
-    fn title_copies_reach_mapped_destinations_and_stop_at_unmapped_pages() {
-        let from = pattern();
-        // All mapped: copied, through a destination that was never asked.
-        let to = holed(0xee);
-        copy_mapped(to, from.as_ptr(), BLOCK, true);
-        assert_eq!(block(to, 0), &from[..BLOCK]);
-        release(to);
-        // An unmapped block in the destination: nothing faults, and nothing
-        // arrives from that block on.
-        let to = holed(0xee);
-        copy_mapped(to, from.as_ptr(), 3 * BLOCK, true);
-        assert!(block(to, 2).iter().all(|&b| b == 0xee));
-        release(to);
-        // An unmapped block in the source reads as zeros.
-        let holes = holed(7);
-        let mut to = vec![0xeeu8; 3 * BLOCK];
-        copy_mapped(to.as_mut_ptr(), holes, 3 * BLOCK, true);
-        assert!(to[..BLOCK].iter().all(|&b| b == 7));
-        assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
-        assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
-        release(holes);
-    }
-
-    #[test]
-    fn copy_back_writes_mapped_pages_only() {
-        let from = pattern();
-        let to = holed(0xee);
-        write_mapped(to, from.as_ptr(), 3 * BLOCK);
-        assert_eq!(block(to, 0), &from[..BLOCK]);
-        assert_eq!(block(to, 2), &from[2 * BLOCK..]);
-        release(to);
-        // Neither aligned nor whole: the bytes around the range stay.
-        let to = holed(0xee);
-        // SAFETY: inside the first block.
-        write_mapped(unsafe { to.add(100) }, from.as_ptr(), BLOCK - 300);
-        let first = block(to, 0);
-        assert_eq!(first[100..BLOCK - 200], from[..BLOCK - 300]);
-        let around = first[..100].iter().chain(&first[BLOCK - 200..]);
-        assert!(around.into_iter().all(|&b| b == 0xee));
-        // A page that is mapped but not writable is not written either
-        // (guarded title blocks are opened before they are copied back).
-        let mut old = 0;
-        // SAFETY: a committed block of ours.
-        let protected =
-            unsafe { VirtualProtect(to.add(2 * BLOCK).cast(), BLOCK, PAGE_READONLY, &mut old) };
-        assert_ne!(protected, 0);
-        // SAFETY: the third block.
-        write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
-        assert!(block(to, 2).iter().all(|&b| b == 0xee));
-        release(to);
-    }
-}
-
 impl Host {
     /// A buffer in the upload heap, mapped for writing.
+    /// A GPU-only buffer of `size` bytes in the copy-destination state.
+    pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+        };
+        made.ok().and(buffer)
+    }
+
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
@@ -2481,49 +2078,45 @@ impl Host {
         }
     }
 
-    /// Maximum number of upload buffers retained in the pool.
-    const MAX_POOLED_UPLOADS: usize = 32;
-
-    /// Takes an upload buffer from the pool if one with sufficient capacity
-    /// exists, or creates a new one. The buffer is aligned to 64 KiB
-    /// (D3D12 placement alignment) or power-of-two for efficient reuse.
-    pub(crate) fn take_upload(&self, size: u64) -> Option<PooledUpload> {
-        let size = size.max(1);
-        let mut pool = self.upload_pool.lock().unwrap_or_else(|e| e.into_inner());
-        let fit = pool
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.size >= size && (b.size <= (size * 2).max(1 << 20)))
-            .min_by_key(|(_, b)| b.size)
-            .map(|(i, _)| i);
-
-        if let Some(i) = fit {
-            return Some(pool.swap_remove(i));
-        }
-        drop(pool);
-
-        let alloc_size = size
-            .checked_next_power_of_two()
-            .unwrap_or(size)
-            .max(64 * 1024);
-        let (buffer, data) = self.upload_buffer(alloc_size)?;
-        Some(PooledUpload {
-            buffer,
-            data: data as usize,
-            size: alloc_size,
-        })
-    }
-
-    /// Returns idle upload buffers back to the pool once a command list is reset.
-    pub(crate) fn recycle_uploads(&self, mut uploads: Vec<PooledUpload>) {
-        if uploads.is_empty() {
-            return;
-        }
-        let mut pool = self.upload_pool.lock().unwrap_or_else(|e| e.into_inner());
-        pool.append(&mut uploads);
-        if pool.len() > Self::MAX_POOLED_UPLOADS {
-            pool.sort_by_key(|b| std::cmp::Reverse(b.size));
-            pool.truncate(Self::MAX_POOLED_UPLOADS);
+    /// A buffer in the read-back heap, not mapped: what the GPU resolved
+    /// into it is read after the submission that filled it has finished.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(8),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a read-back buffer; nothing maps it
+        // until the submission that resolved into it has finished.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no read-back buffer");
+                None
+            }
         }
     }
 }
@@ -2584,6 +2177,9 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        crate::memory::log_frame();
+        #[cfg(feature = "diagnostics")]
+        crate::watch::frame_done();
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -2611,6 +2207,7 @@ impl Meter {
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        let root_views = crate::draw::take_root_view_slots() as f64 / frames;
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -2621,12 +2218,25 @@ impl Meter {
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect",
+                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
+            );
+            let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
+            tracing::info!(
+                "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \
+                 copies between textures of one memory {:.1}/frame, depth twin copies {:.1}/frame",
+                bytes as f64 / 1e6,
+                used as f64 / 1e6,
+                saved as f64 / 1e6,
+                crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
+                crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
             );
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
+                crate::copystat::log(copy_frames);
+                crate::bindless::log(copy_frames);
+                crate::shadow::log_views(copy_frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -2662,7 +2272,22 @@ impl Meter {
                         match next {
                             // SAFETY: a window handle and a NUL-terminated text.
                             Some((hwnd, text)) => unsafe {
-                                let _ = SetWindowTextW(HWND(hwnd as *mut _), PCWSTR(text.as_ptr()));
+                                let hwnd = HWND(hwnd as *mut _);
+                                let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                                let frame = (WS_CAPTION | WS_THICKFRAME).0 as isize;
+                                if style & frame != 0
+                                    && SetWindowLongPtrW(hwnd, GWL_STYLE, style & !frame) != 0
+                                {
+                                    let flags = SWP_FRAMECHANGED
+                                        | SWP_NOMOVE
+                                        | SWP_NOSIZE
+                                        | SWP_NOZORDER
+                                        | SWP_NOACTIVATE;
+                                    if SetWindowPos(hwnd, None, 0, 0, 0, 0, flags).is_err() {
+                                        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+                                    }
+                                }
+                                let _ = SetWindowTextW(hwnd, PCWSTR(text.as_ptr()));
                             },
                             None => std::thread::sleep(std::time::Duration::from_millis(100)),
                         }
@@ -2727,18 +2352,6 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
-            #[cfg(all(test, feature = "diagnostics"))]
-            let back_readback = present_tests::ACTIVE.get().then(|| {
-                list.ResourceBarrier(&[transition(
-                    &back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
-                let copy = crate::capture::read_back(&self.device, list, &back)
-                    .expect("back-buffer readback");
-                list.ResourceBarrier(&[transition(
-                    &back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST,
-                )]);
-                copy
-            });
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -2761,14 +2374,7 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            #[cfg(all(test, feature = "diagnostics"))]
-            if let Some((buffer, footprint)) = back_readback {
-                assert_eq!(status.0, 0, "DXGI Present");
-                present_tests::check_pixels(frame, &buffer, &footprint);
-                eprintln!("PresentX frame {frame}, back buffer {index}: all pixels matched");
-            }
-            let _ = status;
+            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -2925,53 +2531,61 @@ impl Host {
             }
         }
     }
+}
 
-    /// A GPU-only default-heap buffer that shaders can write (unordered
-    /// access). Starts in the common state.
-    pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            ..Default::default()
-        };
-        let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a default-heap buffer.
-        let made = unsafe {
-            self.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut buffer,
-            )
-        };
-        match made {
-            Ok(()) => buffer,
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no default buffer");
-                None
-            }
-        }
+/// Host resources that view heap slots stopped viewing while a submission
+/// may have been running ([`retire`]).
+static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+
+/// Keeps `resource` alive until the GPU work running now (or the next
+/// submission's) has run: title threads rewrite view heap slots while the
+/// GPU runs, and a shader that took the old descriptor still reads what it
+/// views.
+pub(crate) fn retire(resource: ID3D12Resource) {
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+}
+
+/// After a submission has run, with none running: the retired resources go.
+pub(crate) fn release_retired() {
+    let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(retired);
+}
+
+/// Diagnostics: a noted command running a shader `VICTORY_TRACE_SHADERS`
+/// names (hashes, comma-separated) is logged with what it binds, the first
+/// 500.
+#[cfg(feature = "diagnostics")]
+fn traced(what: &str) {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let hashes = HASHES.get_or_init(|| {
+        let v = std::env::var("VICTORY_TRACE_SHADERS").unwrap_or_default();
+        v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned).collect()
+    });
+    if hashes.iter().any(|h| what.contains(h.as_str())) && LOGGED.fetch_add(1, Ordering::Relaxed) < 500 {
+        tracing::info!("traced command: {what}");
     }
 }
 
-/// The last recorded commands in each list of the failed submission
-/// (diagnostics, with `VICTORY_D3D12_DRED`). These notes describe recording;
-/// GPU progress comes from the breadcrumbs.
+/// Diagnostics, `VICTORY_GPU_TIMING`: every command of the list during
+/// whose run (each list alone) the device was found removed.
+fn removed_during(runs: &[&HostList], list: Option<usize>) -> String {
+    #[cfg(feature = "diagnostics")]
+    if let Some(i) = list {
+        let notes = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut text = format!("; removed while list {i} ran alone ({} commands):", notes.len());
+        for (k, (n, _)) in notes.iter().enumerate() {
+            text.push_str(&format!(" [{k}] {n}"));
+        }
+        return text;
+    }
+    let _ = (runs, list);
+    String::new()
+}
+
+/// For adapters without device-removed data (the software one): the last
+/// commands each list of the failed submission noted (diagnostics, with
+/// `VICTORY_D3D12_DRED`).
 fn last_notes(runs: &[&HostList]) -> String {
     #[cfg(feature = "diagnostics")]
     {
@@ -2979,11 +2593,7 @@ fn last_notes(runs: &[&HostList]) -> String {
         for (i, r) in runs.iter().enumerate() {
             let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
             for (n, _) in notes.iter().rev().take(6).rev() {
-                text.push_str(&format!(
-                    "; list {i} of {}, recorded command ({} in list): {n}",
-                    runs.len(),
-                    notes.len()
-                ));
+                text.push_str(&format!("; list {i} of {}, of its {}: {n}", runs.len(), notes.len()));
             }
         }
         text
@@ -3144,21 +2754,6 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     use std::sync::Arc;
 
     #[test]
-    fn exact_gpu_writes_are_declared_once_per_submission() {
-        let mut batch = Batch::default();
-        let (a, b) = (Arc::new(0), Arc::new(0));
-        assert!(batch.new_gpu_write(&a, 4096, 16));
-        assert!(!batch.new_gpu_write(&a.clone(), 4096, 16));
-        assert!(batch.new_gpu_write(&a, 4096, 32));
-        assert!(batch.new_gpu_write(&a, 4104, 16));
-        assert!(batch.new_gpu_write(&b, 4096, 16));
-        // CPU copies can flush refreshes, but these GPU writes stay pending.
-        batch.title_written();
-        assert!(!batch.new_gpu_write(&a, 4096, 16));
-        assert!(Batch::default().new_gpu_write(&a, 4096, 16));
-    }
-
-    #[test]
     fn a_texture_is_checked_once_per_submission() {
         let mut batch = Batch::default();
         let (a, b) = (Arc::new([0u8; 16]), Arc::new([0u8; 16]));
@@ -3185,6 +2780,42 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    /// A host copy of tracked title memory: a submission whose lists all ask
+    /// for it whole copies the one page the title wrote, once, and again
+    /// only after a step that writes title memory.
+    #[test]
+    fn a_copy_is_refreshed_once_per_submission_by_the_pages_written() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), len, "all of it at first");
+        // SAFETY: our pool, guarded since the copy took it.
+        unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(7) };
+        // The next submission: two lists ask for the copy.
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        batch.add(&copy, p + 100, 200);
+        assert_eq!(batch.flush(), PAGE, "the page written");
+        assert_eq!(copy.read_host((p + PAGE + 8) as u64, 1)[0], 7);
+        // SAFETY: as above.
+        unsafe { (p as *mut u8).write_volatile(1) };
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), 0, "nothing again in the submission");
+        batch.title_written();
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
     }
 
     /// The hashing a submission does for textures in physical-page memory,
@@ -3225,54 +2856,4 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             before.as_secs_f64() / after.as_secs_f64()
         );
     }
-
-    #[test]
-    fn upload_pool_reuses_buffers_and_handles_varying_sizes() {
-        let Some(host) = super::host() else { return };
-        let Ok(list) = host.new_list() else { return };
-
-        // 4096 gets rounded to 64 KiB allocation.
-        let (buf1, ptr1) = list.upload(host, 4096).expect("first upload buffer");
-        let raw1 = ptr1 as usize;
-
-        // Reset recycles the upload buffer back to host.upload_pool.
-        list.close();
-        list.reset();
-
-        // Requesting a buffer of compatible size reuses the pooled buffer.
-        let (buf2, ptr2) = list.upload(host, 4096).expect("second upload buffer");
-        let raw2 = ptr2 as usize;
-
-        assert_eq!(raw1, raw2);
-        assert_eq!(buf1, buf2);
-
-        // 8192 should also reuse the 64 KiB buffer.
-        list.close();
-        list.reset();
-        let (buf_8k, ptr_8k) = list.upload(host, 8192).expect("upload 8k");
-        assert_eq!(raw1, ptr_8k as usize);
-        assert_eq!(buf1, buf_8k);
-
-        // 256 KiB needs a larger buffer than 64 KiB.
-        let (buf_256k, ptr_256k) = list.upload(host, 256 * 1024).expect("upload 256k");
-        let raw_256k = ptr_256k as usize;
-        assert_ne!(raw1, raw_256k);
-        list.close();
-        list.reset();
-
-        // Both 64 KiB and 256 KiB are now pooled.
-        // Requesting 200 KiB should pick the 256 KiB buffer.
-        let (buf_fit_large, _) = list.upload(host, 200 * 1024).expect("upload 200k");
-        assert_eq!(buf_fit_large, buf_256k);
-
-        // Requesting 10 KiB should pick the 64 KiB buffer.
-        let (buf_fit_small, _) = list.upload(host, 10 * 1024).expect("upload 10k");
-        assert_eq!(buf_fit_small, buf1);
-
-        list.close();
-        list.reset();
-    }
 }
-
-#[cfg(all(test, feature = "diagnostics"))]
-mod present_tests;
