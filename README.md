@@ -74,10 +74,18 @@ desert_gamer@icloud.com.
 **Not playable yet.** The title boots, runs its menus at its own 30 fps,
 loads the world and shows it: slowly, and with rendering defects.
 
-V2, 2026-11-25: on entering the world the host GPU still fails with a device
-removed error, as on upstream, and frames still take seconds. Frame figures
-differ a lot from one log line to the next, so V2 makes no claim that it
-renders more than upstream; that needs a measurement under the same conditions.
+V2, 2026-11-25, on Windows 11 with an NVIDIA RTX 5070: the title no longer
+loses the host GPU at start. Two fixes made that so: textures in formats the
+GPU refuses to render to or write (B4G4R4A4, B5G5R5A1) are created without
+those uses, and typed unordered views are made only in formats the GPU can
+store to. The start sequence, the intro splash included, then runs smoothly.
+Trouble begins when the first cutscene starts: it stutters, and a run can end
+with the host GPU removed after a single submission that took about 5
+seconds, longer than the Windows driver watchdog allows. In a release run the
+frame counter read 16 to 30 fps, and 127 shaders were translated at first use
+(70 seconds in all, the slowest 13 seconds); a run with the shader cache warm
+has not been measured yet. V2 makes no claim that it renders more than
+upstream; that needs a measurement under the same conditions.
 
 The tables below are upstream's findings of 2026-11-23; V2 has not re-measured
 them.
@@ -90,7 +98,8 @@ them.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | drawn and shown: streets, buildings, vehicles, characters, the title card and credits; 1-2 s per frame. Surfaces are unlit, a band of distant geometry is missing, characters come out broken in some shots |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Upstream's table was measured on Windows 11 with an AMD RX 6700 XT; V2's
+notes above on Windows 11 with an NVIDIA RTX 5070.
 
 > **Warning.** Entering the world on a real GPU has hung it in earlier
 > builds, and Windows then resets the display driver (every monitor goes
