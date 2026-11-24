@@ -1453,3 +1453,54 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+#[test]
+fn valu_24bit_mul_and_mad_match_rdna2() {
+    // VOP3 encodings: v_mul_i32_i24 = 0x109, v_mul_u32_u24 = 0x10b,
+    // v_mad_i32_i24 = 0x142, v_mad_u32_u24 = 0x143.
+    let mul_i = build_valu_cs(&vop3(0x109, 0, vgpr(1), vgpr(2), 0));
+    let mul_u = build_valu_cs(&vop3(0x10b, 0, vgpr(1), vgpr(2), 0));
+    let mad_i = build_valu_cs(&vop3(0x142, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let mad_u = build_valu_cs(&vop3(0x143, 0, vgpr(1), vgpr(2), vgpr(3)));
+
+    let sext24 = |x: u32| -> i32 { ((x << 8) as i32) >> 8 };
+    let zext24 = |x: u32| -> u32 { x & 0x00FF_FFFF };
+
+    let cases: &[[u32; 4]] = &[
+        [0, 0, 0, 0],
+        [0xAA00_0003, 0x5500_0007, 100, 0], // upper bits [31:24] must be ignored
+        [0x0080_0000, 2, 10, 0],            // bit 23 set: -8388608 (i24) vs +8388608 (u24)
+        [0x00FF_FFFF, 0x00FF_FFFF, 1, 0],   // (-1)*(-1) vs (2^24-1)^2 mod 2^32
+        [0x12FF_FFFB, 0x3400_0004, 0xFFFF_FFF0, 0], // -5 * 4 + (-16) in i24
+        [0x007F_FFFF, 0x0080_0001, 0x1234_5678, 0], // mixed signs & full 32-bit addend
+    ];
+
+    run_cases(&mul_i, cases, |backend, _, inp, got| {
+        let want = sext24(inp[0]).wrapping_mul(sext24(inp[1])) as u32;
+        assert_eq!(got, want, "{backend}: v_mul_i32_i24({:#x}, {:#x})", inp[0], inp[1]);
+    });
+    run_cases(&mul_u, cases, |backend, _, inp, got| {
+        let want = zext24(inp[0]).wrapping_mul(zext24(inp[1]));
+        assert_eq!(got, want, "{backend}: v_mul_u32_u24({:#x}, {:#x})", inp[0], inp[1]);
+    });
+    run_cases(&mad_i, cases, |backend, _, inp, got| {
+        let want = sext24(inp[0])
+            .wrapping_mul(sext24(inp[1]))
+            .wrapping_add(inp[2] as i32) as u32;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mad_i32_i24({:#x}, {:#x}, {:#x})",
+            inp[0], inp[1], inp[2]
+        );
+    });
+    run_cases(&mad_u, cases, |backend, _, inp, got| {
+        let want = zext24(inp[0])
+            .wrapping_mul(zext24(inp[1]))
+            .wrapping_add(inp[2]);
+        assert_eq!(
+            got, want,
+            "{backend}: v_mad_u32_u24({:#x}, {:#x}, {:#x})",
+            inp[0], inp[1], inp[2]
+        );
+    });
+}
