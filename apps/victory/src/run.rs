@@ -47,9 +47,17 @@ pub fn run(
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
+    // The exe may sit apart from the dump; the manifest and the package's
+    // virtual drive belong to the configured game directory then.
+    let content_dir = cfg
+        .game_dir
+        .as_deref()
+        .filter(|d| d.is_dir())
+        .unwrap_or(title_dir);
     // A missing manifest leaves id 0 and no storage quota.
-    let manifest =
-        std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
+    let manifest = std::fs::read_to_string(title_dir.join("MicrosoftGame.config"))
+        .or_else(|_| std::fs::read_to_string(content_dir.join("MicrosoftGame.config")))
+        .unwrap_or_default();
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
@@ -59,7 +67,7 @@ pub fn run(
         title.storage_bytes >> 20
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
-    victory_hle::modules::files::mount_at('G', title_dir);
+    victory_hle::modules::files::mount_at('G', content_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
