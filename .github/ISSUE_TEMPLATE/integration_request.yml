@@ -1,0 +1,23 @@
+name: Include an upstream pull request
+description: Ask for an open pull request of the original project to be considered for V2
+labels: [integration]
+body:
+  - type: input
+    id: pr
+    attributes:
+      label: Link to the upstream pull request
+      placeholder: https://github.com/Marvisak/VIctory/pull/0000
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it should be in V2
+      description: What it fixes for you, and whether you ran it.
+    validations:
+      required: true
+  - type: textarea
+    id: overlap
+    attributes:
+      label: Overlaps
+      description: Other pull requests that change the same code, if you know of any.
