@@ -10,7 +10,9 @@
 //! are translated: the backend description names the console device (type
 //! 0x0100_0002; on PC type 2 with the host device), and a dispatch names the
 //! title's command list and resources (their host list and host copies, in
-//! the states the title gives, see `victory_gpu::external`). The rest passes
+//! the states the title gives, see `victory_gpu::external`; an output in a
+//! format the host cannot write, RGB9E5, through an FP16 stand-in packed
+//! into it after the dispatch, see `victory_gpu::rgb9e5`). The rest passes
 //! through unchanged: sizes, flags, jitter, motion-vector scale, camera
 //! values, the resource descriptions, the context. Only the upscaler: other
 //! effects (frame generation) are refused.
@@ -95,6 +97,11 @@ struct DispatchUpscale {
     resources: [Resource; 7],
     rest: [u32; 18],
 }
+
+/// The dispatch's output, last of its resources.
+const OUTPUT: usize = 6;
+/// The FidelityFX state of unordered access.
+const FFX_UNORDERED_ACCESS: u32 = 0x2;
 
 const _: () = assert!(size_of::<CreateUpscale>() == 0x30);
 const _: () = assert!(size_of::<Resource>() == 0x30);
@@ -404,11 +411,26 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     let list = dispatch.list.cast::<Object>().cast_const();
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
-    for r in dispatch
+    // The title output the host cannot write, packed from its stand-in.
+    let mut packs = None;
+    for (slot, r) in dispatch
         .resources
         .iter_mut()
-        .filter(|r| !r.resource.is_null())
+        .enumerate()
+        .filter(|(_, r)| !r.resource.is_null())
     {
+        if slot == OUTPUT
+            && let Some(stand_in) = victory_gpu::external::stand_in(r.resource.cast::<Object>())
+        {
+            packs = Some(r.resource.cast::<Object>().cast_const());
+            // SAFETY: a live texture.
+            let d = unsafe { stand_in.GetDesc() };
+            r.description = stand_in_description(d.Width as u32, d.Height);
+            r.state = FFX_UNORDERED_ACCESS;
+            r.resource = stand_in.as_raw();
+            textures.push(stand_in);
+            continue;
+        }
         let wanted = host_state(r.state);
         let texture = wanted.and_then(|w| {
             victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), w)
@@ -429,12 +451,31 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         // SAFETY: a live texture.
         unsafe { t.GetDesc() }.Format.0
     }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
-    victory_gpu::external::record(list, |host_list| {
+    let code = victory_gpu::external::record(list, |host_list| {
         dispatch.list = host_list.as_raw();
         // SAFETY: the PC dispatch on host objects; the context is the host's.
         unsafe { (host.dispatch)(context, &raw mut dispatch.header) }
     })
-    .unwrap_or(PARAMETER)
+    .unwrap_or(PARAMETER);
+    if code == OK
+        && let Some(output) = packs
+        && !victory_gpu::external::pack_stand_in(list, output)
+    {
+        once!(
+            warn,
+            "FidelityFX: the upscaled colour was not packed into the title's RGB9E5 output"
+        );
+    }
+    code
+}
+
+/// The FidelityFX description of an FP16 stand-in of `width` x `height`:
+/// type, format, sizes, mips, flags, usage.
+fn stand_in_description(width: u32, height: u32) -> [u32; 8] {
+    const TEXTURE_2D: u32 = 2;
+    const RGBA16_FLOAT: u32 = 4;
+    const USAGE_UNORDERED: u32 = 2;
+    [TEXTURE_2D, RGBA16_FLOAT, width, height, 1, 1, 0, USAGE_UNORDERED]
 }
 
 pub(crate) fn module() -> HleModule {
@@ -507,6 +548,13 @@ mod tests {
             resolver.classify("amd_fidelityfx_loader_xbox.dll", &symbol),
             None
         );
+    }
+
+    /// The upscaler writes the stand-in as the PC backend describes an
+    /// FP16 unordered 2D texture of the output's size.
+    #[test]
+    fn a_stand_in_is_described_as_an_fp16_unordered_texture() {
+        assert_eq!(stand_in_description(3840, 2160), [2, 4, 3840, 2160, 1, 1, 0, 2]);
     }
 
     #[test]

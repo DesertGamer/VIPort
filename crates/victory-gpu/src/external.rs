@@ -31,6 +31,31 @@ pub fn host_texture(
     Some((texture, state))
 }
 
+/// The texture a host library writes through unordered access in place of
+/// the title texture `resource`, when the host has no unordered view of
+/// its format (RGB9E5: the title's upscaled colour): an FP16 texture of
+/// its size, in the unordered-access state. [`pack_stand_in`] then writes
+/// what the library wrote into `resource`. `None` for textures the host
+/// writes as they are.
+pub fn stand_in(resource: *const Object) -> Option<ID3D12Resource> {
+    let copy = crate::resource::host_copy(resource)?;
+    crate::rgb9e5::stand_in(&copy).map(|s| s.float.clone())
+}
+
+/// Records into the title list `list`, after the host library wrote
+/// [`stand_in`]'s texture, its pack into the title texture `resource`, left
+/// in the unordered-access state. False without a stand-in or host list.
+pub fn pack_stand_in(list: *const Object, resource: *const Object) -> bool {
+    let Some(copy) = crate::resource::host_copy(resource) else { return false };
+    let Some(stand_in) = crate::rgb9e5::stand_in(&copy) else { return false };
+    let mut packed = false;
+    crate::list::with_state(list, |host, state| {
+        packed = stand_in.pack(host, &copy);
+        state.host_state_lost();
+    });
+    packed
+}
+
 /// Runs `f` with the host list behind the title list `list` (open for
 /// recording); `None` without one. What `f` binds (descriptor heaps, root
 /// signatures, pipeline) is replaced before the list's next draw or

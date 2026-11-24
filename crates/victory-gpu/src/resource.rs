@@ -776,6 +776,9 @@ pub(crate) struct HostTexture {
     /// A depth texture's writable twin (`crate::twin`), made with its first
     /// unordered access view; `None` inside if it has none.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
+    /// An RGB9E5 texture's FP16 stand-in for host libraries that write it
+    /// (`crate::rgb9e5`), made on first use; `None` inside if it has none.
+    pub(crate) rgb9e5: std::sync::OnceLock<Option<crate::rgb9e5::StandIn>>,
     /// Bytes it takes on the host GPU.
     bytes: u64,
     /// A list used it (counted once).
@@ -803,6 +806,7 @@ impl HostTexture {
             host_written: false.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
+            rgb9e5: std::sync::OnceLock::new(),
             bytes,
             used: false.into(),
         }
@@ -1967,6 +1971,81 @@ mod tests {
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { layout: 0x102, ..a }));
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { flags: 2, format: 40, ..a }));
         assert_eq!(memory_key(0x1_0000, &buffer(256)), None);
+    }
+
+    /// The title's upscaled colour: an RGB9E5 render target that is also
+    /// unordered-access. The host makes it (castable), a library writes its
+    /// FP16 stand-in, and the pack writes the title texture: DXGI's rounding,
+    /// negatives as 0.
+    #[cfg(windows)]
+    #[test]
+    fn an_rgb9e5_output_takes_its_stand_ins_colour() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let d = host_desc(&ResourceDesc { flags: 5, ..texture(2, 2, 67, 1) }).unwrap();
+        let target = std::sync::Arc::new(make_texture(&d, 0, std::ptr::null()).unwrap());
+        assert_eq!(crate::host::legal_state(&target.texture, 0x8), 0x8);
+        assert_eq!(crate::host::legal_state(&target.texture, 0x4), 0x4);
+        let Some(stand_in) = crate::rgb9e5::stand_in(&target) else {
+            return; // a host that writes RGB9E5 itself, or takes no castable formats
+        };
+        let list = host.new_list().unwrap();
+        let (upload, data) = host.upload_buffer(512).unwrap();
+        let (back, out) = host.shared_buffer(512).unwrap();
+        // FP16 (1, .5, .25), (4, 2, -1); (0, 0, 0), (32, 1, .125).
+        let rows = [[0x3c00u16, 0x3800, 0x3400, 0, 0x4400, 0x4000, 0xbc00, 0], [0, 0, 0, 0, 0x5000, 0x3c00, 0x3000, 0]];
+        let placed = |buffer: &ID3D12Resource, format| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the copy does not release.
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: 2, Height: 2, Depth: 1, RowPitch: 256 },
+                },
+            },
+        };
+        let whole = |t: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(t) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let state = |t: &ID3D12Resource, from, to| crate::host::transition(t, from, to);
+        // SAFETY: both rows fit the upload; the resources live through the
+        // submission, in the states named.
+        unsafe {
+            for (y, row) in rows.iter().enumerate() {
+                data.add(y * 256).cast::<[u16; 8]>().write_unaligned(*row);
+            }
+            // What the library would write: the colour into the stand-in.
+            list.list.ResourceBarrier(&[state(&stand_in.float, uav, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.list.CopyTextureRegion(&whole(&stand_in.float), 0, 0, 0, &placed(&upload, DXGI_FORMAT_R16G16B16A16_FLOAT), None);
+            list.list.ResourceBarrier(&[state(&stand_in.float, D3D12_RESOURCE_STATE_COPY_DEST, uav)]);
+        }
+        assert!(stand_in.pack(&list, &target));
+        // SAFETY: as above; the pack left the target in unordered access.
+        unsafe {
+            list.list.ResourceBarrier(&[state(&target.texture, uav, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.list.CopyTextureRegion(&placed(&back, DXGI_FORMAT_R9G9B9E5_SHAREDEXP), 0, 0, 0, &whole(&target.texture), None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let decode = |bits: u32| {
+            let scale = 2f32.powi((bits >> 27) as i32 - 24);
+            [0, 9, 18].map(|shift| ((bits >> shift) & 0x1ff) as f32 * scale)
+        };
+        // SAFETY: the submission finished; both rows are in the buffer.
+        let texel = |x: usize, y: usize| decode(unsafe { out.add(y * 256 + x * 4).cast::<u32>().read_unaligned() });
+        assert_eq!(texel(0, 0), [1.0, 0.5, 0.25]);
+        assert_eq!(texel(1, 0), [4.0, 2.0, 0.0]);
+        assert_eq!(texel(0, 1), [0.0; 3]);
+        assert_eq!(texel(1, 1), [32.0, 1.0, 0.125]);
+        assert_eq!(host.log_messages(), None);
     }
 
     /// Castable formats: every format of the same element but typeless and
