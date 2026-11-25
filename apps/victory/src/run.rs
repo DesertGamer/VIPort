@@ -548,11 +548,17 @@ fn apply_patches(base: usize) {
         (s.len() % 2 == 0).then_some(())?;
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
     };
-    let skip: Vec<u32> = std::env::var("VICTORY_PATCH_SKIP")
+    let mut skip: Vec<u32> = std::env::var("VICTORY_PATCH_SKIP")
         .unwrap_or_default()
         .split(',')
         .filter_map(|n| n.trim().parse().ok())
         .collect();
+    // Patches 4, 5 and 7-9 switch off the title's lighting passes (indirect
+    // diffuse, scattering, ray-marched gather): with them interiors came out
+    // black (run vu14 against vu15). Only with VICTORY_PATCH_HEAVY=1.
+    if std::env::var("VICTORY_PATCH_HEAVY").map_or(true, |v| v.trim() != "1") {
+        skip.extend([4, 5, 7, 8, 9]);
+    }
     let mut list: Vec<(String, usize, Vec<u8>, Vec<u8>)> = Vec::new();
     if std::env::var("VICTORY_PATCH_DEFAULTS").map_or(true, |v| v.trim() != "0") {
         for (n, rva, old, new, what) in DEFAULTS {
