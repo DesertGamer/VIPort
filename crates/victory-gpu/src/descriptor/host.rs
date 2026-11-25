@@ -301,6 +301,13 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
 }
 
 impl HostHeap {
+    /// Where the pairs' region starts: past the title's and the dynamic
+    /// slots, whichever dynamic range this heap was made with.
+    #[cfg(test)]
+    pub(crate) fn pairs_start(&self) -> u32 {
+        self.pairs.lock().unwrap_or_else(|e| e.into_inner()).0
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
