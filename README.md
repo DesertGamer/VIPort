@@ -163,6 +163,10 @@ cargo test --workspace -- --test-threads=1 # serializes D3D12 tests; no game dat
 cargo run -p victory -- config           # check your paths
 ```
 
+The shader tests' GPU checks run on the default adapter and WARP. On a machine
+with two GPUs, `$env:VICTORY_ADAPTER=1` runs them on the second (DXGI's
+adapter order, 0 being the default); the first test to make a device names it.
+
 Run the title:
 
 ```powershell

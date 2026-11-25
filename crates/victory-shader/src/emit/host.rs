@@ -158,10 +158,38 @@ fn wait(event: HANDLE, fence: &ID3D12Fence, dev: &ID3D12Device, value: u64) -> R
     }
 }
 
+/// `VICTORY_ADAPTER`'s value: unset or empty is the default adapter.
+fn adapter_index(value: Option<&str>) -> Result<Option<u32>, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(v) => v
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("VICTORY_ADAPTER={v}: not an adapter index")),
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::adapter_index;
+
+    #[test]
+    fn adapter_index_reads_a_number_or_nothing() {
+        assert_eq!(adapter_index(None), Ok(None));
+        assert_eq!(adapter_index(Some("")), Ok(None));
+        assert_eq!(adapter_index(Some(" 1 ")), Ok(Some(1)));
+        assert!(adapter_index(Some("igpu")).is_err());
+    }
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// `VICTORY_ADAPTER=<n>` picks DXGI's `n`th adapter instead of the
+    /// default (0 is the default one), so a machine's second GPU, an iGPU
+    /// beside a graphics card say, runs the same tests.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        let index = adapter_index(std::env::var("VICTORY_ADAPTER").ok().as_deref())?;
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
@@ -169,6 +197,24 @@ impl Host {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            } else if let Some(n) = index {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                // Said once per run, so a mistyped index (whose tests then
+                // skip as on a machine without the device) does not pass
+                // unnoticed.
+                static NAMED: std::sync::Once = std::sync::Once::new();
+                let adapter: IDXGIAdapter1 = factory.EnumAdapters1(n).map_err(|e| {
+                    let e = format!("VICTORY_ADAPTER={n}: no such adapter ({})", e.message());
+                    NAMED.call_once(|| eprintln!("{e}"));
+                    e
+                })?;
+                let desc = adapter.GetDesc1().map_err(err)?;
+                let name = String::from_utf16_lossy(&desc.Description);
+                NAMED.call_once(|| {
+                    eprintln!("VICTORY_ADAPTER={n}: {}", name.trim_end_matches('\0'));
+                });
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
