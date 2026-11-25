@@ -238,6 +238,41 @@ fn a_compressed_depth_export_with_stencil_stays_refused() {
     ));
 }
 
+fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+    let mut words = vec![0xBE85_0380, 0xF408_0202, 0xFA00_0000];
+    words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+    words.extend_from_slice(body);
+    words.extend_from_slice(&[0xE070_0000, 0x8002_0000, S_ENDPGM]);
+    let constants = RootParam {
+        sgprs: 4,
+        ..root(RootType::Constants, 0, 0)
+    };
+    let buffer = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    lower_with(
+        &words,
+        vec![constants, root(RootType::Table, 4, 1)],
+        vec![buffer],
+    )
+    .map(|_| ())
+}
+
+#[test]
+fn sums_of_absolute_differences_lower() {
+    for op in [0x15Au32, 0x15B, 0x15C, 0x15D, 0x171] {
+        let words = [0xD400_0000 | op << 16, 0x101 | 0x102 << 9 | 0x103 << 18];
+        lowers_valu(&words).unwrap_or_else(|e| panic!("VOP3 {op:#x}: {e}"));
+    }
+}
+
 #[test]
 fn a_scalar_carry_chain_reaches_the_select() {
     // The high dword of a 64-bit add or subtract, then a select on the
