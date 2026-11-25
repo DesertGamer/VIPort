@@ -356,6 +356,19 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let call = std::time::Instant::now();
+        let written = self.copy_back_inner(address, len, back);
+        #[cfg(feature = "diagnostics")]
+        {
+            cb_time(1, call);
+            cb_add(0, 1);
+            cb_add(10, written as u64);
+        }
+        written
+    }
+
+    fn copy_back_inner(&self, address: usize, len: usize, back: bool) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
@@ -390,9 +403,27 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                #[cfg(feature = "diagnostics")]
+                let t0 = std::time::Instant::now();
+                let differs = host != old;
+                #[cfg(feature = "diagnostics")]
+                {
+                    cb_time(2, t0);
+                    cb_add(6, 1);
+                }
+                #[cfg(feature = "diagnostics")]
+                let t1 = std::time::Instant::now();
+                let read = differs && crate::host::read_into((start + at) as *const u8, title);
+                #[cfg(feature = "diagnostics")]
+                if differs {
+                    cb_time(3, t1);
+                    cb_add(7, 1);
+                }
+                if read {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
+                    #[cfg(feature = "diagnostics")]
+                    let t2 = std::time::Instant::now();
                     let mut changed = false;
                     for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
                         if *h != *o && *t != *h {
@@ -401,10 +432,19 @@ impl Shadow {
                         }
                         *h = *t;
                     }
+                    #[cfg(feature = "diagnostics")]
+                    cb_time(4, t2);
                     if changed {
+                        #[cfg(feature = "diagnostics")]
+                        let t3 = std::time::Instant::now();
                         let _writing = crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            cb_time(5, t3);
+                            cb_add(8, 1);
+                        }
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -414,10 +454,14 @@ impl Shadow {
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
+            #[cfg(feature = "diagnostics")]
+            let t4 = std::time::Instant::now();
             if let Some(t) = &self.tracked {
                 let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
                 t.taken(&whole);
             }
+            #[cfg(feature = "diagnostics")]
+            cb_time(9, t4);
         }
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
@@ -700,10 +744,40 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shad
 #[cfg(feature = "diagnostics")]
 static VIEWS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+#[cfg(feature = "diagnostics")]
+static COPY_BACK: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
+#[cfg(feature = "diagnostics")]
+fn cb_add(i: usize, n: u64) {
+    COPY_BACK[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "diagnostics")]
+fn cb_time(i: usize, since: std::time::Instant) {
+    cb_add(i, since.elapsed().as_micros() as u64);
+}
+
 /// Logs [`VIEWS`] per frame over `frames`.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_views(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
+    let c = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(|i| COPY_BACK[i].swap(0, Relaxed) as f64);
+    if c[0] > 0.0 {
+        tracing::info!(
+            "copy-back per frame: {:.0} calls {:.1} ms in all; compare {:.1} ms ({:.0} pieces), read title {:.1} ms ({:.0} pieces), merge {:.1} ms, write {:.1} ms ({:.0} pieces, {:.1} MB), tracked taken {:.1} ms",
+            c[0] / frames,
+            c[1] / frames / 1e3,
+            c[2] / frames / 1e3,
+            c[6] / frames,
+            c[3] / frames / 1e3,
+            c[7] / frames,
+            c[4] / frames / 1e3,
+            c[5] / frames / 1e3,
+            c[8] / frames,
+            c[10] / frames / 1e6,
+            c[9] / frames / 1e3
+        );
+    }
     let [asks, made, bytes, largest] = [0, 1, 2, 3].map(|i| VIEWS[i].swap(0, Relaxed));
     let live = EXACT
         .lock()
