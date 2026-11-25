@@ -379,6 +379,10 @@ pub fn emit(
     };
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
+    if pixel {
+        // DXIL reads SV_Coverage via dx.op.coverage (NotInSig), not ISG1.
+        inputs.retain(|e| e.kind != 14);
+    }
     let mut outputs = sig(FourCC::OSG1)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
@@ -1756,5 +1760,33 @@ mod tests {
                 what: "an unknown minimum-precision signature element",
             })
         );
+    }
+
+    #[test]
+    fn pixel_sample_coverage_input_lowers_and_drops_from_isg1() {
+        let coverage = SigElement {
+            name: "SV_Coverage".into(),
+            index: 0,
+            kind: 14,
+            comp: 1,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 1,
+            usage: 0,
+            half: false,
+        };
+        let isg1 = container::signature(&[coverage], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let words = [
+            0x7E00_0D00u32, // v_cvt_f32_u32 v0, v0
+            0xF800_180F,
+            0x0000_0000,    // exp mrt0, v0, v0, v0, v0 done vm
+            0xBF81_0000,    // s_endpgm
+        ];
+        let shader = emit_pixel(&words, vec![], 1 << 14, &isg1, &osg1).expect("translate");
+        let dxbc = crate::dxbc::Container::parse(&shader.dxil).expect("dxbc");
+        let out_isg1 = dxbc.part(FourCC::ISG1).expect("ISG1");
+        assert_eq!(crate::dxbc::u32_at(out_isg1.data, 0).unwrap(), 0);
     }
 }
