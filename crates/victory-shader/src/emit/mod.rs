@@ -481,6 +481,11 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
+    // The rows the count asks for are in the part, 32 bytes each: a count
+    // from a damaged part would otherwise be an allocation of its size.
+    if count > part.len().saturating_sub(base) / 32 {
+        return Err(ShaderError::Malformed("signature rows out of bounds"));
+    }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let at = base + 32 * i;
@@ -492,6 +497,11 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         let mask = *part
             .get(at + 24)
             .ok_or(ShaderError::Malformed("truncated"))?;
+        // A row has four dwords, so its mask names at most four components
+        // (the emission shifts `1 << cols`, which overflows past 8).
+        if mask.count_ones() > 4 {
+            return Err(ShaderError::Malformed("signature element mask"));
+        }
         // DXBC encodes HLSL min16*/min10* types with a 32-bit ComponentType
         // (1..=3) and a non-zero D3D_MIN_PRECISION at +28 (1 FLOAT_16,
         // 2 FLOAT_2_8, 4 SINT_16, 5 UINT_16, 240 ANY_16, 241 ANY_10).
@@ -556,6 +566,11 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             }
         };
         let register = u32_at(part, at + 20)?;
+        // PSV0 counts a signature's register rows in a byte, and lays out
+        // the input/output dependence table from them.
+        if register != u32::MAX && register > 254 {
+            return Err(ShaderError::Malformed("signature element register"));
+        }
         out.push(container::SigElement {
             name: String::from_utf8_lossy(name).into_owned(),
             index: u32_at(part, at + 8)?,
@@ -577,6 +592,51 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// An `ISG1` part of one element, with the given row register and mask.
+    fn isg1(register: u32, mask: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(1u32.to_le_bytes()); // count
+        out.extend(8u32.to_le_bytes()); // row table offset
+        let at = out.len();
+        out.resize(at + 32, 0);
+        out[at + 4..at + 8].copy_from_slice(&40u32.to_le_bytes()); // name
+        out[at + 12..at + 16].copy_from_slice(&64u32.to_le_bytes()); // SV_Target
+        out[at + 16..at + 20].copy_from_slice(&3u32.to_le_bytes()); // f32
+        out[at + 20..at + 24].copy_from_slice(&register.to_le_bytes());
+        out[at + 24] = mask;
+        out.extend(b"SV_Target\0");
+        out
+    }
+
+    /// A damaged signature part fails the translation instead of aborting
+    /// on the allocation its count asks for.
+    #[test]
+    fn a_signature_count_past_its_rows_is_refused() {
+        let mut part = isg1(0, 0x1);
+        part[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            signature(&part).unwrap_err(),
+            ShaderError::Malformed("signature rows out of bounds")
+        );
+        let part = [0x20u8, 0, 0, 0, 0, 0, 0, 0];
+        assert!(signature(&part).is_err());
+    }
+
+    /// The mask and the register of a row reach shifts and a PSV0 table
+    /// sized from them: a damaged part is refused, not a panic.
+    #[test]
+    fn a_signature_row_outside_its_fields_is_refused() {
+        assert_eq!(
+            signature(&isg1(0, 0xFF)).unwrap_err(),
+            ShaderError::Malformed("signature element mask")
+        );
+        assert_eq!(
+            signature(&isg1(0x4000_0000, 0x1)).unwrap_err(),
+            ShaderError::Malformed("signature element register")
+        );
+        assert_eq!(signature(&isg1(u32::MAX, 0xC)).unwrap().len(), 1);
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
