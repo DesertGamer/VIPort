@@ -1832,14 +1832,14 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
-        // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
-            fail(format_args!(
-                "a host command list did not close ({e}): a command recorded into it was invalid"
         let closing = std::mem::take(&mut self.deferred().closing);
         for work in &closing {
             work(&self.list);
         }
+        // SAFETY: our list.
+        if let Err(e) = unsafe { self.list.Close() } {
+            fail(format_args!(
+                "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
     }
@@ -2277,14 +2277,14 @@ impl HostList {
         self.deferred().missed.push(Box::new(check));
     }
 
-    /// Runs `work` once the list has run (each submission), before its
-    /// bottom-of-pipe writes.
-    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().after.push(Box::new(work));
     pub(crate) fn defer_closing(&self, work: impl Fn(&ID3D12GraphicsCommandList) + Send + 'static) {
         self.deferred().closing.push(Box::new(work));
     }
 
+    /// Runs `work` once the list has run (each submission), before its
+    /// bottom-of-pipe writes.
+    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after.push(Box::new(work));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -3031,15 +3031,6 @@ impl Host {
     }
 
     /// A buffer in the read-back heap, mapped for reading.
-    pub(crate) fn read_back_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        self.mapped_buffer(size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST)
-    }
-
-    fn mapped_buffer(
-        &self,
-        size: u64,
-        kind: D3D12_HEAP_TYPE,
-        state: D3D12_RESOURCE_STATES,
     pub(crate) fn gpu_bitmap(&self, size: u64) -> Option<(ID3D12Resource, ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -3074,6 +3065,15 @@ impl Host {
         Some((buffer?, back, data))
     }
 
+    pub(crate) fn read_back_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_buffer(size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST)
+    }
+
+    fn mapped_buffer(
+        &self,
+        size: u64,
+        kind: D3D12_HEAP_TYPE,
+        state: D3D12_RESOURCE_STATES,
     ) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: kind,

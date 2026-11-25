@@ -211,14 +211,6 @@ pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<
     // SAFETY: a live buffer.
     let gpu = unsafe { bitmap.GetGPUVirtualAddress() };
     list.keep(&bitmap);
-    let data = data as usize;
-    list.defer_after(move || {
-        // SAFETY: the bitmap is mapped and the list's run is over.
-        let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
-        let on = heap_usage_on() && heap != 0;
-        if heap == 0 {
-            USAGE.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
     list.keep(&back);
     let copied = (bitmap.clone(), back);
     list.defer_closing(move |l| {
@@ -241,6 +233,14 @@ pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<
             )]);
         }
     });
+    let data = data as usize;
+    list.defer_after(move || {
+        // SAFETY: the bitmap is mapped and the list's run is over.
+        let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
+        let on = heap_usage_on() && heap != 0;
+        if heap == 0 {
+            USAGE.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut used = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             if *mark == 0 {
