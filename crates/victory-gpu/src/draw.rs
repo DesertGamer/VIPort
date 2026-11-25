@@ -102,6 +102,9 @@ pub(crate) struct State {
     /// The values sent to each stage for the next device-removed marker.
     #[cfg(feature = "diagnostics")]
     bound_user_data: Vec<BoundUserData>,
+    /// The view-stride table last kept in the host list, so that its draws
+    /// keep it once rather than once per stage ([`State::bind`]).
+    stride_table: usize,
 }
 
 impl Drop for State {
@@ -741,7 +744,12 @@ impl State {
                             not_run("view strides without a view heap");
                             return false;
                         };
-                        list.keep(table);
+                        // Kept once per table: the same table is bound again
+                        // by every draw of this pipeline.
+                        if self.stride_table != table.as_raw() as usize {
+                            self.stride_table = table.as_raw() as usize;
+                            list.keep(table);
+                        }
                         // SAFETY: an open list; the table lives while the list
                         // holds it.
                         unsafe {
