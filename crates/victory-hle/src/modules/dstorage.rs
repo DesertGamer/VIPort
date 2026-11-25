@@ -1013,10 +1013,14 @@ fn into_destination(
             }
         }
     }
+    let first = pages.get(offset / PAGE).copied().unwrap_or(0);
     tracing::warn!(
         offset,
         len,
         pages = pages.len(),
+        first = format_args!("{first:#x}"),
+        first_known = super::xmem::page_known(first),
+        zero_in_list = pages.contains(&0),
         "dstorage: a destination's physical pages could not be written; its request fails"
     );
     Err(E_INVALIDARG)
