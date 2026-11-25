@@ -611,15 +611,16 @@ fn atomic_descriptor_loads(p: &Program, res: &Resources) -> HashSet<Site> {
         if !atomic.name().starts_with("image_atomic_")
             || inst.name() != "s_load_dwordx8"
             || code > crate::ir::VCC - 8
-            || inst.writes.len() != 8
+            || inst.writes(p).len() != 8
         {
             continue;
         }
-        if inst.writes.iter().all(|&(reg, v)| {
-            matches!(reg, Reg::S(n) if (code..code + 8).contains(&n)) && atomic.read(reg) == Some(v)
+        if inst.writes(p).iter().all(|&(reg, v)| {
+            matches!(reg, Reg::S(n) if (code..code + 8).contains(&n))
+                && atomic.read(p, reg) == Some(v)
         }) {
             loads.insert(load);
-            for &(_, v) in &inst.writes {
+            for &(_, v) in inst.writes(p) {
                 readers.insert(v, (load, d.site));
             }
         }
@@ -632,7 +633,7 @@ fn atomic_descriptor_loads(p: &Program, res: &Resources) -> HashSet<Site> {
                 }
             }
             for (i, inst) in block.insts.iter().enumerate() {
-                for (_, v) in &inst.reads {
+                for (_, v) in inst.reads(p) {
                     if let Some(&(load, reader)) = readers.get(v)
                         && reader != (b, i)
                     {
@@ -6712,10 +6713,10 @@ impl<'a> Lower<'a> {
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 || v.sdwa.is_some() || v.dpp.is_some() {
             return Err("64-bit operand modifiers");
         }
-        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let op = *self.x.p.operands(v.src).get(k).ok_or("a missing operand")?;
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
-            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
-            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            let lo = l.i32_of(inst.read(l.x.p, r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(l.x.p, r1).ok_or("an unread operand")?)?;
             Ok((lo, hi))
         };
         match op {
