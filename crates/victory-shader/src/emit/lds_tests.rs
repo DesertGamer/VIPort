@@ -184,6 +184,7 @@ fn build_cs(body: &[u32], threads: u32) -> HostShader {
         root_uavs: lowered.root_uavs,
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
+        heap_usage: lowered.heap_usage,
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,

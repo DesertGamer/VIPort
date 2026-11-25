@@ -279,6 +279,12 @@ pub struct HostShader {
     /// Whether the host binds the page bitmap `u0` in [`MEMORY_SPACE`]
     /// (pages written and pages missed): whenever [`HostShader::memory`].
     pub memory_writes: bool,
+    /// Whether the host binds the heap-usage bitmap `u1` in
+    /// [`MEMORY_SPACE`]: shaders taking resource views from the heap itself
+    /// set bit `index` for each slot they read (once per wave when uniform),
+    /// so that the host makes the views it left null (placed textures) the
+    /// next time.
+    pub heap_usage: bool,
     /// Whether it reads buffer views' title addresses from their
     /// descriptors: the host binds the view addresses `t1` in
     /// [`MEMORY_SPACE`] (module notes, "Title memory").
@@ -470,6 +476,7 @@ pub fn emit(
         root_uavs: l.root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
+        heap_usage: l.heap_usage,
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
@@ -917,6 +924,7 @@ mod tests {
             root_uavs: Vec::new(),
             memory: false,
             memory_writes: false,
+            heap_usage: false,
             view_addresses: false,
             heap: false,
             heap_writes: false,
@@ -933,6 +941,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 memory: false,
                 memory_writes: false,
+                heap_usage: false,
                 view_addresses: false,
                 heap: false,
                 heap_writes: false,
