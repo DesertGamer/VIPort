@@ -3589,6 +3589,14 @@ impl Meter {
                     usage as f64 * 100.0 / budget.max(1) as f64
                 );
             }
+            #[cfg(feature = "diagnostics")]
+            for (shaders, count, groups) in crate::draw::take_dispatch_stats().into_iter().take(6) {
+                tracing::info!(
+                    "dispatches/frame {:.1}, groups/frame {:.0}: {shaders}",
+                    count as f64 / frames,
+                    groups as f64 / frames
+                );
+            }
             let (marked, made) = crate::descriptor::take_usage();
             tracing::info!(
                 "heap usage: {marked} heap slots marked read by shaders, {made} placed-texture views made for them (last 5 s); not made: {:?}, no heap {}; placed textures that failed to make: {}",

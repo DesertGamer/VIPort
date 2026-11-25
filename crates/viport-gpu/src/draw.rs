@@ -197,6 +197,32 @@ fn not_run(why: &'static str) {
     let _ = why;
 }
 
+#[cfg(feature = "diagnostics")]
+static DISPATCH_STATS: std::sync::Mutex<Vec<(usize, String, u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "diagnostics")]
+fn note_dispatch(pipeline: usize, groups: u64) {
+    let mut stats = DISPATCH_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    match stats.iter_mut().find(|s| s.0 == pipeline) {
+        Some(s) => {
+            s.2 += 1;
+            s.3 += groups;
+        }
+        None => {
+            let name = crate::pipeline::shaders_of(pipeline as This);
+            stats.push((pipeline, name, 1, groups));
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_dispatch_stats() -> Vec<(String, u64, u64)> {
+    let mut stats = std::mem::take(&mut *DISPATCH_STATS.lock().unwrap_or_else(|e| e.into_inner()));
+    stats.sort_unstable_by(|a, b| b.3.cmp(&a.3).then_with(|| a.1.cmp(&b.1)));
+    stats.into_iter().map(|s| (s.1, s.2, s.3)).collect()
+}
+
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
@@ -1114,7 +1140,10 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
-        self.probe_written(list);
+        {
+            self.probe_written(list);
+            note_dispatch(self.pipeline, x as u64 * y as u64 * z as u64);
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
