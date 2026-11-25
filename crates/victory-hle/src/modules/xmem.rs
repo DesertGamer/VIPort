@@ -656,7 +656,6 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     1
 }
 
-
 fn view_run(physical: &Physical, at: usize, max_len: usize) -> Option<(Slice, usize)> {
     let (&base, &(size, ref s)) = physical
         .views
@@ -675,7 +674,6 @@ fn view_run(physical: &Physical, at: usize, max_len: usize) -> Option<(Slice, us
         pages * PAGE,
     ))
 }
-
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
@@ -721,7 +719,6 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
-
 fn coalesce_placeholders(base: usize, len: usize) {
     let Some(target_end) = base.checked_add(len) else {
         return;
@@ -742,8 +739,8 @@ fn coalesce_placeholders(base: usize, len: usize) {
     if first.State != MEM_RESERVE {
         return;
     }
-    let start = first.AllocationBase as usize;
-    let mut end = first.BaseAddress as usize + first.RegionSize;
+    let start = first.BaseAddress as usize;
+    let mut end = start + first.RegionSize;
     if end >= target_end {
         return;
     }
@@ -751,7 +748,10 @@ fn coalesce_placeholders(base: usize, len: usize) {
         let Some(next) = query(end) else {
             return;
         };
-        if next.State != MEM_RESERVE || next.RegionSize == 0 {
+        if next.AllocationBase != first.AllocationBase
+            || next.State != MEM_RESERVE
+            || next.RegionSize == 0
+        {
             return;
         }
         let next_end = next.BaseAddress as usize + next.RegionSize;
@@ -760,16 +760,23 @@ fn coalesce_placeholders(base: usize, len: usize) {
         }
         end = next_end;
     }
-    // SAFETY: `[start, end)` is the exact span of adjacent placeholders to merge.
-    unsafe {
+    // SAFETY: `[start, end)` spans adjacent reserve placeholders in one allocation.
+    let ok = unsafe {
         VirtualFree(
             start as *mut c_void,
             end - start,
             MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+        )
+    };
+    if ok == 0 {
+        tracing::warn!(
+            start = format_args!("{start:#x}"),
+            len = end - start,
+            error = %std::io::Error::last_os_error(),
+            "coalescing placeholders failed"
         );
     }
 }
-
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
@@ -1195,7 +1202,6 @@ mod tests {
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
 
-
     #[test]
     fn remapping_split_placeholders_and_coalesced_aliases() {
         let (a_pages, b_pages) = (allocate(3), allocate(1));
@@ -1254,6 +1260,29 @@ mod tests {
                 assert_eq!(at(dst, i).cast::<u8>().read(), (i + 10) as u8);
             }
         }
+
+        // Unmap pages 1..4 individually while page 0 stays mapped, then remap
+        // from page 1 so coalescing starts at `BaseAddress` rather than `AllocationBase`.
+        assert_eq!(
+            XMemMapPhysicalPages(at(src, 1), 1, std::ptr::null()),
+            at(src, 1)
+        );
+        assert_eq!(
+            XMemMapPhysicalPages(at(src, 2), 1, std::ptr::null()),
+            at(src, 2)
+        );
+        assert_eq!(
+            XMemMapPhysicalPages(at(src, 3), 1, std::ptr::null()),
+            at(src, 3)
+        );
+        assert_eq!(
+            XMemMapPhysicalPages(at(src, 1), 3, a_pages.as_ptr()),
+            at(src, 1)
+        );
+        assert_eq!(
+            physical().views.get(&(at(src, 1) as usize)).map(|v| v.0),
+            Some(3 * PAGE)
+        );
 
         assert!(map_alias(dst as u64, 0, 4 * PAGE as u64));
         assert_eq!(XMemMapPhysicalPages(src, 4, std::ptr::null()), src);
