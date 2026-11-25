@@ -55,10 +55,10 @@ fn package_bytes() -> u64 {
         };
         entries
             .flatten()
-            .map(|e| match e.metadata() {
+            .map(|e| match std::fs::symlink_metadata(e.path()) {
                 Ok(m) if m.is_dir() => size(&e.path()),
-                Ok(m) => m.len(),
-                Err(_) => 0,
+                Ok(m) if m.is_file() => m.len(),
+                _ => 0,
             })
             .sum()
     }
