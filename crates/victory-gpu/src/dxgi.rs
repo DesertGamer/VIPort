@@ -533,4 +533,17 @@ mod tests {
         assert_eq!(super::parse_mode("1080p"), None);
         assert_eq!(super::parse_mode("1920"), None);
     }
+
+    #[test]
+    fn output_mode_override_parses_or_falls_back() {
+        assert_eq!(super::parse_mode("1920x1080"), Some((1920, 1080)));
+        assert_eq!(super::parse_mode(" 1280 X 720 "), Some((1280, 720)));
+        assert_eq!(super::parse_mode("3840x2160"), Some((3840, 2160)));
+        // Zero, past D3D12's limit, or not a size: the 4K default stays.
+        assert_eq!(super::parse_mode("0x1080"), None);
+        assert_eq!(super::parse_mode("3840x0"), None);
+        assert_eq!(super::parse_mode("16385x1080"), None);
+        assert_eq!(super::parse_mode("1080p"), None);
+        assert_eq!(super::parse_mode("1920"), None);
+    }
 }
