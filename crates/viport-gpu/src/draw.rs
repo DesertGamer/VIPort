@@ -2067,6 +2067,14 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     unsafe { list.list.OMSetStencilRef(reference) };
 }
 
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if crate::host::host().is_some_and(|h| h.depth_bounds())
+        && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
+    {
+        unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
