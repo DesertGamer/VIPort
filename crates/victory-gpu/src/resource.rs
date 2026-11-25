@@ -1085,11 +1085,22 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
 /// (no view takes them).
 pub(crate) fn castable(format: u32) -> Vec<u32> {
     const DEPTH_FAMILIES: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
+    // 68/69 (`R8G8_B8G8_UNORM`, `G8R8_G8B8_UNORM`) are 4:2:2 2x1 packed
+    // formats and 89 (`R10G10B10_XR_BIAS_A2_UNORM`) is a swapchain-only
+    // format; D3D12/vkd3d-proton reject them in `CreateCommittedResource3`
+    // castable lists (`E_INVALIDARG`), which disables format casting for
+    // the entire 2-byte and 4-byte classes.
+    const UNCASTABLE: [u32; 3] = [68, 69, 89];
     let Some(e) = element(format) else {
         return Vec::new();
     };
     (1..=115)
-        .filter(|&f| f != format && element(f) == Some(e) && !DEPTH_FAMILIES.contains(&f))
+        .filter(|&f| {
+            f != format
+                && element(f) == Some(e)
+                && !DEPTH_FAMILIES.contains(&f)
+                && !UNCASTABLE.contains(&f)
+        })
         .filter(|&f| !(family(f) == f && family(f + 1) == f))
         .collect()
 }
@@ -2071,9 +2082,11 @@ mod tests {
         for f in [67, 28, 29, 41, 24, 26, 87, 35] {
             assert!(c.contains(&f), "{f}");
         }
-        for f in [42, 39, 40, 45, 27, 10, 56] {
+        for f in [42, 39, 40, 45, 27, 10, 56, 89] {
             assert!(!c.contains(&f), "{f}");
         }
+        let u16_like = castable(48);
+        assert!(!u16_like.contains(&68) && !u16_like.contains(&69));
         let bc1 = castable(71);
         assert!(bc1.contains(&72) && bc1.contains(&80) && bc1.contains(&81));
         assert!(!bc1.contains(&70) && !bc1.contains(&98) && !bc1.contains(&17));
@@ -2667,5 +2680,35 @@ mod tests {
         assert_eq!(release(queue), 0);
         assert_eq!(release(heap), 0);
         assert_eq!(release(results), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn castable_host_textures_are_accepted_by_the_host() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut opts12 = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        // SAFETY: querying standard D3D12_FEATURE_D3D12_OPTIONS12 support.
+        let ok = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS12,
+                std::ptr::from_mut(&mut opts12).cast(),
+                std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+            )
+        }
+        .is_ok();
+        if !ok || !opts12.RelaxedFormatCastingSupported.as_bool() {
+            return;
+        }
+        for fmt in [28u32, 48, 71, 10, 61] {
+            let d = texture(64, 64, fmt, 1);
+            let tex = make_texture(&d, 0, std::ptr::null()).expect("host texture");
+            assert!(
+                !tex.castable.is_empty(),
+                "host refused castable formats for format {fmt}"
+            );
+        }
     }
 }
