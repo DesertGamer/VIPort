@@ -230,7 +230,7 @@ What each part does today and what it still needs:
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: mesh 8,765 of 8,765, vertex/pixel 12,550 of 12,592, compute 2,579 of 2,637 | Merged geometry stages (195 programs) and about 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
+| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: mesh 8,765 of 8,765, vertex/pixel 12,550 of 12,592, compute 2,579 of 2,637 | Merged geometry stages (195 programs) and about 100 others; fused multiply-adds follow the host GPU; compute programs that use wave operations and need 64-lane waves need a GPU with them, and so do mesh programs written for 64-lane waves (32-lane GPUs skip those draws) |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
@@ -427,6 +427,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VIPORT_TRACE_SHADERS=<hash>,...` | with `VIPORT_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500) |
 | `VIPORT_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VIPORT_BORDERLESS=1` | removes the game window's title bar and frame (the window keeps them by default) |
+| `VIPORT_SUBMIT_MAX_RUNS=<n>` | at most `n` command lists per host submission, so a hang or a slow frame is cut into shorter GPU jobs (`1` runs every list on its own) |
+| `VIPORT_LEARN_UAV_EXTENT=1` | experimental: after 64 submissions a root buffer view of a pipeline is snapshotted and compared only up to twice the highest byte its shaders wrote (every 32nd submission checks the whole range and logs a warning if a shader wrote past the learned extent) |
 | `VIPORT_AUTO_ENTER=0` | stops the automatic Enter presses (every 3 s from the 5th to the 45th second) that pass the terms screen |
 | `VIPORT_MODE=<width>x<height>` | report that display mode instead of the console's 3840x2160 (smaller render targets on smaller hosts) |
 | `VIPORT_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
