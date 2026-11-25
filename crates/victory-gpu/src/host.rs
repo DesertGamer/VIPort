@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{E_FAIL, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -58,7 +59,7 @@ pub(crate) struct Host {
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
-    presenter: Mutex<Option<Presenter>>,
+    presenter: Mutex<Presentation>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -355,7 +356,7 @@ fn create() -> windows::core::Result<Host> {
             next_cpu_view: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
-            presenter: Mutex::new(None),
+            presenter: Mutex::new(Presentation::default()),
         })
     }
 }
@@ -445,6 +446,26 @@ mod tests {
         assert_eq!((stalled, waits), (Waited::Stalled, STALL_SECS * slices_per_sec));
     }
 
+    #[test]
+    fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
+        use super::{Duration, Instant, SwapChainRetry};
+
+        let start = Instant::now();
+        let mut retry = SwapChainRetry::default();
+        let mut attempts = 0;
+        // Two seconds at 60 Hz, with a failure on every eligible attempt.
+        for frame in 0..120 {
+            retry.attempt(start + Duration::from_millis(frame * 1000 / 60), || {
+                attempts += 1;
+                Err::<(), _>("desktop unavailable")
+            });
+        }
+        assert_eq!(attempts, 2);
+        let recovered = start + Duration::from_secs(2);
+        assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(42)), Some(Ok(42)));
+        assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(43)), Some(Ok(43)));
+    }
+
     use super::*;
 
     #[test]
@@ -452,6 +473,31 @@ mod tests {
         assert_eq!(super::legal_for(0, 0x4), 0);
         assert_eq!(super::legal_for(0x2, 0x4), 0);
         assert_eq!(super::legal_for(0x1, 0x4), 0x4);
+    }
+
+    #[test]
+    fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let first = list.scratch(1).unwrap();
+        let second = list.scratch(1).unwrap();
+        assert_eq!(second.0 - first.0, 256);
+        assert_eq!(second.1 as usize - first.1 as usize, 256);
+        assert_eq!(list.scratch.lock().unwrap().chunks[0].capacity, FIRST_SCRATCH_CHUNK);
+        let large = list.scratch(96 << 10).unwrap();
+        assert_eq!(list.scratch.lock().unwrap().chunks[1].capacity, 128 << 10);
+        assert!(list.scratch(u64::MAX).is_none());
+        assert!(list.scratch(SCRATCH_CHUNK + 1).is_some());
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert_eq!(list.scratch(96 << 10).unwrap(), large);
+        assert_eq!(list.scratch.lock().unwrap().chunks.len(), 2);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert_eq!(list.scratch(512).unwrap(), first);
+        list.close();
     }
 
     #[test]
@@ -742,7 +788,7 @@ fn node_is_list(
 /// the bytes used in it.
 #[derive(Default)]
 struct Scratch {
-    chunks: Vec<(ID3D12Resource, usize, u64)>,
+    chunks: Vec<ScratchChunk>,
     current: usize,
     used: u64,
 }
@@ -751,6 +797,14 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
+
+struct ScratchChunk {
+    _buffer: ID3D12Resource,
+    mapped: usize,
+    gpu: u64,
+    capacity: u64,
+}
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -2131,7 +2185,7 @@ impl HostList {
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let len = len.max(1).next_multiple_of(256);
+        let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
@@ -2140,21 +2194,30 @@ impl HostList {
             self.deferred().uploads.push(buffer);
             return Some((gpu, data));
         }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        while let Some(chunk) = s.chunks.get(s.current) {
+            if len <= chunk.capacity - s.used {
+                break;
+            }
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
-            name(&buffer, || "list scratch".into());
+            let next = s.chunks.last().map_or(FIRST_SCRATCH_CHUNK, |c| 2 * c.capacity);
+            let capacity = len.next_multiple_of(FIRST_SCRATCH_CHUNK).max(next).min(SCRATCH_CHUNK);
+            let (buffer, data) = host.upload_buffer(capacity)?;
+            name(&buffer, || format!("list scratch {capacity:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, data as usize, gpu));
+            #[cfg(feature = "diagnostics")]
+            tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
+                chunk = s.current, requested = len, capacity, "allocated list scratch");
+            s.chunks.push(ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity });
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
+        let chunk = &s.chunks[s.current];
         let at = s.used;
+        let result = (chunk.gpu + at, (chunk.mapped + at as usize) as *mut u8);
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        Some(result)
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -2787,6 +2850,34 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+#[derive(Default)]
+struct Presentation {
+    presenter: Option<Presenter>,
+    retry: SwapChainRetry,
+}
+
+#[derive(Default)]
+struct SwapChainRetry {
+    next_attempt: Option<Instant>,
+}
+
+impl SwapChainRetry {
+    /// A desktop can become presentable again. Keep retrying while limiting
+    /// the DXGI calls and warnings during the outage.
+    fn attempt<T, E>(
+        &mut self,
+        now: Instant,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Option<Result<T, E>> {
+        if self.next_attempt.is_some_and(|next| now < next) {
+            return None;
+        }
+        let result = operation();
+        self.next_attempt = result.is_err().then(|| now + Duration::from_secs(1));
+        Some(result)
+    }
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -2961,27 +3052,37 @@ impl Host {
             return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
-        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let Presentation { presenter, retry } = &mut *presentation;
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            *presenter = match retry
+                .attempt(Instant::now(), || self.presenter(width, height, format))?
+            {
                 Ok(p) => Some(p),
-                Err(e) => {
-                    tracing::warn!(error = %e, "no swap chain");
+                Err((step, e)) => {
+                    tracing::warn!(error = %e, step, width, height, format = format.0, "no swap chain");
                     return None;
                 }
             };
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
-            // SAFETY: no back buffer is held; every submission was waited for.
-            let resized = unsafe {
-                p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
-            };
+            let resized = retry.attempt(Instant::now(), || {
+                // SAFETY: no back buffer is held; every submission was waited for.
+                unsafe {
+                    p.swap_chain.ResizeBuffers(
+                        BUFFERS,
+                        width,
+                        height,
+                        format,
+                        DXGI_SWAP_CHAIN_FLAG(0),
+                    )
+                }
+            })?;
             match resized {
                 Ok(()) => (p.width, p.height, p.format) = (width, height, format),
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    tracing::warn!(error = %e, width, height, format = format.0, "swap chain not resized");
                     return None;
                 }
             }
@@ -3040,14 +3141,15 @@ impl Host {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
-    ) -> windows::core::Result<Presenter> {
+    ) -> Result<Presenter, (&'static str, windows::core::Error)> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
-            None => window(width, height)?,
+            None => window(width, height).map_err(|e| ("window", e))?,
         };
         // SAFETY: plain object creation for our window.
         unsafe {
-            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+                .map_err(|e| ("DXGI factory", e))?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -3062,9 +3164,10 @@ impl Host {
                 ..Default::default()
             };
             let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
-            let copy = self.new_list()?;
+                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
+                .and_then(|chain| chain.cast::<IDXGISwapChain3>())
+                .map_err(|e| ("swap chain", e))?;
+            let copy = self.new_list().map_err(|e| ("copy list", e))?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             Ok(Presenter {

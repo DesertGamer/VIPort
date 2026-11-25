@@ -133,6 +133,12 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 For a dated summary of Windows 10 runtime and GPU feature caveats, see
 [Windows and GPU support](docs/windows-and-gpu-support.md).
 
+To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
+the installer from https://rustup.rs). The first `cargo` command in this
+repository then fetches the pinned toolchain. Building needs the MSVC C++
+build tools: Visual Studio or its Build Tools with the "Desktop development
+with C++" workload.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
@@ -231,6 +237,24 @@ to listed 16-hex content hashes; `--isa` also prints the decoded GFX10
 instructions. Use it to check the divergent-barrier hypothesis for a hang
 before touching the translator.
 
+### Windows shader-test validator
+
+The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
+An older Windows SDK validator can load successfully but reject them with
+`Unknown shader model 'ps_6_6'`. If this happens, use a current x64 validator
+from [Microsoft's DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
+or a current Windows SDK. Set its path for the test session:
+
+```powershell
+$env:VICTORY_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
+cargo test -p victory-shader --lib --locked -- --test-threads=1
+```
+
+Without this override, the validator loader selects the newest installed
+Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
+path when no SDK copy is found. This is a test/offline-validation dependency;
+the translated shaders do not require it at runtime.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
@@ -250,6 +274,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_NO_HOST_PAD=1` | ignores XInput pads, so the keyboard drives the stand-in pad |
+| `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_TITLE_ASSERTS=<n>` | continues past up to `n` `int3` asserts in title code, where the first one ends the process; the check is taken as passed, so what follows it is undefined |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
@@ -273,8 +298,25 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_UPSCALER=<rva>[,<kind>]` | the title's upscaler picker returns `kind` (default 7, FidelityFX; 1.0.2.1: `7E93F0`): FidelityFX in Series X mode |
 | `VICTORY_FFX_SCALE=<scale>[,<rva>]` | render scale of the title's FidelityFX path (`0.6667`: 1440p for 4K, `0.5`: 1080p; 1.0.2.1 default rva `28EF680`); with the above, Series X otherwise renders native 4K and overflows its memory plan |
 
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+Every build appends unhandled exceptions, panics, and host GPU failures to
+`crashes.log` in the title's data folder.
+
+For a startup breakpoint (`0x80000003`), run the diagnostics build with
+`VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
+`crashes.log` entries. A host DLL refusal includes the caller stack in the
+console output. The refusal is expected for DLLs outside the host policy,
+including `rpcrt4.dll`.
+
+On Series 1.0.2.1, a missing `appdata0.rpf` reproduced the breakpoint at
+`+0x2237178` before the first window. Restore the archive from the same
+package beside the title executable. `run --execute` checks that it can
+read the RPF9 header before starting this build.
+
+To compare hardware and software rendering, repeat with
+`VICTORY_D3D12_WARP=1` and check the console for
+`host device on the software adapter (WARP)` to confirm the WARP device was
+created. Compare the exception's module and offset, stack frames, and
+preceding messages across the two runs.
 
 [docs/debugging-notes-from-a-gta-v-port.md](docs/debugging-notes-from-a-gta-v-port.md)
 collects what got another RAGE port from "the world loads" to "the game

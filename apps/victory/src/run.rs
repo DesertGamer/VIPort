@@ -12,7 +12,7 @@ pub fn run(
     execute: bool,
     console: Console,
     title_args: &[String],
-) -> Result<()> {
+) -> Result<u32> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
@@ -30,8 +30,14 @@ pub fn run(
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
+    let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
-        Some(build) => println!("build          {} ({hash})", build.label),
+        Some(build) => {
+            println!("build          {} ({hash})", build.label);
+            if execute {
+                check_startup_archive(&title_dir.join(build.startup_archive))?;
+            }
+        }
         None => println!("build          unknown ({hash})"),
     }
 
@@ -56,7 +62,6 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
     // The exe may sit apart from the dump; the manifest and the package's
     // virtual drive belong to the configured game directory then.
     let content_dir = cfg
@@ -155,7 +160,7 @@ pub fn run(
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
     if !execute {
         println!("not executing (pass --execute to start the title)");
-        return Ok(());
+        return Ok(0);
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
@@ -179,6 +184,27 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
+    Ok(code)
+}
+
+#[cfg(windows)]
+fn check_startup_archive(path: &Path) -> Result<()> {
+    use std::io::Read;
+
+    let mut magic = [0; 4];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .with_context(|| {
+            format!(
+                "Cannot read startup archive {}. Check that the file from your package is present and readable.",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        magic == *b"9FPR",
+        "Invalid RPF9 header in {}. Restore the startup archive from your package.",
+        path.display()
+    );
     Ok(())
 }
 
@@ -485,6 +511,6 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console, _: &[String]) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console, _: &[String]) -> Result<u32> {
     anyhow::bail!("running titles requires Windows")
 }

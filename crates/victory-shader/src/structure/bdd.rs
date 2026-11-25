@@ -17,9 +17,9 @@ enum IteTask {
 }
 
 #[derive(Clone, Copy)]
-enum Rewrite {
+enum Rewrite<'a> {
     ForgetFrom(usize),
-    Restrict(u32, bool),
+    Restrict(&'a [(u32, bool)]),
 }
 
 enum RewriteTask {
@@ -90,18 +90,19 @@ impl Bools {
         self.rewrite(b, Rewrite::ForgetFrom(from), memo)
     }
 
-    /// Substitute one atom with a known value.
+    /// Substitute every atom in `values` (sorted by atom) with its value.
+    /// Nothing below a node testing a later atom than the last of them
+    /// changes.
     pub(super) fn restrict(
         &mut self,
         b: Bool,
-        v: u32,
-        value: bool,
+        values: &[(u32, bool)],
         memo: &mut Map<Bool, Bool>,
     ) -> Bool {
-        self.rewrite(b, Rewrite::Restrict(v, value), memo)
+        self.rewrite(b, Rewrite::Restrict(values), memo)
     }
 
-    fn rewrite(&mut self, root: Bool, op: Rewrite, memo: &mut Map<Bool, Bool>) -> Bool {
+    fn rewrite(&mut self, root: Bool, op: Rewrite<'_>, memo: &mut Map<Bool, Bool>) -> Bool {
         let mut tasks = vec![RewriteTask::Evaluate(root)];
         let mut results = Vec::new();
         while let Some(task) = tasks.pop() {
@@ -112,13 +113,13 @@ impl Bools {
                         results.push(b);
                         continue;
                     }
-                    if let Rewrite::Restrict(target, value) = op {
-                        if v > target {
+                    if let Rewrite::Restrict(values) = op {
+                        if values.last().is_none_or(|&(last, _)| v > last) {
                             results.push(b);
                             continue;
                         }
-                        if v == target {
-                            results.push(if value { hi } else { lo });
+                        if let Ok(i) = values.binary_search_by_key(&v, |&(v, _)| v) {
+                            tasks.push(RewriteTask::Evaluate(if values[i].1 { hi } else { lo }));
                             continue;
                         }
                     }
@@ -252,7 +253,7 @@ mod tests {
             }
             for v in 0..3 {
                 for value in [false, true] {
-                    let r = b.restrict(f, v, value, &mut Map::default());
+                    let r = b.restrict(f, &[(v, value)], &mut Map::default());
                     for x in 0..8 {
                         let assigned = (x & !(1 << v)) | (usize::from(value) << v);
                         assert_eq!(eval(&b, r, x), eval(&b, f, assigned));
@@ -286,7 +287,7 @@ mod tests {
         assert_ne!(not_all, all);
         assert_eq!(b.not(not_all), all);
         assert_eq!(
-            b.restrict(all, DEPTH - 1, false, &mut Map::default()),
+            b.restrict(all, &[(DEPTH - 1, false)], &mut Map::default()),
             Bool::FALSE
         );
         assert_eq!(b.forget(all, 0, &mut Map::default()), Bool::TRUE);

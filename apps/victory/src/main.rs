@@ -202,7 +202,14 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args,
-        } => run::run(&exe, unimplemented, strict, execute, console, &title_args),
+        } => {
+            let code = run::run(&exe, unimplemented, strict, execute, console, &title_args)?;
+            if code != 0 {
+                // Preserve all 32 bits of the Windows process status.
+                std::process::exit(code as i32);
+            }
+            Ok(())
+        }
         Command::Config => show_config(),
     }
 }
