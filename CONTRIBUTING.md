@@ -116,9 +116,7 @@ changes in other crates, run their relevant tests and state which checks you
 ran in the PR. Run the policy check with the files staged if you have not
 committed them yet: `cargo xtask policy --staged`.
 
-On the current main branch, `cargo fmt --all --check` also reports existing
-formatting differences. Format only the Rust files you touch so unrelated
-changes stay out of the PR.
+Format only the Rust files you touch so unrelated changes stay out of the PR.
 
 ## Write a useful report
 
@@ -129,6 +127,8 @@ with placeholders. When comparing two builds, use the same settings and give
 both commit IDs.
 
 Read the [asset policy](docs/asset-policy.md) before sharing anything. Use
-source or synthetic fixtures. Summarize runtime observations in text and
+source or synthetic fixtures. In code, comments, tests, and docs, avoid naming
+the console SDK or copying identifiers from its headers. Summarize runtime
+observations in text and
 keep game files, captures, dumps, and logs that contain proprietary material
 out of issues and PRs.
