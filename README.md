@@ -43,7 +43,7 @@ An independent, community-built project on the VIctory codebase: hundreds of pul
 
 **VIPort** — независимый проект на кодовой базе VIPort (неофициальный, GPL-3.0): запуск GTA VI (Xbox Series X|S) на Windows из ваших файлов. Игра пока не играбельна: меню и вступительное видео работают, дальше игра загружает мир и рисует его по 1–2 секунды на кадр, с дефектами. В репозитории нет игровых данных, их вы приносите сами.
 
-Нужна помощь: отчёты по железу ([#4](https://github.com/DesertGamer/VIPort/issues/4)), небольшие задачи ([#16](https://github.com/DesertGamer/VIPort/issues/16), [#17](https://github.com/DesertGamer/VIPort/issues/17), [#18](https://github.com/DesertGamer/VIPort/issues/18)) и подсчёт сбоев DirectStorage на вашей видеокарте ([#15](https://github.com/DesertGamer/VIPort/issues/15)). Связь: Telegram [@desertdev](https://t.me/desertdev).
+Нужна помощь: отчёты по железу ([#4](https://github.com/DesertGamer/VIPort/issues/4)), небольшие задачи (список и распределение в [#29](https://github.com/DesertGamer/VIPort/issues/29)) и подсчёт сбоев DirectStorage на вашей видеокарте ([#15](https://github.com/DesertGamer/VIPort/issues/15)). Связь: Telegram [@desertdev](https://t.me/desertdev).
 
 </details>
 
@@ -122,8 +122,7 @@ VIPort moves as fast as people help it. Small tasks are the quickest way in:
 |----------|---------|-------|
 | a Windows PC with a GPU and your own game files | run it and report how far it got | [#4](https://github.com/DesertGamer/VIPort/issues/4) |
 | the same, and two minutes | count the DirectStorage failures on your GPU (zero is a useful answer) | [#15](https://github.com/DesertGamer/VIPort/issues/15) |
-| a Windows PC and Rust | fix a stale test | [#16](https://github.com/DesertGamer/VIPort/issues/16), [#17](https://github.com/DesertGamer/VIPort/issues/17) |
-| a GPU of any vendor | run one test and say which rows differ | [#18](https://github.com/DesertGamer/VIPort/issues/18) |
+| a Windows PC and Rust, or a GPU of any vendor | pick a task (performance, shader translation, hardware reports, tests, docs), claim it and send a pull request | [#29](https://github.com/DesertGamer/VIPort/issues/29) |
 
 Every issue has the exact failure and what "done" looks like (label
 `help wanted`). Authorship stays: every merged pull request keeps its author in
@@ -429,6 +428,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VIPORT_BORDERLESS=1` | removes the game window's title bar and frame (the window keeps them by default) |
 | `VIPORT_LAZY_VIEWS=1` | experimental: placed buffer views of heap slots no draw or shader has read are made at their first read instead of at each submission (that first read sees a null view) |
 | `VIPORT_SUBMIT_MAX_RUNS=<n>` | at most `n` command lists per host submission, so a hang or a slow frame is cut into shorter GPU jobs (`1` runs every list on its own) |
+| `VIPORT_PROFILE=<ms>` | a sampling profiler of the whole process (title threads, our workers, the driver): every 5 s it logs, per thread, the CPU time and the most frequent call stacks; `<ms>` is the sampling period of busy threads (4 by default) |
+| `VIPORT_PIPELINE_WORKERS=<n>` | host pipeline compile workers, 1 to 64 (default half the logical processors, 2 to 8; any build); more workers empty a first run's pipeline queue faster |
 | `VIPORT_LEARN_UAV_EXTENT=1` | experimental: after 64 submissions a root buffer view of a pipeline is snapshotted and compared only up to twice the highest byte its shaders wrote (every 32nd submission checks the whole range and logs a warning if a shader wrote past the learned extent) |
 | `VIPORT_AUTO_ENTER=0` | stops the automatic Enter presses (every 3 s from the 5th to the 45th second) that pass the terms screen |
 | `VIPORT_MODE=<width>x<height>` | report that display mode instead of the console's 3840x2160 (smaller render targets on smaller hosts) |
