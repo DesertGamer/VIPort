@@ -795,12 +795,13 @@ mod tests {
             let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             code.extend(0xBF81_0000u32.to_le_bytes());
             let inst = &decode(&code).unwrap()[0];
+            let mut arena = Vec::new();
             let Fields::Smem {
                 data: got,
                 base: got_base,
                 cache,
                 ..
-            } = inst.fields(false)
+            } = inst.fields(false, &mut arena)
             else {
                 panic!("not an SMEM instruction");
             };
