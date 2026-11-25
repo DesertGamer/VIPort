@@ -364,6 +364,7 @@ fn create() -> windows::core::Result<Host> {
 }
 
 fn video_memory(device: &ID3D12Device) -> Option<(u64, u64)> {
+    // SAFETY: plain DXGI queries on a live device's adapter.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
         let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).ok()?;
@@ -925,6 +926,8 @@ type Target = (usize, u64, usize);
 /// A read-back buffer and the pieces of its resolved queries that go back
 /// into the title's memory.
 type Resolved = (ID3D12Resource, Vec<Target>);
+/// Work recorded at the end of a list, just before it is closed.
+type Closing = Box<dyn Fn(&ID3D12GraphicsCommandList) + Send>;
 
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
@@ -989,7 +992,7 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
-    closing: Vec<Box<dyn Fn(&ID3D12GraphicsCommandList) + Send>>,
+    closing: Vec<Closing>,
 }
 
 impl Deferred {
@@ -1058,6 +1061,7 @@ impl Host {
         static BOUNDS: OnceLock<bool> = OnceLock::new();
         *BOUNDS.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+            // SAFETY: a valid out pointer of the right size.
             let ok = unsafe {
                 self.device
                     .CheckFeatureSupport(
@@ -4091,6 +4095,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         batch.flush();
         copy.write_host((p + 16) as u64, &[0xaa]);
         assert_eq!(copy.copy_back_page(p), PAGE, "the page was taken whole, so the write goes back");
+        // SAFETY: a committed page of the test's pool.
         assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0xaa);
         batch.add(&copy, p + PAGE, PAGE);
         assert_eq!(batch.flush(), PAGE);

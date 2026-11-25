@@ -251,6 +251,7 @@ pub(crate) fn format_support(format: u32) -> windows::Win32::Graphics::Direct3D1
         ..Default::default()
     };
     let ok = crate::host::host().is_some_and(|h| {
+        // SAFETY: a valid out pointer of the right size.
         unsafe {
             h.device.CheckFeatureSupport(
                 D3D12_FEATURE_FORMAT_SUPPORT,
@@ -880,6 +881,7 @@ impl HostTexture {
 
     pub(crate) fn packed(&self) -> Option<u32> {
         let format = self.key?.packed?;
+        // SAFETY: a live texture.
         (unsafe { self.texture.GetDesc() }.Format.0 == 28).then_some(format)
     }
 
@@ -1204,6 +1206,7 @@ fn shared_texture(
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(host) = crate::host::host() {
+            // SAFETY: a live device and texture.
             let info = unsafe { host.device.GetResourceAllocationInfo(0, &[t.texture.GetDesc()]) };
             SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
         }
@@ -2092,6 +2095,7 @@ pub(crate) mod tests {
                 let clear = [format, 0, 0, 0, 0];
                 let clear = if flags & TARGET != 0 { clear.as_ptr().cast() } else { std::ptr::null() };
                 let host = make_texture(&d, 0, clear).expect("a writable host texture");
+                // SAFETY: a texture the test just made.
                 let made = unsafe { host.texture.GetDesc() };
                 assert_eq!(made.Format.0 as u32, d.format);
             }

@@ -1029,6 +1029,7 @@ mod tests {
 
     #[cfg(windows)]
     fn write_records(memory: usize, records: &[u8]) {
+        // SAFETY: `memory` has room for the records (the heap the test made).
         unsafe { std::ptr::copy_nonoverlapping(records.as_ptr(), memory as *mut u8, records.len()) };
     }
 
@@ -1049,6 +1050,7 @@ mod tests {
     fn write_view(memory: usize, index: usize, record: impl FnOnce(u64)) {
         let mut scratch = [0u8; 32];
         record(scratch.as_mut_ptr() as u64);
+        // SAFETY: slot `index` of the heap the test made.
         unsafe { std::ptr::copy_nonoverlapping(scratch.as_ptr(), (memory + index * 32) as *mut u8, 32) };
     }
 
@@ -1105,6 +1107,7 @@ mod tests {
             assert!(host.parked(3) && host.made(4));
             assert_eq!(slot::<extern "system" fn(This) -> u32>(buffer, 0x10)(buffer), 0);
             let record = (memory + 4 * 32) as *mut [u8; 12];
+            // SAFETY: slot 4 of the heap the test made, rewritten as it was.
             unsafe { record.write(record.read()) };
             sync_heaps();
             assert!(!host.made(4), "the released resource's slot is null");
