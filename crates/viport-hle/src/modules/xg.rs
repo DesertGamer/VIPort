@@ -862,6 +862,7 @@ mod tests {
         let mut d = desc(256, 256, 7, 98, 0x10a);
         d.depth_or_array = 3;
         let c = create(&d);
+        // SAFETY: `LayoutOut` is plain data, valid all zero.
         let mut l: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
         let get: extern "system" fn(This, *mut LayoutOut) -> HRESULT = slot(c, 2);
         assert_eq!(get(c, &mut *l), S_OK);

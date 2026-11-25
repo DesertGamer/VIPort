@@ -2078,6 +2078,7 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     if crate::host::host().is_some_and(|h| h.depth_bounds())
         && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
     {
+        // SAFETY: a list being recorded; the host supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
     }
 }

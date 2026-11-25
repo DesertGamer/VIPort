@@ -844,6 +844,7 @@ impl HostHeap {
         (first..last.min(self.count))
             .filter(|&index| {
                 let handle = start + u64::from(index) * step;
+                // SAFETY: a handle below `count` in our heap: its record starts with three dwords.
                 let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
                 let key = u64::from(generation) << 32 | u64::from(i);
                 let slot = made[index as usize];

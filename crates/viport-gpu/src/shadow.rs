@@ -88,7 +88,7 @@ pub(crate) fn write_extent(key: u64, full: u64) -> u64 {
     let mut extents = EXTENTS.lock().unwrap_or_else(|e| e.into_inner());
     let extent = extents.entry(key).or_insert(Extent { max: 0, seen: 0, tick: 0 });
     extent.tick = extent.tick.wrapping_add(1);
-    if extent.seen < LEARN || extent.tick % VERIFY == 0 {
+    if extent.seen < LEARN || extent.tick.is_multiple_of(VERIFY) {
         return full;
     }
     learned(extent, full)
@@ -1060,7 +1060,9 @@ mod tests {
     fn a_page_remapped_while_a_submission_runs_keeps_the_new_bytes() {
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
+        // SAFETY: committed pages of the test's pool, `len` bytes from `p`.
         let write = |at: usize, v: u8| unsafe { ((p + at) as *mut u8).write_volatile(v) };
+        // SAFETY: as above.
         let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
         write(0, 0x11);
         write(PAGE, 0x33);
@@ -1094,7 +1096,9 @@ mod tests {
             unregister(p, p as u64);
             return;
         };
+        // SAFETY: a committed page of the test's pool.
         let write = |at: usize, v: u8| unsafe { ((p + at) as *mut u8).write_volatile(v) };
+        // SAFETY: as above.
         let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
         copy.update(p, PAGE);
         copy.writing(p, PAGE);

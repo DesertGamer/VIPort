@@ -39,6 +39,7 @@ pub(crate) fn created_by_builder(code: &[*const u8]) -> bool {
 fn callers() -> Vec<usize> {
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
     let mut frames = [std::ptr::null_mut(); 24];
+    // SAFETY: a valid buffer of `frames.len()` entries.
     let n = unsafe {
         RtlCaptureStackBackTrace(
             1,
