@@ -45,7 +45,7 @@ mod page_batch;
 pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed.
-struct Changed(Mutex<BTreeSet<usize>>);
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<BTreeSet<usize>>);
 
 /// Title memory a host copy or texture staging takes: bytes `[start, end)`.
 pub(crate) struct Tracked {
@@ -183,7 +183,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     install();
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
-    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect())));
+    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default()));
     let mut g = guards();
     for page in pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -300,6 +300,7 @@ impl Tracked {
         }
         drop(changed);
         drop(g);
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| !pages.contains(p));
         let mut runs: Vec<(usize, usize)> = Vec::new();
         for p in pages {
             let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
@@ -330,6 +331,12 @@ impl Tracked {
         for page in protect(&mut g, pages) {
             changed.remove(&page);
         }
+        drop(changed);
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| !pages.contains(p));
+    }
+
+    pub(crate) fn was_remapped(&self, page: usize) -> bool {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).contains(&page)
     }
 }
 
@@ -487,7 +494,12 @@ pub fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
-    changed(&mut g, first, last);
+    changed_here(&mut g, first, last);
+    for (&page, holders) in g.holders.range(first..last) {
+        for c in holders {
+            c.1.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
+        }
+    }
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -842,6 +854,20 @@ pub(crate) mod tests {
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
         assert_eq!(unsafe { ((b + 8) as *const u32).read_volatile() }, 2);
         assert_eq!(unsafe { ((a + 4) as *const u32).read_volatile() }, 1);
+    }
+
+    #[test]
+    fn remapping_one_mapping_leaves_the_other_unchanged() {
+        let (a, b) = twin_views(2);
+        let t = track(a, 2 * PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+        title_memory_remapped(b, PAGE);
+        assert!(!t.changed(a / PAGE) && !t.was_remapped(a / PAGE));
+        title_memory_remapped(a, PAGE);
+        assert!(t.changed(a / PAGE) && t.was_remapped(a / PAGE));
+        assert!(!t.changed(a / PAGE + 1) && !t.was_remapped(a / PAGE + 1));
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+        assert!(!t.was_remapped(a / PAGE));
     }
 
     #[test]

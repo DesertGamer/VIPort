@@ -481,6 +481,10 @@ impl Shadow {
                     at += n;
                     continue;
                 }
+                if self.tracked.as_ref().is_some_and(|t| t.was_remapped((start + at) / PAGE)) {
+                    at += n;
+                    continue;
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 #[cfg(feature = "diagnostics")]
@@ -1049,6 +1053,58 @@ mod tests {
         let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
+        unregister(p, p as u64);
+    }
+
+    #[test]
+    fn a_page_remapped_while_a_submission_runs_keeps_the_new_bytes() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        let write = |at: usize, v: u8| unsafe { ((p + at) as *mut u8).write_volatile(v) };
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        write(0, 0x11);
+        write(PAGE, 0x33);
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return;
+        };
+        copy.update(p, len);
+        copy.writing(p, len);
+        copy.write_host(p as u64, &[0xaa]);
+        copy.write_host((p + PAGE) as u64, &[0xbb]);
+        crate::watch::title_memory_remapped(p, PAGE);
+        write(0, 0x22);
+        assert_eq!(copy.copy_back(p, len), PAGE, "only the page not remapped goes back");
+        assert_eq!([read(0), read(PAGE)], [0x22, 0xbb]);
+        copy.update(p, len);
+        assert_eq!(copy.read_host(p as u64, 1)[0].to_le_bytes()[0], 0x22);
+        copy.writing(p, PAGE);
+        copy.write_host(p as u64, &[0xcc]);
+        assert_eq!(copy.copy_back(p, PAGE), PAGE, "the next submission writes back again");
+        assert_eq!(read(0), 0xcc);
+        unregister(p, p as u64);
+    }
+
+    #[test]
+    fn a_marked_page_after_a_declared_copy_back_keeps_newer_title_writes() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return;
+        };
+        let write = |at: usize, v: u8| unsafe { ((p + at) as *mut u8).write_volatile(v) };
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        write(40, 0x11);
+        assert!(copy.copy_back(p, PAGE) > 0);
+        write(10, 0x22);
+        write(40, 0x23);
+        assert_eq!(copy.copy_back_page(p), 0);
+        assert_eq!([read(10), read(40)], [0x22, 0x23]);
         unregister(p, p as u64);
     }
 

@@ -2602,6 +2602,26 @@ fn coalesce_ranges(ranges: &mut Vec<(usize, usize)>, gap: usize) {
     ranges.truncate(out + 1);
 }
 
+fn coalesce_current(ranges: &mut Vec<(usize, usize)>) {
+    ranges.sort_unstable_by_key(|&(from, _)| from);
+    let page = crate::watch::PAGE;
+    let mut out = 0;
+    for i in 1..ranges.len() {
+        let (from, to) = ranges[i];
+        let end = ranges[out].1;
+        if to <= end {
+            continue;
+        }
+        if from <= end && from.div_ceil(page) <= end / page {
+            ranges[out].1 = to;
+        } else {
+            out += 1;
+            ranges[out] = (from, to);
+        }
+    }
+    ranges.truncate(out + 1);
+}
+
 type Refresh = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 
 #[derive(Default)]
@@ -2741,7 +2761,7 @@ impl Batch {
                 .entry(key)
                 .or_insert_with(|| (shadow, Vec::new()));
             kept.extend(ranges);
-            coalesce_ranges(kept, 0);
+            coalesce_current(kept);
         }
         total
     }
@@ -3910,7 +3930,7 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::{Batch, COALESCE_GAP, Deferred, coalesce_ranges};
+    use super::{Batch, COALESCE_GAP, Deferred, coalesce_current, coalesce_ranges};
     use std::sync::Arc;
 
     #[test]
@@ -3984,6 +4004,50 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(deferred.refreshed.contains(&(2, 0x4000, 0x100)));
         assert!(deferred.first_fill(0x8000, 0x2000, 64));
         assert!(!deferred.first_fill(0x8100, 0x4000, 64));
+    }
+
+    #[test]
+    fn partial_flushes_do_not_hide_a_whole_page_refresh() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return;
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, 0x1000);
+        assert_eq!(batch.flush(), 0x1000);
+        batch.add(&copy, p + 0x1000, PAGE - 0x1000);
+        assert_eq!(batch.flush(), PAGE - 0x1000);
+        batch.add(&copy, p, PAGE);
+        batch.flush();
+        copy.write_host((p + 16) as u64, &[0xaa]);
+        assert_eq!(copy.copy_back_page(p), PAGE, "the page was taken whole, so the write goes back");
+        assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0xaa);
+        batch.add(&copy, p + PAGE, PAGE);
+        assert_eq!(batch.flush(), PAGE);
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), 0, "whole pages meeting at a boundary still merge");
+        crate::shadow::unregister(p, p as u64);
+        drop(batch);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    #[test]
+    fn coalesce_current_joins_only_across_a_page_boundary() {
+        use crate::watch::PAGE;
+        let mut halves = vec![(PAGE + 0x1000, 2 * PAGE), (PAGE, PAGE + 0x1000)];
+        coalesce_current(&mut halves);
+        assert_eq!(halves, vec![(PAGE, PAGE + 0x1000), (PAGE + 0x1000, 2 * PAGE)]);
+        let mut pages = vec![(PAGE, 2 * PAGE), (2 * PAGE, 3 * PAGE), (2 * PAGE + 8, 2 * PAGE + 16)];
+        coalesce_current(&mut pages);
+        assert_eq!(pages, vec![(PAGE, 3 * PAGE)]);
+        let mut apart = vec![(0, 0x10), (5 * PAGE, 5 * PAGE + 0x10)];
+        coalesce_current(&mut apart);
+        assert_eq!(apart, vec![(0, 0x10), (5 * PAGE, 5 * PAGE + 0x10)]);
     }
 
     #[test]
