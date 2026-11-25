@@ -262,7 +262,13 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            let len = subresource_len(
+                footprint.Offset,
+                f.RowPitch as usize,
+                staging.rows[i],
+                f.Depth,
+                staging.size,
+            ) as u64;
             list.note_read(
                 || {
                     format!(
@@ -506,6 +512,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
+    if footprints.iter().any(|f| f.Offset >= total) {
+        once!(?desc, total, "texture upload footprint outside its staging buffer");
+        return None;
+    }
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
@@ -550,6 +560,8 @@ mod tests {
         assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
         assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
         assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+        assert_eq!(subresource_len(784, 256, 4, 1, 784), 0);
+        assert_eq!(subresource_len(785, 256, 4, 1, 784), 0);
     }
 
     #[test]
