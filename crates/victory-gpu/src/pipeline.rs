@@ -134,6 +134,16 @@ impl Shader {
                 let (done, cached) = translate(&self.container);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
+                #[cfg(feature = "diagnostics")]
+                if let Some(dir) = std::env::var_os("VICTORY_SHADER_DUMP") {
+                    let dir = std::path::PathBuf::from(dir);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join(format!("{}.bin", self.hash)), &self.container);
+                    if let Ok(t) = &done {
+                        let _ =
+                            std::fs::write(dir.join(format!("{}.dxil", self.hash)), &t.host.dxil);
+                    }
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,

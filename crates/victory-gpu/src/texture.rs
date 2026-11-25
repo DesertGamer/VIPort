@@ -63,6 +63,8 @@ struct Last {
 /// detiling, so each `Staging` does not retain a full-size `Vec<u8>`.
 static READ_SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
+static DETILE_SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -260,7 +262,13 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            let len = subresource_len(
+                footprint.Offset,
+                f.RowPitch as usize,
+                staging.rows[i],
+                f.Depth,
+                staging.size,
+            ) as u64;
             list.note_read(
                 || {
                     format!(
@@ -345,7 +353,12 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
         }
-        if !committed(self.memory, size) {
+        let mut scratch = READ_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        if scratch.len() < size {
+            scratch.resize(size, 0);
+        }
+        let tiled = &mut scratch[..size];
+        if !crate::host::read_into(self.memory, tiled) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -355,8 +368,6 @@ impl Staging {
             );
             return (0, false);
         }
-        // SAFETY: committed memory of the texture's layout size.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -370,8 +381,12 @@ impl Staging {
         (size, true)
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
+    /// Detiles `tiled` (the texture's memory) into the staging buffer. The
+    /// buffer is a mapped upload heap (write-combined), where the scattered
+    /// writes of detiling are very slow: each subresource is detiled into
+    /// cached memory, then copied over in one sequential pass.
     fn detile(&self, tiled: &[u8]) {
+        let mut cached = DETILE_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -385,12 +400,10 @@ impl Staging {
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
-            // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
-            // keeping the slice strictly inside the mapped staging buffer even when
-            // GetCopyableFootprints does not pad the final row of the last subresource.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
+            if cached.len() < len {
+                cached.resize(len, 0);
+            }
+            let linear = &mut cached[..len];
             if let Err(e) =
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
@@ -398,6 +411,17 @@ impl Staging {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
+            // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
+            // keeping the copy strictly inside the mapped staging buffer even when
+            // GetCopyableFootprints does not pad the final row of the last subresource;
+            // the cached memory is host memory apart from it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    linear.as_ptr(),
+                    self.data.add(footprint.Offset as usize),
+                    len,
+                )
+            };
         }
     }
 }
@@ -488,6 +512,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
+    if footprints.iter().any(|f| f.Offset >= total) {
+        once!(?desc, total, "texture upload footprint outside its staging buffer");
+        return None;
+    }
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
@@ -532,6 +560,8 @@ mod tests {
         assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
         assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
         assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+        assert_eq!(subresource_len(784, 256, 4, 1, 784), 0);
+        assert_eq!(subresource_len(785, 256, 4, 1, 784), 0);
     }
 
     #[test]
