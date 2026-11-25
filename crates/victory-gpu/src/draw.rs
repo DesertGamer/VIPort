@@ -408,6 +408,14 @@ impl State {
                 );
                 continue;
             }
+            if !crate::host::renders_to(texture) {
+                once!(
+                    resource = format_args!("{:#x}", record.resource as usize),
+                    "render target the host cannot render to: a null view in its slot"
+                );
+                rtvs.push(host.null_rtv());
+                continue;
+            }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
