@@ -358,10 +358,11 @@ fn dxil_wave_lanes(dxil: &[u8]) -> Option<(u32, u32)> {
 ///   console `wave64` mesh/compute shader is only allowed when `PSV0`
 ///   explicitly bounds `req_max <= host_max`, such as split `WaveSize(32)`
 ///   emulation).
-/// - Console `wave64` mesh and compute programs whose emitted DXIL declares no
-///   `PSV0` wave-lane range are refused whenever `host_lanes.1 < 64`: some
-///   console `wave64` compute programs still assume 64-lane wave semantics
-///   even without `WaveSize(64)` metadata and hang 32-lane hosts.
+/// - Console `wave64` mesh programs whose emitted DXIL declares no `PSV0`
+///   wave-lane range are refused whenever `host_lanes.1 < 64`. Console
+///   `wave64` compute programs with no range use no cross-lane operation
+///   (the translator declares `WaveSize` for those), so they run per lane and
+///   are refused only on hosts with fewer than 32 lanes.
 /// - Wave32 compute and vertex/pixel programs run per lane and are kept unless
 ///   their emitted DXIL explicitly requires an unsupported wave size.
 fn wave_lanes_unsupported(
@@ -377,7 +378,11 @@ fn wave_lanes_unsupported(
         }
         return wave64_stage && host_max < 64 && req_max > host_max;
     }
-    wave64_stage && host_max < 64
+    match stage {
+        "mesh" => console_wave64 && host_max < 64,
+        "compute" => console_wave64 && host_max < 32,
+        _ => false,
+    }
 }
 
 /// Returns a human-readable refusal reason when [`wave_lanes_unsupported`]
@@ -1161,10 +1166,11 @@ mod tests {
             (4, 4)
         ));
 
-        // Console wave64 compute with no PSV0 wave-lane range (or an upper
-        // bound wider than the host) is refused on <64-lane hosts, and allowed
-        // on 64-lane hosts; console wave32 compute without PSV0 runs everywhere.
-        assert!(wave_lanes_unsupported("compute", true, None, (32, 32)));
+        // Console wave64 compute with no PSV0 wave-lane range runs per lane on
+        // hosts of 32 lanes or more; one with an upper bound wider than the
+        // host is refused on <64-lane hosts; console wave32 compute without
+        // PSV0 runs everywhere.
+        assert!(!wave_lanes_unsupported("compute", true, None, (32, 32)));
         assert!(wave_lanes_unsupported("compute", true, None, (4, 4)));
         assert!(wave_lanes_unsupported(
             "compute",
@@ -1202,10 +1208,11 @@ mod tests {
         assert!(wave64_on_32.contains("[32, 32]"));
         assert!(!wave64_on_32.contains("64-lane waves"));
 
-        let unsized_on_32 = wave_lanes_refusal("compute", true, None, (32, 32)).expect("refused");
+        assert!(wave_lanes_refusal("compute", true, None, (32, 32)).is_none());
+        let mesh_on_32 = wave_lanes_refusal("mesh", true, None, (32, 32)).expect("refused");
         assert_eq!(
-            unsized_on_32,
-            "a shader requiring 64-lane waves, on a host without them"
+            mesh_on_32,
+            "a mesh program written for 64-lane waves, on a host without them"
         );
     }
 
