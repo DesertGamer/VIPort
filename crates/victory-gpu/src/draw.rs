@@ -68,6 +68,8 @@ pub(crate) struct State {
     heaps: [usize; 2],
     graphics: Vec<Root>,
     compute: Vec<Root>,
+    /// The title's graphics and compute root signatures.
+    title_roots: [usize; 2],
     vertex: [VertexView; 32],
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
@@ -339,6 +341,15 @@ impl State {
             &mut self.compute
         } else {
             &mut self.graphics
+        }
+    }
+
+    pub(crate) fn set_root_signature(&mut self, compute: bool, signature: This) {
+        let slot = &mut self.title_roots[usize::from(compute)];
+        let signature = signature as usize;
+        if *slot != signature {
+            *slot = signature;
+            self.roots(compute).clear();
         }
     }
 
@@ -2909,5 +2920,36 @@ mod breadcrumb_tests {
         let mut last = State::default();
         assert_eq!(last.take_dynamic(&heap, key, total), None);
         assert!(!reset.lease().is_lost());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changing_root_signatures_invalidates_only_the_matching_bindings() {
+        let mut state = State::default();
+        let first = std::ptr::without_provenance(1);
+        let second = std::ptr::without_provenance(2);
+
+        state.set_root_signature(false, first);
+        state.set_root_signature(true, first);
+        state.set_table(false, 0, 0x1000);
+        state.set_view(false, 1, 0x2000);
+        state.set_constants(false, 2, &[42], 0);
+        state.set_constants(true, 0, &[7], 0);
+
+        state.set_root_signature(false, first);
+        assert!(matches!(&state.graphics[..], [
+            Root::Table(0x1000), Root::View(0x2000), Root::Constants(values)
+        ] if values == &[42]));
+
+        state.set_root_signature(false, second);
+        assert!(state.graphics.is_empty());
+        assert!(matches!(&state.compute[..], [Root::Constants(values)] if values == &[7]));
+
+        state.set_root_signature(true, std::ptr::null());
+        assert!(state.compute.is_empty());
     }
 }
