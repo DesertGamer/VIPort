@@ -3296,6 +3296,7 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        crate::screenshot::presenter_seen();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -3358,7 +3359,10 @@ impl Host {
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::screenshot::read_back(&self.device, list, texture))
+                .flatten();
+            let shot = crate::screenshot::pending()
+                .then(|| crate::screenshot::read_back(&self.device, list, texture))
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = crate::capture::probe(&self.device, list, texture);
@@ -3374,6 +3378,10 @@ impl Host {
             ]);
             p.copy.close();
             self.execute(&[&p.copy]);
+            crate::screenshot::presenter_seen();
+            if let Some((buffer, footprint)) = shot {
+                crate::screenshot::fill(&buffer, &footprint);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);

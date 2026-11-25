@@ -54,6 +54,8 @@ pub mod root;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
+mod screenshot;
+#[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
@@ -76,6 +78,8 @@ pub use host::on_failure;
 pub fn host_ready() -> Result<(), String> {
     Ok(())
 }
+#[cfg(windows)]
+pub use screenshot::{last_frame, png as screenshot_png, take as save_screenshot, Frame};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
