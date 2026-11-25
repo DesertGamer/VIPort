@@ -32,6 +32,7 @@ pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    pub const NO_REFACTORING: u64 = 1 << 1;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -104,6 +105,8 @@ pub(crate) struct Shader {
     /// The view addresses' handle, once a descriptor's address is read.
     pub view_addresses: Option<V>,
     pub flags: u64,
+    /// A fused multiply-add (`FMad`) was emitted: the driver may then fuse.
+    pub fused: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -168,6 +171,7 @@ impl Shader {
             memory_dirty: None,
             view_addresses: None,
             flags: 0,
+            fused: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -477,6 +481,14 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
+    /// Refactoring lets the host fuse a multiply and an add the console
+    /// rounds apart (NVIDIA does); only `FMad` needs it, to fuse at all.
+    pub(crate) fn settle_flags(&mut self) {
+        if !self.fused {
+            self.flags |= flags::NO_REFACTORING;
+        }
+    }
+
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
@@ -722,6 +734,7 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        self.settle_flags();
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
