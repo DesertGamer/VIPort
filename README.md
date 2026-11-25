@@ -187,6 +187,12 @@ upscaler for your GPU (the log says so), the title's own DLLs run. Series X
 mode uses the title's own upscaler; a diagnostics build switches it to
 FidelityFX with `VICTORY_UPSCALER` and `VICTORY_FFX_SCALE` (below).
 
+Linux (Wine or Proton) is not a supported host, but the title runs as far
+as its loading screen there. The host needs an audio output device: under
+Wine, install its sound driver (on Fedora `wine-pulseaudio`, which `wine`
+alone does not pull in). Without one the title stops on an assert about
+15 s in, and VIctory warns "the host has no audio output device".
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
