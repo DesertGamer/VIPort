@@ -28,8 +28,9 @@ otherwise. See [docs/architecture.md](docs/architecture.md).
 
 ## What V2 changes
 
-- **Community pull requests, merged.** Open upstream PRs are merged into V2 in
-  batches. The authors of the original commits stay the authors in the history.
+- **Community pull requests, merged.** Open upstream PRs were merged into V2 in
+  batches until 2026-11-25. The authors of the original commits stay the authors
+  in the history.
 - **Reviewed before merging.** Every PR is checked first for things that do not
   belong in a code change: binary files and archives, build scripts
   (`build.rs`), git hooks, `.cargo` configuration, shell/PowerShell/batch
@@ -50,6 +51,27 @@ otherwise. See [docs/architecture.md](docs/architecture.md).
   [docs/asset-policy.md](docs/asset-policy.md). You supply your own files.
 - It does not promise that the game is playable. See *Status* below.
 
+## Help wanted
+
+V2 reaches the first cutscene on the machine we test on. It is not playable yet.
+What would move it forward fastest:
+
+- **Run it and tell us how far it got.** One comment per machine in
+  [#4](https://github.com/DesertGamer/VIctory-V2/issues/4), there is a form.
+  Different GPUs and drivers matter most: some failures depend on the machine.
+- **Pick a small task.** Three tests are red. Two of them look like stale tests
+  rather than product bugs
+  ([#16](https://github.com/DesertGamer/VIctory-V2/issues/16),
+  [#17](https://github.com/DesertGamer/VIctory-V2/issues/17)); one needs a run
+  on your GPU
+  ([#18](https://github.com/DesertGamer/VIctory-V2/issues/18)). Each issue has
+  the exact failure and what "done" looks like (labelled `help wanted`).
+- **Count the DirectStorage failures on your GPU**
+  ([#15](https://github.com/DesertGamer/VIctory-V2/issues/15)): zero is a useful
+  answer too.
+- **Authorship stays.** Every merged pull request keeps its author in the
+  history.
+
 ## Where to talk
 
 - [#1: entering the world fails with a GPU device removed](https://github.com/DesertGamer/VIctory-V2/issues/1): the main blocker; post diagnostics and findings here.
@@ -65,9 +87,10 @@ desert_gamer@icloud.com.
 - How to contribute: [CONTRIBUTING.md](CONTRIBUTING.md).
 - Found a security problem: [SECURITY.md](SECURITY.md). This code runs inside a
   process with your user's rights, so please read it before reporting in public.
-- V2 keeps the upstream repository as a remote and merges its `main` regularly.
-  A fix that is useful to everyone belongs upstream too: if you send a change
-  to V2, consider sending it to the original project as well.
+- V2 no longer merges from the upstream repository. Upstream stays a reference:
+  its pull requests, discussions and issues. A fix that is useful to everyone
+  belongs upstream too: if you send a change to V2, consider sending it to the
+  original project as well.
 
 ## Status (2026-11-24)
 
