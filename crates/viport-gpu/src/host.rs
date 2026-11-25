@@ -240,7 +240,7 @@ pub(crate) fn after_landing(work: impl FnOnce() + Send + 'static) {
     AIR.after_landing(Box::new(work));
 }
 
-fn gate(from: usize, to: usize) {
+pub(crate) fn gate(from: usize, to: usize) {
     AIR.gate(from, to);
 }
 
@@ -1287,9 +1287,6 @@ impl Host {
             .collect();
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
-        if !heaps.is_empty() {
-            AIR.settle();
-        }
         let uploads = (!heaps.is_empty())
             .then(|| crate::bindless::uploads(&heaps))
             .flatten();
@@ -1373,7 +1370,7 @@ impl Host {
         let landed_here = traced;
         #[cfg(not(feature = "diagnostics"))]
         let landed_here = false;
-        if leases.is_some() && groups.len() == 1 && uploads.is_none() && !landed_here {
+        if leases.is_some() && groups.len() == 1 && !landed_here {
             AIR.settle();
             *submitted += 1;
             let value = *submitted;
@@ -1403,7 +1400,7 @@ impl Host {
                 footprint,
                 Box::new(move || {
                     if let Some(host) = host() {
-                        host.land_flight(&addresses, leases, armed, started, prepared);
+                        host.land_flight(&addresses, leases, armed, started, prepared, uploads);
                     }
                 }),
             );
@@ -1505,6 +1502,7 @@ impl Host {
         armed: bool,
         started: std::time::Instant,
         prepared: std::time::Instant,
+        uploads: Option<crate::bindless::Uploads>,
     ) {
         let runs: Vec<&HostList> = addresses.iter().map(|&a| unsafe { &*(a as *const HostList) }).collect();
         if armed {
@@ -1531,6 +1529,7 @@ impl Host {
         for lease in leases {
             lease.finish();
         }
+        drop(uploads);
     }
 
     fn land(
@@ -2780,7 +2779,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging, staging.title_range()) {
-                        AIR.settle();
+                        staging.wait_landed();
                         staging.refresh();
                     }
                     continue;

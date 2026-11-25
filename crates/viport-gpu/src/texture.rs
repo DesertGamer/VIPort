@@ -75,6 +75,7 @@ pub(crate) struct Staging {
     data: *mut u8,
     packed: Option<u32>,
     recorded: std::sync::atomic::AtomicBool,
+    in_air: Arc<std::sync::atomic::AtomicBool>,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: viport_formats::texture::Layout,
@@ -277,7 +278,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 /// records its copy into `list` only if the memory changed since (or was
 /// never uploaded). True if it recorded; the texture is then in the copy
 /// destination state.
-pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Resource) -> bool {
+pub(crate) fn upload_changed(
+    list: &HostList,
+    resource: This,
+    texture: &ID3D12Resource,
+    flying: &mut Vec<Arc<std::sync::atomic::AtomicBool>>,
+) -> bool {
     if is_host_written(resource) {
         return false;
     }
@@ -289,7 +295,22 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
     }
     record(list, resource, texture, &staging);
     list.keep(&staging.buffer);
+    staging.in_air.store(true, std::sync::atomic::Ordering::Release);
+    flying.push(staging.in_air.clone());
     true
+}
+
+pub(crate) fn wait_landed(resource: This, texture: &ID3D12Resource) {
+    if is_host_written(resource) {
+        return;
+    }
+    let Some(staging) = staging(resource, texture) else {
+        return;
+    };
+    if staging.settled() {
+        return;
+    }
+    staging.wait_landed();
 }
 
 /// Records the copy of every subresource of `staging` into `texture`,
@@ -356,6 +377,14 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
 impl Staging {
     fn settled(&self) -> bool {
         self.packed.is_some() && self.recorded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn wait_landed(&self) {
+        let (from, to) = self.title_range();
+        crate::host::gate(from, to);
+        if self.in_air.load(std::sync::atomic::Ordering::Acquire) {
+            crate::host::settle();
+        }
     }
 
     /// Title memory range `[start, end)` this texture reads from.
@@ -582,6 +611,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         data,
         packed: copy.packed(),
         recorded: false.into(),
+        in_air: Arc::default(),
         footprints,
         rows,
         layout,

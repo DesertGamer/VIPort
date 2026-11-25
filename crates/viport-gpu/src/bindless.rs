@@ -192,16 +192,34 @@ fn left_kind(view: &View) -> usize {
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
 pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
-    static LIST: Mutex<Holder> = Mutex::new(Holder(None));
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-    let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
-    match &guard.0 {
-        // Closed by the last submission, which has run.
-        Some(list) => list.reset(),
-        // Made open.
-        None => guard.0 = Some(crate::host::host()?.new_list().ok()?),
+    for viewed in heaps {
+        let resources: Vec<usize> = viewed
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .textures
+            .keys()
+            .copied()
+            .collect();
+        for r in resources {
+            if let Some(texture) = crate::resource::host_resource(r as This) {
+                crate::texture::wait_landed(r as This, texture);
+            }
+        }
     }
-    let list = guard.0.as_ref()?;
+    let pooled = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    let list = match pooled {
+        Some(Holder(list)) => {
+            list.reset();
+            list
+        }
+        None => crate::host::host()?.new_list().ok()?,
+    };
+    let mut held = Uploads {
+        list: Some(list),
+        flying: Vec::new(),
+    };
     let mut recorded = false;
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
@@ -215,7 +233,8 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
             let Some(texture) = crate::resource::host_resource(r as This) else {
                 continue;
             };
-            if crate::texture::upload_changed(list, r as This, texture) {
+            let list = held.list.as_ref()?;
+            if crate::texture::upload_changed(list, r as This, texture, &mut held.flying) {
                 crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
                 recorded = true;
                 #[cfg(feature = "diagnostics")]
@@ -223,23 +242,37 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
             }
         }
     }
-    list.close();
+    held.list.as_ref()?.close();
     // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
+    recorded.then_some(held)
 }
 
-/// The upload list, used under its lock only.
-pub(crate) struct Holder(Option<HostList>);
-// SAFETY: D3D12 objects are free-threaded; the list is used by one
-// submission at a time, under the lock.
+static POOL: Mutex<Vec<Holder>> = Mutex::new(Vec::new());
+
+pub(crate) struct Holder(HostList);
 unsafe impl Send for Holder {}
 
-/// The upload list of a submission, ours until it has run.
-pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
+pub(crate) struct Uploads {
+    list: Option<HostList>,
+    flying: Vec<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+unsafe impl Send for Uploads {}
 
 impl Uploads {
     pub(crate) fn list(&self) -> &HostList {
-        self.0.0.as_ref().expect("made before it is handed out")
+        self.list.as_ref().expect("made before it is handed out")
+    }
+}
+
+impl Drop for Uploads {
+    fn drop(&mut self) {
+        for staging in &self.flying {
+            staging.store(false, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(list) = self.list.take() {
+            POOL.lock().unwrap_or_else(|e| e.into_inner()).push(Holder(list));
+        }
     }
 }
 
