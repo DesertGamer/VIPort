@@ -79,12 +79,10 @@ static LIVE_STAGING: Mutex<Vec<std::sync::Weak<Staging>>> = Mutex::new(Vec::new(
 pub(crate) fn cached_staging_bytes() -> Option<(u64, usize)> {
     let staging = LIVE_STAGING.try_lock().ok()?;
     let mut upload = 0;
-    let mut read = 0;
     for allocation in staging.iter().filter_map(std::sync::Weak::upgrade) {
-        let last = allocation.last.try_lock().ok()?;
         upload += allocation.size;
-        read += last.read.capacity();
     }
+    let read = READ_SCRATCH.try_lock().ok()?.capacity();
     Some((upload, read))
 }
 
