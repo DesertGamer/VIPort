@@ -84,6 +84,6 @@ pub fn host_ready() -> Result<(), String> {
 pub use screenshot::{last_frame, png as screenshot_png, take as save_screenshot, Frame};
 #[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
+    Writing as KernelWrite, title_memory_aliased, title_memory_remapped, title_memory_written,
     writing as kernel_will_write,
 };

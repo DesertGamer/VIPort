@@ -430,12 +430,32 @@ fn shown_at(pages: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-/// Reports writes into physical pages through our own views at every title
-/// view showing them (DirectStorage's page destinations).
+fn write_before(shown: &[usize]) -> Vec<viport_gpu::KernelWrite> {
+    #[cfg(test)]
+    OPENED.with(|o| o.borrow_mut().extend_from_slice(shown));
+    shown
+        .iter()
+        .map(|&page| viport_gpu::kernel_will_write(page, PAGE))
+        .collect()
+}
+
 fn report_written(shown: &[usize]) {
     for &page in shown {
-        drop(viport_gpu::kernel_will_write(page, PAGE));
+        #[cfg(test)]
+        REPORTED.with(|r| r.borrow_mut().push(page));
+        viport_gpu::title_memory_written(page, PAGE);
     }
+}
+
+fn report_new(after: Vec<usize>, told: &[usize]) {
+    let new: Vec<usize> = after.into_iter().filter(|a| !told.contains(a)).collect();
+    report_written(&new);
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPORTED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    static OPENED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl Physical {
@@ -636,7 +656,11 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
-    let shown = shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]));
+    let written = pages
+        .get(offset / PAGE..(offset + data.len()).div_ceil(PAGE))
+        .unwrap_or(&[]);
+    let told: Vec<usize> = shown_at(written);
+    let held = write_before(&told);
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -646,7 +670,8 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
-    report_written(&shown);
+    drop(held);
+    report_new(shown_at(written), &told);
     true
 }
 
@@ -657,13 +682,16 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
-    /// Title views showing the pages, told when the window is done.
-    shown: Vec<usize>,
+    pages: Vec<usize>,
+    held: Vec<(usize, viport_gpu::KernelWrite)>,
 }
 
 impl Drop for PageWindow {
     fn drop(&mut self) {
-        report_written(&self.shown);
+        let held = std::mem::take(&mut self.held);
+        let told: Vec<usize> = held.iter().map(|&(a, _)| a).collect();
+        drop(held);
+        report_new(shown_at(&self.pages), &told);
     }
 }
 
@@ -684,11 +712,20 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let view = View::map(slice, *n)?;
+    let pages = pages
+        .get(offset / PAGE..(offset + len).div_ceil(PAGE))
+        .unwrap_or(&[])
+        .to_vec();
+    let told = shown_at(&pages);
+    let held: Vec<(usize, viport_gpu::KernelWrite)> =
+        told.iter().copied().zip(write_before(&told)).collect();
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view,
         within: offset % PAGE,
         len,
-        shown: shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[])),
+        pages,
+        held,
     })
 }
 
@@ -1637,6 +1674,60 @@ mod tests {
         );
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    fn mapped_view(pages: &[usize]) -> *mut c_void {
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            pages.len() * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, pages.len(), pages.as_ptr()), a);
+        a
+    }
+
+    #[test]
+    fn writes_open_the_title_views_before_their_bytes() {
+        let pages = allocate(1);
+        let a = mapped_view(&pages);
+        REPORTED.with(|r| r.borrow_mut().clear());
+        OPENED.with(|o| o.borrow_mut().clear());
+        assert!(write_physical(&pages, 0, &[4]));
+        assert_eq!(OPENED.with(|o| o.borrow().clone()), [a as usize]);
+        assert!(REPORTED.with(|r| r.borrow().is_empty()));
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_window_opens_the_title_views_before_its_bytes() {
+        let pages = allocate(1);
+        let a = mapped_view(&pages);
+        REPORTED.with(|r| r.borrow_mut().clear());
+        OPENED.with(|o| o.borrow_mut().clear());
+        let mut window = page_window(&pages, 0, 16).expect("one run");
+        assert_eq!(OPENED.with(|o| o.borrow().clone()), [a as usize]);
+        window.bytes().fill(5);
+        drop(window);
+        assert!(REPORTED.with(|r| r.borrow().is_empty()));
+        assert_eq!(unsafe { a.cast::<u8>().read() }, 5);
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_view_mapped_during_a_window_is_told_when_it_drops() {
+        let pages = allocate(1);
+        let window = page_window(&pages, 0, 16).expect("one run");
+        REPORTED.with(|r| r.borrow_mut().clear());
+        let b = mapped_view(&pages);
+        drop(window);
+        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 
     #[test]

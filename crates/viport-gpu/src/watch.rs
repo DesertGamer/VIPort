@@ -489,6 +489,12 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+pub fn title_memory_written(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut g = guards();
+    changed(&mut g, first, last);
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
@@ -921,6 +927,18 @@ pub(crate) mod tests {
         // takes it for `a`'s pages here).
         unsafe { (c as *mut u32).write_volatile(1) };
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+    }
+
+    #[test]
+    fn a_write_reported_after_the_fact_marks_the_tracker() {
+        let (a, b) = twin_views(1);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        unsafe { ((b + 8) as *mut u8).write_volatile(0x22) };
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        title_memory_written(b, PAGE);
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(t.take(a, a + PAGE).is_empty());
     }
 
     /// A write or mapping that runs past the end of the address space (a

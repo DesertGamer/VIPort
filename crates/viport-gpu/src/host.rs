@@ -1888,6 +1888,9 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
+        if copy.packed().is_some() {
+            crate::texture::upload(self, resource, texture);
+        }
         if let Some(Some(twin)) = copy.twin.get()
             && crate::twin::route(self, &copy, twin, wanted)
         {
@@ -2336,6 +2339,21 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.uploads.push(buffer.clone());
         deferred.readbacks.push((data as usize, to as usize, size as usize));
+        Some(buffer)
+    }
+
+    pub(crate) fn read_back_with(
+        &self,
+        host: &Host,
+        size: u64,
+        work: impl Fn(*const u8) + Send + 'static,
+    ) -> Option<ID3D12Resource> {
+        let (buffer, data) = host.read_back_buffer(size)?;
+        name(&buffer, || format!("list read-back {size:#x}"));
+        let mut deferred = self.deferred();
+        deferred.uploads.push(buffer.clone());
+        let data = data as usize;
+        deferred.after.push(Box::new(move || work(data as *const u8)));
         Some(buffer)
     }
 

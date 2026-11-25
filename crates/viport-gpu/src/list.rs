@@ -529,6 +529,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if crate::texture::incompatible_copy(crate::resource::packed_format(src), crate::resource::packed_format(dst)) {
+                return;
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
@@ -593,6 +596,7 @@ extern "system" fn copy_texture_region(
             read_back_texture(list, dst, (x, y, z), src, source_box);
             return;
         };
+        let packed = crate::resource::packed_format(dst.resource);
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -604,24 +608,43 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+            let Some(footprint) = host_footprint(src.footprint, packed) else { return };
+            let Some(host_bytes) = footprint.bytes() else { return };
+            let Some((buffer, staging)) = list.upload(host, host_bytes) else {
                 return;
             };
             // The list owns this mapped D3D12 upload buffer. Wine can report
             // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
+            if let Some(format) = packed {
+                let (data, staging) = (data as usize, staging as usize);
+                let (title_pitch, host_pitch) = (src.footprint.row_pitch as usize, footprint.row_pitch as usize);
+                let row = footprint.width as usize * 2;
+                list.defer_host(move || {
+                    let mut guest = vec![0; bytes as usize];
+                    crate::host::copy_mapped(guest.as_mut_ptr(), data as *const u8, guest.len(), false);
+                    let rgba = unsafe { std::slice::from_raw_parts_mut(staging as *mut u8, host_bytes as usize) };
+                    for (src, dst) in guest.chunks(title_pitch).zip(rgba.chunks_mut(host_pitch)) {
+                        crate::texture::expand_row(format, &src[..row], dst);
+                    }
+                });
+            } else {
+                list.defer_fill(staging, data, bytes as usize);
+            }
+            from.footprint = footprint;
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, host_bytes));
             }
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::texture::incompatible_copy(crate::resource::packed_format(src.resource), packed) {
+                return;
+            }
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
@@ -674,6 +697,25 @@ extern "system" fn copy_texture_region(
     let _ = (this, dst, x, y, z, src, source_box);
 }
 
+#[cfg(windows)]
+fn host_footprint(mut f: crate::resource::PlacedFootprint, packed: Option<u32>) -> Option<crate::resource::PlacedFootprint> {
+    f.offset = 0;
+    if packed.is_some() {
+        if crate::resource::element(f.format) != Some((2, 1))
+            || f.width == 0
+            || f.height == 0
+            || f.depth == 0
+            || f.width.checked_mul(2)? > f.row_pitch
+            || !f.row_pitch.is_multiple_of(256)
+        {
+            return None;
+        }
+        f.format = 28;
+        f.row_pitch = f.row_pitch.checked_mul(2)?;
+    }
+    Some(f)
+}
+
 /// Texture to buffer (read back): the texture is copied on the GPU into a
 /// read-back buffer of the list's, and from there into the title's buffer
 /// once the list has run.
@@ -706,7 +748,31 @@ fn read_back_texture(
     let Some(target) = buffer_range(dst.resource, dst.footprint.offset, bytes) else {
         return;
     };
-    let Some(buffer) = list.read_back(host, bytes, target) else {
+    let packed = crate::resource::packed_format(src.resource);
+    let Some(footprint) = host_footprint(dst.footprint, packed) else {
+        UNSUPPORTED.call_once(|| tracing::warn!(footprint = ?dst.footprint, "texture read-back of a packed footprint the host cannot expand"));
+        return;
+    };
+    let Some(host_bytes) = footprint.bytes() else { return };
+    let buffer = if let Some(format) = packed {
+        let (title_pitch, host_pitch) = (dst.footprint.row_pitch as usize, footprint.row_pitch as usize);
+        let row = footprint.width as usize * 2;
+        let (target, len) = (target as usize, bytes as usize);
+        list.read_back_with(host, host_bytes, move |data| {
+            let (rgba, title) = unsafe {
+                (
+                    std::slice::from_raw_parts(data, host_bytes as usize),
+                    std::slice::from_raw_parts_mut(target as *mut u8, len),
+                )
+            };
+            for (src, dst) in rgba.chunks(host_pitch).zip(title.chunks_mut(title_pitch)) {
+                crate::texture::pack_row(format, src, &mut dst[..row]);
+            }
+        })
+    } else {
+        list.read_back(host, bytes, target)
+    };
+    let Some(buffer) = buffer else {
         return;
     };
     static FIRST: std::sync::Once = std::sync::Once::new();
@@ -717,7 +783,7 @@ fn read_back_texture(
     ensure_state(list, src.resource, COPY_SOURCE);
     let mut to = dst;
     to.resource = buffer.as_raw().cast_const().cast();
-    to.footprint.offset = 0;
+    to.footprint = footprint;
     let mut from = src;
     from.resource = texture.as_raw().cast_const().cast();
     let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -773,6 +839,10 @@ extern "system" fn resolve(
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
+        let packed = crate::resource::packed_format(dst);
+        if crate::texture::incompatible_copy(crate::resource::packed_format(src), packed) {
+            return;
+        }
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
@@ -789,7 +859,7 @@ extern "system" fn resolve(
         unsafe {
             let (dst_width, dst_height) = extent(to.GetDesc(), dst_sub);
             let (src_width, src_height) = extent(from.GetDesc(), src_sub);
-            let format = DXGI_FORMAT(format as i32);
+            let format = if packed.is_some() { to.GetDesc().Format } else { DXGI_FORMAT(format as i32) };
             if (dst_width, dst_height) == (src_width, src_height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
@@ -940,22 +1010,26 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     {
         let (d, s, len) = (dst as usize, src as usize, len as usize);
         if d < s.saturating_add(len) && s < d.saturating_add(len) {
-            list.defer(move || {
-                if crate::texture::committed(s as *const u8, len)
-                    && crate::texture::committed(d as *const u8, len)
-                {
-                    let _writing = crate::watch::writing(d, len);
-                    // SAFETY: both ranges are committed title memory; `ptr::copy`
-                    // preserves overlapping `memmove` semantics.
-                    unsafe { std::ptr::copy(s as *const u8, d as *mut u8, len) };
-                }
-            });
+            list.defer(move || copy_title_memory(d, s, len));
         } else {
             list.defer_copy(d as *mut u8, s as *const u8, len);
         }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
+}
+
+#[cfg(windows)]
+fn copy_title_memory(dst: usize, src: usize, len: usize) {
+    if !crate::texture::committed(src as *const u8, len) {
+        return;
+    }
+    let mut bytes = vec![0u8; len];
+    if !crate::host::read_into(src as *const u8, &mut bytes) {
+        return;
+    }
+    let _writing = crate::watch::writing(dst, len);
+    crate::host::write_mapped(dst as *mut u8, bytes.as_ptr(), len);
 }
 
 /// `DriverHintX(feature, value)`: no hints for the host.
@@ -1872,6 +1946,33 @@ mod tests {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn memory_copies_do_not_fault_on_read_only_destinations() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        let page = unsafe {
+            VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        }
+        .cast::<u8>();
+        assert!(!page.is_null());
+        unsafe { (0..16).for_each(|i| page.add(i).write(i as u8)) };
+        let at = page as usize;
+        copy_title_memory(at + 4, at, 8);
+        let moved: Vec<u8> = (0..16).map(|i| unsafe { page.add(i).read() }).collect();
+        assert_eq!(moved, [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15]);
+        let mut old = 0;
+        assert!(
+            unsafe { VirtualProtect(page.add(4096).cast(), 4096, PAGE_READONLY, &mut old) } != 0
+        );
+        copy_title_memory(at + 4096, at, 8);
+        copy_title_memory(at, at, usize::MAX / 4);
+        copy_title_memory(at, at, usize::MAX);
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
     }
 
     #[test]
