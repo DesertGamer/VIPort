@@ -84,9 +84,10 @@ The title's console GPU code is recompiled to DXIL. Coverage of the world's
 shaders, from the Status details tables:
 
 ```text
-Mesh shaders     ████████████████████  100%     8,765 / 8,765
-Vertex / pixel   ███████████████████░  99.7%   12,550 / 12,592
-Compute          ███████████████████░  97.8%    2,579 / 2,637
+                                       done / total      missing
+Mesh shaders     ████████████████████  100%     8,765 /  8,765       0
+Vertex / pixel   ███████████████████░  99.7%   12,550 / 12,592      42
+Compute          ███████████████████░  97.8%    2,579 /  2,637      58
 ```
 
 ### By the numbers (2026-11-25)
