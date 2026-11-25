@@ -83,6 +83,18 @@ const DEVICES: usize = PADS + 2;
 const HISTORY: usize = 32;
 const POLL: Duration = Duration::from_millis(8);
 
+const ENTER_FIRST: Duration = Duration::from_secs(5);
+const ENTER_LAST: Duration = Duration::from_secs(45);
+const ENTER_EVERY: Duration = Duration::from_secs(3);
+const ENTER_HELD: Duration = Duration::from_millis(200);
+
+fn enter_due(since_start: Duration) -> bool {
+    since_start >= ENTER_FIRST
+        && since_start < ENTER_LAST
+        && (since_start - ENTER_FIRST).as_millis() % ENTER_EVERY.as_millis()
+            < ENTER_HELD.as_millis()
+}
+
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
@@ -1297,10 +1309,13 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            let mut down = auto_enter();
             #[cfg(feature = "diagnostics")]
-            let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
+            for vk in scripted() {
+                if !down.contains(&vk) {
+                    down.push(vk);
+                }
+            }
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1339,6 +1354,19 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+    }
+
+    fn auto_enter() -> Vec<u8> {
+        static AUTO: LazyLock<(Instant, bool)> = LazyLock::new(|| {
+            let off = std::env::var("VIPORT_AUTO_ENTER").is_ok_and(|v| v == "0");
+            (Instant::now(), !off)
+        });
+        let (start, on) = &*AUTO;
+        if *on && enter_due(start.elapsed()) {
+            vec![0x0D]
+        } else {
+            Vec::new()
         }
     }
 
@@ -1536,6 +1564,21 @@ mod tests {
     use crate::HostPolicy;
     use viport_loader::Provenance;
     use viport_pe::ImportSymbol;
+
+    #[test]
+    fn enter_is_pressed_every_three_seconds_between_five_and_forty_five() {
+        let due = |ms| enter_due(Duration::from_millis(ms));
+        assert!(!due(4_999));
+        assert!(due(5_000));
+        assert!(due(5_199));
+        assert!(!due(5_200));
+        assert!(!due(7_999));
+        assert!(due(8_000));
+        assert!(due(44_000));
+        assert!(!due(44_200));
+        assert!(!due(45_000));
+        assert!(!due(60_000));
+    }
 
     #[derive(Default)]
     struct FakeHost {

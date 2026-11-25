@@ -426,6 +426,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VIPORT_GPU_TIMING=1` | each list of a submission run and timed on its own; slow lists are logged, and with `VIPORT_D3D12_DRED=1` their slowest commands are named too — the per-command notes come from that switch, so `VIPORT_GPU_TIMING` alone reports `commands=0`; a device removal names the list it happened in and lists all its commands |
 | `VIPORT_TRACE_SHADERS=<hash>,...` | with `VIPORT_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500) |
 | `VIPORT_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VIPORT_BORDERLESS=1` | removes the game window's title bar and frame (the window keeps them by default) |
+| `VIPORT_AUTO_ENTER=0` | stops the automatic Enter presses (every 3 s from the 5th to the 45th second) that pass the terms screen |
 | `VIPORT_MODE=<width>x<height>` | report that display mode instead of the console's 3840x2160 (smaller render targets on smaller hosts) |
 | `VIPORT_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
 | `VIPORT_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |

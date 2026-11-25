@@ -3309,6 +3309,7 @@ impl Meter {
             let _ = std::thread::Builder::new()
                 .name("viport-caption".into())
                 .spawn(|| {
+                    let borderless = std::env::var_os("VIPORT_BORDERLESS").is_some_and(|v| v == "1");
                     loop {
                         let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
                         match next {
@@ -3317,7 +3318,8 @@ impl Meter {
                                 let hwnd = HWND(hwnd as *mut _);
                                 let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
                                 let frame = (WS_CAPTION | WS_THICKFRAME).0 as isize;
-                                if style & frame != 0
+                                if borderless
+                                    && style & frame != 0
                                     && SetWindowLongPtrW(hwnd, GWL_STYLE, style & !frame) != 0
                                 {
                                     let flags = SWP_FRAMECHANGED
