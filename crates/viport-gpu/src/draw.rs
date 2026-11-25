@@ -131,7 +131,7 @@ const MEMORY_HEAP: usize = crate::memory::OURS;
 const SAMPLERS_OURS: usize = usize::MAX;
 
 /// Dynamic slots taken at a time for root views.
-const ROOT_VIEW_RUN: u32 = 256;
+const ROOT_VIEW_RUN: u32 = 32;
 
 /// Dynamic slots taken for root views ([`State::root_view`]) since the last
 /// call.
@@ -938,11 +938,11 @@ impl State {
         }
         let (run_heap, next, end) = self.root_run;
         if run_heap != key || next >= end {
-            let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
+            let Some(first) = self.take_dynamic(host, key, ROOT_VIEW_RUN) else {
                 once!("no dynamic slots for root views: dropped");
+                not_run("no dynamic slots for root views");
                 return None;
             };
-            self.dynamic.push((key, first, ROOT_VIEW_RUN));
             self.root_run = (key, first, first + ROOT_VIEW_RUN);
         }
         let index = self.root_run.1;
