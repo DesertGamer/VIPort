@@ -711,7 +711,7 @@ impl State {
                                 && r.root == RootType::Descriptor
                                 && r.kind == ResourceType::Uav
                         });
-                        roots.push((*address, uav.then_some(shadow)));
+                        roots.push((*address, uav.then_some(shadow), u.slot));
                     }
                     let fresh = made
                         .iter()
@@ -732,7 +732,7 @@ impl State {
                         }
                         None if is_root_view(u) => {
                             let uav = u.dword == viport_shader::emit::ROOT_UAV_VIEW;
-                            match self.root_view(list, compute, u.slot, uav) {
+                            match self.root_view(list, compute, u.slot, uav, &p.name) {
                                 Some((slot, _)) => slot,
                                 None => return false,
                             }
@@ -833,11 +833,13 @@ impl State {
                 crate::memory::note_use(&p.name);
                 // What shaders write through a root UAV goes back by its
                 // bytes, as through root views ([`root_view`]).
-                for (address, shadow) in &roots {
+                for (address, shadow, slot) in &roots {
                     if let (Some(shadow), Some((_, map))) = (shadow, &self.memory) {
-                        let len = shadow.left(*address).min(1 << 20);
-                        shadow.refresh(list, *address, len);
-                        shadow.gpu_writes(list, *address, len);
+                        let full = shadow.left(*address).min(1 << 20);
+                        let key = crate::shadow::write_key(&p.name, *slot);
+                        let len = crate::shadow::write_extent(key, full);
+                        shadow.refresh(list, *address, full);
+                        shadow.gpu_writes_keyed(list, *address, len, key);
                         map.precise(*address, len);
                     }
                 }
@@ -898,7 +900,7 @@ impl State {
     /// fetch's streams sit at offsets in the root view's own header).
     /// shortcut: what shaders write through a root UAV goes back to title
     /// memory for 1 MiB from its address, as before the views.
-    fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
+    fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool, name: &str) -> Option<(u32, u32)> {
         let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
             once!(slot, "a shader reads a root view the title did not set: dropped");
             return None;
@@ -907,7 +909,9 @@ impl State {
         let offset = u32::try_from(shadow.offset(address)).ok()?;
         shadow.refresh(list, address, shadow.left(address));
         if uav {
-            shadow.gpu_writes(list, address, shadow.left(address).min(1 << 20));
+            let full = shadow.left(address).min(1 << 20);
+            let key = crate::shadow::write_key(name, slot);
+            shadow.gpu_writes_keyed(list, address, crate::shadow::write_extent(key, full), key);
         }
         let (key, host) = match self.heaps[0] {
             0 => (MEMORY_HEAP, crate::memory::heap()?),
@@ -2252,10 +2256,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             let mut state = State::default();
             state.set_heaps(&[heap]);
             state.set_view(true, 0, address);
-            let (index, at) = state.root_view(&list, true, 0, false).expect("a root view");
+            let (index, at) = state.root_view(&list, true, 0, false, "test").expect("a root view");
             assert_eq!(u64::from(at), address - src, "the root address's offset in the copy");
             state.set_view(true, 1, address - 0x40);
-            let other = state.root_view(&list, true, 1, false).expect("a root view");
+            let other = state.root_view(&list, true, 1, false, "test").expect("a root view");
             assert_eq!(other, (index, at - 0x40), "one view per copy");
             let constants = [at, offset];
             // SAFETY: an open list, live objects of ours.

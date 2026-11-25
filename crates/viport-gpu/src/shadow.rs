@@ -49,6 +49,65 @@ pub(crate) struct Shadow {
     /// order, and the 64 KiB pieces (by title address) already compared.
     before: Mutex<Snapshot>,
     spare_capacity: u64,
+    keys: Mutex<Vec<((usize, usize), u64)>>,
+}
+
+struct Extent {
+    max: u64,
+    seen: u32,
+    tick: u32,
+}
+
+static EXTENTS: Mutex<BTreeMap<u64, Extent>> = Mutex::new(BTreeMap::new());
+
+const LEARN: u32 = 64;
+const VERIFY: u32 = 32;
+const GRAIN: u64 = 64 << 10;
+
+pub(crate) fn write_key(pipeline: &str, slot: u8) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    pipeline.hash(&mut hasher);
+    slot.hash(&mut hasher);
+    hasher.finish() | 1
+}
+
+fn learning() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VIPORT_LEARN_UAV_EXTENT"))
+}
+
+fn learned(extent: &Extent, full: u64) -> u64 {
+    extent.max.saturating_mul(2).max(1).next_multiple_of(GRAIN).min(full)
+}
+
+pub(crate) fn write_extent(key: u64, full: u64) -> u64 {
+    if !learning() {
+        return full;
+    }
+    let mut extents = EXTENTS.lock().unwrap_or_else(|e| e.into_inner());
+    let extent = extents.entry(key).or_insert(Extent { max: 0, seen: 0, tick: 0 });
+    extent.tick = extent.tick.wrapping_add(1);
+    if extent.seen < LEARN || extent.tick % VERIFY == 0 {
+        return full;
+    }
+    learned(extent, full)
+}
+
+fn observe_extent(key: u64, written: u64, declared: u64) {
+    let mut extents = EXTENTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(extent) = extents.get_mut(&key) else {
+        return;
+    };
+    if extent.seen >= LEARN && declared > learned(extent, declared) && written > learned(extent, declared) {
+        static BEYOND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = BEYOND.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(n, written, learned = learned(extent, declared), "shader writes beyond the learned extent of a root view");
+        }
+    }
+    extent.max = extent.max.max(written);
+    extent.seen = extent.seen.saturating_add(1);
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -263,6 +322,7 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             spare_capacity: 0,
+            keys: Mutex::default(),
         }
     }
 
@@ -284,6 +344,15 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.left(address));
+        list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    pub(crate) fn gpu_writes_keyed(self: &Arc<Self>, list: &HostList, address: u64, len: u64, key: u64) {
+        let len = len.min(self.left(address));
+        self.keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(((address as usize, len as usize), key));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -372,6 +441,7 @@ impl Shadow {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
+        let mut written_end = 0usize;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
         if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
@@ -406,6 +476,10 @@ impl Shadow {
                 #[cfg(feature = "diagnostics")]
                 let t0 = std::time::Instant::now();
                 let differs = host != old;
+                if differs && learning() {
+                    let last = host.iter().zip(old).rposition(|(h, o)| h != o).unwrap_or(0);
+                    written_end = written_end.max(at - from + last + 1);
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     cb_time(2, t0);
@@ -462,6 +536,16 @@ impl Shadow {
             }
             #[cfg(feature = "diagnostics")]
             cb_time(9, t4);
+        }
+        if learning() {
+            let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+            keys.retain(|(range, key)| {
+                let ours = *range == (address, len);
+                if ours {
+                    observe_extent(*key, written_end as u64, len as u64);
+                }
+                !ours
+            });
         }
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
