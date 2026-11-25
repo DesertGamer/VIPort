@@ -313,9 +313,12 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             let mut scratch = READ_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
-            scratch.resize(size, 0);
-            crate::host::copy_mapped(scratch.as_mut_ptr(), self.memory, size, false);
-            self.detile(&scratch);
+            if scratch.len() < size {
+                scratch.resize(size, 0);
+            }
+            let tiled = &mut scratch[..size];
+            crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+            self.detile(tiled);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
