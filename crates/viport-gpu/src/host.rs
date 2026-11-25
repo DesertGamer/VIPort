@@ -1378,6 +1378,7 @@ impl Host {
             AIR.settle();
             *submitted += 1;
             let value = *submitted;
+            // SAFETY: the lists in `groups` are closed and live until the submission lands.
             let armed = unsafe {
                 self.queue.ExecuteCommandLists(groups[0]);
                 let waited = self
@@ -1508,8 +1509,10 @@ impl Host {
         prepared: std::time::Instant,
         uploads: Option<crate::bindless::Uploads>,
     ) {
+        // SAFETY: each address is of a list the submission keeps alive until it has landed.
         let runs: Vec<&HostList> = addresses.iter().map(|&a| unsafe { &*(a as *const HostList) }).collect();
         if armed {
+            // SAFETY: plain waits on the host's own event and device.
             let ended = unsafe {
                 wait_for_submission(
                     || WaitForSingleObject(self.event, WAIT_SLICE_MS) != WAIT_TIMEOUT,

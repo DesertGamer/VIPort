@@ -250,6 +250,7 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
 static POOL: Mutex<Vec<Holder>> = Mutex::new(Vec::new());
 
 pub(crate) struct Holder(HostList);
+// SAFETY: D3D12 objects are free-threaded and a pooled list belongs to one submission at a time.
 unsafe impl Send for Holder {}
 
 pub(crate) struct Uploads {
@@ -257,6 +258,7 @@ pub(crate) struct Uploads {
     flying: Vec<Arc<std::sync::atomic::AtomicBool>>,
 }
 
+// SAFETY: as `Holder`.
 unsafe impl Send for Uploads {}
 
 impl Uploads {
