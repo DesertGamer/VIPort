@@ -187,8 +187,12 @@ fn try_lower_valu_cs(
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
 /// from several test threads at once, now and then none of their dispatches
 /// ever completes and the test binary hangs; and two GPU tests at once on
-/// WARP can end the test process with an access violation. Other GPU test
-/// modules take this lock too.
+/// WARP can end the test process with an access violation, and two tests
+/// dispatching at once can have one read back what the other wrote — that is
+/// how `memory_tests`' title-memory test failed now and then in a full
+/// workspace run (#1882). **Every GPU test module takes this lock**, and a
+/// new one that makes a `Host` without it is the way the failure comes back:
+/// `diff_tests` was the last module missing it.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// `Host::new(false)` also selects WARP when the environment forces it.
