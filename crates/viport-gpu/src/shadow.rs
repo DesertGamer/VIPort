@@ -48,6 +48,7 @@ pub(crate) struct Shadow {
     /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
     /// order, and the 64 KiB pieces (by title address) already compared.
     before: Mutex<Snapshot>,
+    spare_capacity: u64,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -102,6 +103,48 @@ const POOL_BYTES: usize = 2 << 30;
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
+
+struct Spare {
+    capacity: u64,
+    buffer: ID3D12Resource,
+    data: usize,
+    gpu: u64,
+    state: u32,
+    frame: u64,
+}
+
+static SPARE: Mutex<Vec<Spare>> = Mutex::new(Vec::new());
+
+const SPARE_MAX: usize = 8192;
+const SPARE_FRAMES: u64 = 3;
+
+fn take_spare(capacity: u64) -> Option<Spare> {
+    let now = crate::queue::presented();
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    let at = spare
+        .iter()
+        .position(|s| s.capacity == capacity && s.frame + SPARE_FRAMES <= now)?;
+    Some(spare.swap_remove(at))
+}
+
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        if self.spare_capacity == 0 {
+            return;
+        }
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.len() < SPARE_MAX {
+            spare.push(Spare {
+                capacity: self.spare_capacity,
+                buffer: self.buffer.clone(),
+                data: self.data as usize,
+                gpu: self.gpu,
+                state: self.state.load(std::sync::atomic::Ordering::Relaxed),
+                frame: crate::queue::presented(),
+            });
+        }
+    }
+}
 
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
@@ -219,6 +262,7 @@ impl Shadow {
             tracked: crate::watch::track(start as usize, len as usize, true),
             pending: Mutex::default(),
             before: Mutex::default(),
+            spare_capacity: 0,
         }
     }
 
@@ -551,7 +595,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     if let Some(Entry { shadow: Some(shadow), .. }) = removed {
         changed();
         if let Some(shadow) = Arc::into_inner(shadow) {
-            crate::host::retire(shadow.buffer);
+            crate::host::retire(shadow.buffer.clone());
         }
     }
 }
@@ -698,19 +742,31 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         map.retain(|_, w| w.strong_count() > 0);
         *prune_at = (2 * map.len()).max(1024);
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let capacity = len.next_power_of_two().max(256);
+    let mut shadow = match take_spare(capacity) {
+        Some(spare) => {
+            let shadow = Shadow::new(spare.buffer, spare.data as *mut u8, spare.gpu, address, len);
+            shadow.state.store(spare.state, std::sync::atomic::Ordering::Relaxed);
+            shadow
+        }
+        None => {
+            let (buffer, data) = host()?.shared_buffer(capacity)?;
+            crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            #[cfg(feature = "diagnostics")]
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                VIEWS[1].fetch_add(1, Relaxed);
+                VIEWS[2].fetch_add(len, Relaxed);
+                VIEWS[3].fetch_max(len, Relaxed);
+            }
+            Shadow::new(buffer, data, gpu, address, len)
+        }
+    };
+    shadow.spare_capacity = capacity;
+    let shadow = Arc::new(shadow);
     map.insert((address, len), Arc::downgrade(&shadow));
-    #[cfg(feature = "diagnostics")]
-    {
-        use std::sync::atomic::Ordering::Relaxed;
-        VIEWS[1].fetch_add(1, Relaxed);
-        VIEWS[2].fetch_add(len, Relaxed);
-        VIEWS[3].fetch_max(len, Relaxed);
-    }
     Some(shadow)
 }
 
