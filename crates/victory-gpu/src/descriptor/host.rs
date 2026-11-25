@@ -305,7 +305,7 @@ impl HostHeap {
     /// slots, whichever dynamic range this heap was made with.
     #[cfg(test)]
     pub(crate) fn pairs_start(&self) -> u32 {
-        self.pairs.lock().unwrap_or_else(|e| e.into_inner()).0
+        self.count + self.dynamic
     }
 
     /// `n` consecutive free dynamic slots (view heaps only), taken until
