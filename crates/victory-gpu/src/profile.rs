@@ -204,11 +204,11 @@ fn symbolize(addr: u64) -> String {
 
 fn run(period: Duration) {
     // SAFETY: symbol handling for our own process, used from this thread only.
-    unsafe {
+    let me = unsafe {
         SymSetOptions(0x2 | 0x4); // SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS
         SymInitialize(GetCurrentProcess(), std::ptr::null(), 1);
-    }
-    let me = unsafe { GetCurrentThreadId() };
+        GetCurrentThreadId()
+    };
     let mut threads: HashMap<u32, Tracked> = HashMap::new();
     let mut cache = HashMap::new();
     let (mut refreshed, mut second, mut reported) = (Instant::now() - Duration::from_secs(9), Instant::now(), Instant::now());
@@ -260,7 +260,7 @@ fn run(period: Duration) {
             }
         }
         for t in threads.values_mut() {
-            if t.cpu_ms_second < BUSY_MS && tick % 25 != 0 {
+            if t.cpu_ms_second < BUSY_MS && !tick.is_multiple_of(25) {
                 continue;
             }
             if let Some(stack) = capture(t.handle) {

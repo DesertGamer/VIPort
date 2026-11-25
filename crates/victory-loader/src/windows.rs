@@ -506,6 +506,7 @@ mod tests {
             dll_characteristics: 0,
             image_base: 0,
             size_of_image,
+            size_of_headers: 0,
             entry_rva: 0,
             stack_reserve: 0,
             stack_commit: 0,
@@ -781,7 +782,7 @@ mod tests {
             title.path().join("v.dll"),
         )
         .unwrap();
-        let loaded = load_title_dll("v.dll", title.path(), title.path(), &|_| true).unwrap();
+        let loaded = load_title_dll("v.dll", &[title.path()], title.path(), &|_| true).unwrap();
         assert_eq!(loaded.len(), 1);
         let image = &loaded[0].1;
         assert!(image.export("GetFileVersionInfoW").is_some());
@@ -822,20 +823,20 @@ mod tests {
         main.imports = vec![import("Late.dll", 0), import("LATE.DLL", 0)];
         main.delay_imports = vec![import("late.dll", 0)];
         let dlls =
-            load_title_dlls(&main, title.path(), cache.path(), &|dll| dll == "late.dll").unwrap();
+            load_title_dlls(&main, &[title.path()], cache.path(), &|dll| dll == "late.dll").unwrap();
         assert_eq!(dlls.len(), 1, "one mapping for three spellings");
         assert_eq!(dlls[0].0, "late.dll");
         assert!(dlls[0].1.export("GetFileVersionInfoW").is_some());
         // `wanted` refuses it, or the folder has no such file: nothing maps.
         assert!(
-            load_title_dlls(&main, title.path(), cache.path(), &|_| false)
+            load_title_dlls(&main, &[title.path()], cache.path(), &|_| false)
                 .unwrap()
                 .is_empty()
         );
         let mut absent = info(PAGE as u32);
         absent.imports = vec![import("absent.dll", 0)];
         assert!(
-            load_title_dlls(&absent, title.path(), cache.path(), &|_| true)
+            load_title_dlls(&absent, &[title.path()], cache.path(), &|_| true)
                 .unwrap()
                 .is_empty()
         );
