@@ -6608,6 +6608,73 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_cvt_f32_f64" => {
+                // Double to float in integer arithmetic (no 64-bit float on
+                // the host path): round to nearest even, overflow to
+                // infinity, NaN kept quiet, results below the float range
+                // flushed to signed zero (as the console flushes f32
+                // denormals by default).
+                let x = self.src64(inst, 0)?;
+                let (lo, hi) = self.split64(x);
+                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                let sign = {
+                    let m = k(self, 0x8000_0000);
+                    self.s.m.bin(c, Bin::And, hi, m)
+                };
+                let e = {
+                    let (k20, m) = (k(self, 20), k(self, 0x7FF));
+                    let t = self.s.m.bin(c, Bin::LShr, hi, k20);
+                    self.s.m.bin(c, Bin::And, t, m)
+                };
+                let m = {
+                    let (mh, k3, k29) = (k(self, 0xF_FFFF), k(self, 3), k(self, 29));
+                    let t = self.s.m.bin(c, Bin::And, hi, mh);
+                    let t = self.s.m.bin(c, Bin::Shl, t, k3);
+                    let u = self.s.m.bin(c, Bin::LShr, lo, k29);
+                    self.s.m.bin(c, Bin::Or, t, u)
+                };
+                let rest = {
+                    let r = k(self, 0x1FFF_FFFF);
+                    self.s.m.bin(c, Bin::And, lo, r)
+                };
+                // Normal: sign | (e - 896) << 23 | m, plus the rounding carry.
+                let (k896, k23, one, half) = (k(self, 896), k(self, 23), k(self, 1), k(self, 0x1000_0000));
+                let e32 = self.s.m.bin(c, Bin::Sub, e, k896);
+                let ebits = self.s.m.bin(c, Bin::Shl, e32, k23);
+                let bits = self.s.m.bin(c, Bin::Or, sign, ebits);
+                let bits = self.s.m.bin(c, Bin::Or, bits, m);
+                let above = self.s.m.cmp(c, pred::IUGT, rest, half);
+                let tie = self.s.m.cmp(c, pred::EQ, rest, half);
+                let odd = self.s.m.bin(c, Bin::And, m, one);
+                let k0 = k(self, 0);
+                let odd = self.s.m.cmp(c, pred::NE, odd, k0);
+                let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
+                let up = self.s.m.bin(c, Bin::Or, above, tie_up);
+                let zero = k(self, 0);
+                let carry = self.s.m.select(c, up, one, zero);
+                let normal = self.s.m.bin(c, Bin::Add, bits, carry);
+                // Exponent ranges, by the double's exponent: <= 896 to zero,
+                // >= 1151 to infinity, 0x7FF infinity or NaN.
+                let inf = {
+                    let i = k(self, 0x7F80_0000);
+                    self.s.m.bin(c, Bin::Or, sign, i)
+                };
+                let nan = {
+                    let q = k(self, 0x7FC0_0000);
+                    self.s.m.bin(c, Bin::Or, sign, q)
+                };
+                let mantissa = self.s.m.bin(c, Bin::Or, m, rest);
+                let has_mantissa = self.s.m.cmp(c, pred::NE, mantissa, zero);
+                let special = self.s.m.select(c, has_mantissa, nan, inf);
+                let (k7ff, k1151) = (k(self, 0x7FF), k(self, 1151));
+                let small = self.s.m.cmp(c, pred::IULE, e, k896);
+                let big = self.s.m.cmp(c, pred::IUGE, e, k1151);
+                let all = self.s.m.cmp(c, pred::EQ, e, k7ff);
+                let r = self.s.m.select(c, big, inf, normal);
+                let r = self.s.m.select(c, small, sign, r);
+                let r = self.s.m.select(c, all, special, r);
+                int(self, r)
+            }
             // An SGPR spilled to a VGPR lane and read back is the SGPR, in
             // every stage (in compute the VGPR's other lanes may hold what has
             // no host value, a descriptor's address say).
