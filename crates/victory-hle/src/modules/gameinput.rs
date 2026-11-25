@@ -1263,6 +1263,20 @@ mod host {
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
         hide_pads: bool,
+        hide_pads: bool,
+    }
+
+    impl Default for Host {
+        fn default() -> Self {
+            let hide_pads = std::env::var_os("VICTORY_NO_HOST_PAD").is_some();
+            if hide_pads {
+                tracing::info!("VICTORY_NO_HOST_PAD: ignoring XInput pads");
+            }
+            Host {
+                empty_until: [None; PADS],
+                hide_pads,
+            }
+        }
     }
 
     impl Default for Host {
