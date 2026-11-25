@@ -363,6 +363,18 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+fn video_memory(device: &ID3D12Device) -> Option<(u64, u64)> {
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).ok()?;
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        adapter
+            .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+            .ok()?;
+        Some((info.CurrentUsage, info.Budget))
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -3366,6 +3378,14 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
             );
+            if let Some((usage, budget)) = host().and_then(|h| video_memory(&h.device)) {
+                tracing::info!(
+                    "video memory: {:.0} MB in use of a {:.0} MB budget ({:.0} %)",
+                    usage as f64 / 1e6,
+                    budget as f64 / 1e6,
+                    usage as f64 * 100.0 / budget.max(1) as f64
+                );
+            }
             let (marked, made) = crate::descriptor::take_usage();
             tracing::info!(
                 "heap usage: {marked} heap slots marked read by shaders, {made} placed-texture views made for them (last 5 s); not made: {:?}, no heap {}; placed textures that failed to make: {}",
