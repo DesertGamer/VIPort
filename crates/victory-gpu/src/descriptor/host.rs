@@ -1119,6 +1119,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if address == 0 || size == 0 || size.checked_next_multiple_of(256).is_none() {
+                return None;
+            }
             // Constant buffers in the title's slots, through the heap itself
             // or a table, are read as raw buffers by translated shaders
             // (`victory_shader::emit`, "Constant buffers in the heap"): the
@@ -1502,6 +1505,27 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Zero-sized, null-address, and size-overflowing CBVs become valid null
+    /// constant buffer views instead of panicking or binding `SizeInBytes = 0`
+    /// with a non-null address.
+    #[test]
+    fn zero_sized_and_overflowing_cbvs_become_null_views() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let dummy = [0u8; 64];
+        let addr = dummy.as_ptr() as u64;
+        assert!(make(&View::Constant(0, 0), heap.cpu(0)).is_none());
+        assert!(make(&View::Constant(0, 256), heap.cpu(1)).is_none());
+        assert!(make(&View::Constant(addr, 0), heap.cpu(2)).is_none());
+        assert!(make(&View::Constant(addr, u32::MAX - 15), heap.cpu(3)).is_none());
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }

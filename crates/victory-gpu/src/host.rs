@@ -757,8 +757,14 @@ enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
-    /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
+    /// A copy of title memory into the list's own upload memory, with any
+    /// trailing padding up to `padded` bytes zeroed.
+    Fill {
+        dst: usize,
+        src: usize,
+        len: usize,
+        padded: usize,
+    },
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -1983,11 +1989,28 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.defer_fill_padded(dst, src, len, len);
+    }
+
+    /// Copies `len` bytes of title memory at `src` into the list's upload
+    /// memory at `dst` when the list is submitted, and zeroes any trailing
+    /// padding bytes up to `padded`.
+    pub(crate) fn defer_fill_padded(
+        &self,
+        dst: *mut u8,
+        src: *const u8,
+        len: usize,
+        padded: usize,
+    ) {
+        let padded = padded.max(len);
         let mut deferred = self.deferred();
-        if deferred.first_fill(dst as usize, src as usize, len) {
-            deferred
-                .copies
-                .push(Step::Fill(dst as usize, src as usize, len));
+        if padded > len || deferred.first_fill(dst as usize, src as usize, len) {
+            deferred.copies.push(Step::Fill {
+                dst: dst as usize,
+                src: src as usize,
+                len,
+                padded,
+            });
         }
     }
 
@@ -2204,7 +2227,7 @@ impl HostList {
                 std::time::Instant::now(),
                 match step {
                     Step::Refresh(..) => C::StepRefreshUs,
-                    Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
+                    Step::Copy(..) | Step::Fill { .. } => C::StepCopyUs,
                     Step::Run(_) | Step::Host(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
                     Step::Texture(_) => C::StepTextureUs,
@@ -2224,30 +2247,44 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
-                &Step::Fill(dst, src, len) => {
+                &Step::Fill {
+                    dst,
+                    src,
+                    len,
+                    padded,
+                } => {
                     started = std::time::Instant::now();
-                    let fill = |dst: usize, src: usize, len: usize| {
+                    let fill = |dst: usize, src: usize, len: usize, padded: usize| {
                         #[cfg(feature = "diagnostics")]
                         {
                             add(C::Copies, 1);
                             add(C::CopyBytes, len as u64);
                         }
                         copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                        if padded > len {
+                            // SAFETY: `dst` is the list's mapped upload memory of
+                            // at least `padded` bytes.
+                            unsafe { (dst as *mut u8).add(len).write_bytes(0, padded - len) };
+                        }
                         len
                     };
-                    let mut copied = if batch.fill_due(dst, src, len) {
-                        fill(dst, src, len)
+                    let mut copied = if padded > len || batch.fill_due(dst, src, len) {
+                        fill(dst, src, len, padded)
                     } else {
                         0
                     };
                     // A run of fills (a list's constant buffers, mostly a
                     // few hundred bytes each) is timed as one: reading the
                     // clock around each would cost as much as the copies.
-                    while let Some(&Step::Fill(dst, src, len)) =
-                        steps.next_if(|s| matches!(s, Step::Fill(..)))
+                    while let Some(&Step::Fill {
+                        dst,
+                        src,
+                        len,
+                        padded,
+                    }) = steps.next_if(|s| matches!(s, Step::Fill { .. }))
                     {
-                        if batch.fill_due(dst, src, len) {
-                            copied += fill(dst, src, len);
+                        if padded > len || batch.fill_due(dst, src, len) {
+                            copied += fill(dst, src, len, padded);
                         }
                     }
                     copied
