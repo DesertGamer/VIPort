@@ -289,6 +289,17 @@ fn v_cndmask_accepts_uniform_and_constant_masks() {
     lowers(&words, 0x8001).unwrap();
 }
 
+#[test]
+fn signed_nibble_dot_products_decode_and_lower() {
+    let dot = [0xCC18_4001u32, 0x100 | 0x100 << 9 | 0x100 << 18 | 3 << 27];
+    let program = |dot: [u32; 2]| [dot[0], dot[1], 0xD834_0000, 0x0000_0100, S_ENDPGM];
+    let code: Vec<u8> = program(dot).iter().flat_map(|w| w.to_le_bytes()).collect();
+    let decoded = crate::gfx10::decode(&code).unwrap();
+    assert_eq!(decoded[0].name(), Some("v_dot8_i32_i4"));
+    lowers(&program(dot), 1 << 15).unwrap();
+    assert!(lowers(&program([dot[0] | 1 << 15, dot[1]]), 1 << 15).is_err());
+}
+
 fn perm_features(selector: u32) -> u64 {
     // Synthetic compute shader:
     // v0 is the thread ID and can supply a dynamic selector.
