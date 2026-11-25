@@ -797,7 +797,9 @@ impl HostPipeline {
         } else {
             super::library::pipeline(
                 &name,
+                // SAFETY: `desc` describes a whole stream that outlives the call.
                 |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
+                // SAFETY: as above.
                 || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
             )
         };
@@ -1203,17 +1205,21 @@ mod tests {
         let mut g = GraphicsState::default();
         let plain = g.describe();
         let with_bounds = Subobject(21, depth_stream(true));
+        // SAFETY: a whole subobject of type 21 on the stack.
         unsafe { g.read(21, (&raw const with_bounds).cast()) };
         assert!(g.depth_bounds);
         assert!(g.depth1().DepthBoundsTestEnable.as_bool());
         assert!(!g.depth1().DepthEnable.as_bool());
         assert_ne!(g.describe(), plain);
         let without = Subobject(21, depth_stream(false));
+        // SAFETY: as above.
         unsafe { g.read(21, (&raw const without).cast()) };
         assert!(!g.depth_bounds);
         let again = Subobject(21, depth_stream(true));
+        // SAFETY: as above.
         unsafe { g.read(21, (&raw const again).cast()) };
         let plain_depth = Subobject(11, GraphicsState::default().depth);
+        // SAFETY: a whole subobject of type 11 on the stack.
         unsafe { g.read(11, (&raw const plain_depth).cast()) };
         assert!(!g.depth_bounds);
         assert!(!g.depth1().DepthBoundsTestEnable.as_bool());
@@ -1258,11 +1264,13 @@ mod tests {
         padding.push(depth_data + depth.start..depth_data + depth.end);
         let ptr = std::ptr::from_mut(&mut stream).cast::<u8>();
         for range in &padding {
+            // SAFETY: each padding range lies inside `stream`.
             unsafe { ptr.add(range.start).write_bytes(0xaa, range.len()) };
         }
         stream.clear_padding();
         let ptr = std::ptr::from_ref(&stream).cast::<u8>();
         for range in padding {
+            // SAFETY: as above.
             let bytes = unsafe { std::slice::from_raw_parts(ptr.add(range.start), range.len()) };
             assert!(bytes.iter().all(|&b| b == 0), "uncleared padding {range:?}: {bytes:?}");
         }

@@ -838,6 +838,7 @@ pub(crate) mod tests {
         let (a, b) = twin_views(2);
         let t = track(a, 2 * PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+        // SAFETY: committed views of the test's pages.
         unsafe { ((b + PAGE + 4) as *mut u32).write_volatile(7) };
         assert!(t.changed(a / PAGE + 1) && !t.changed(a / PAGE));
         assert!(guards().protected.contains(&(a / PAGE + 1)));
@@ -853,12 +854,16 @@ pub(crate) mod tests {
         let (a, b) = twin_views(2);
         let t = track(a, 2 * PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+        // SAFETY: as above.
         unsafe { ((b + 4) as *mut u32).write_volatile(1) };
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+        // SAFETY: as above.
         unsafe { ((a + 8) as *mut u32).write_volatile(2) };
         assert!(t.changed(a / PAGE));
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+        // SAFETY: as above.
         assert_eq!(unsafe { ((b + 8) as *const u32).read_volatile() }, 2);
+        // SAFETY: as above.
         assert_eq!(unsafe { ((a + 4) as *const u32).read_volatile() }, 1);
     }
 
@@ -887,6 +892,7 @@ pub(crate) mod tests {
         let started = std::time::Instant::now();
         for i in 0..PAGES {
             let at = if i % 2 == 0 { b } else { c };
+            // SAFETY: committed views of the test's pages.
             unsafe { ((at + i * PAGE + 4) as *mut u32).write_volatile(i as u32) };
         }
         let writes = started.elapsed();
@@ -898,6 +904,7 @@ pub(crate) mod tests {
         let again = open_pages(&views, PAGES);
         let started = std::time::Instant::now();
         for i in 0..PAGES {
+            // SAFETY: as above.
             unsafe { ((a + i * PAGE + 8) as *mut u32).write_volatile(i as u32) };
         }
         let direct = started.elapsed();
@@ -915,8 +922,10 @@ pub(crate) mod tests {
         let (a, b) = twin_views(2);
         let t = track(a, 2 * PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+        // SAFETY: committed views of the test's pages.
         unsafe { ((b + PAGE + 4) as *mut u32).write_volatile(7) };
         assert_eq!(t.take(a, a + 2 * PAGE), [(a + PAGE, a + 2 * PAGE)]);
+        // SAFETY: as above.
         assert_eq!(unsafe { ((a + PAGE + 4) as *const u32).read_volatile() }, 7);
         drop(writing(b, 8));
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
@@ -925,6 +934,7 @@ pub(crate) mod tests {
         let (c, _) = twin_views(1);
         title_memory_aliased(c, &[a]);
         // takes it for `a`'s pages here).
+        // SAFETY: a committed view of the test's pages.
         unsafe { (c as *mut u32).write_volatile(1) };
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
     }
@@ -934,6 +944,7 @@ pub(crate) mod tests {
         let (a, b) = twin_views(1);
         let t = track(a, PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        // SAFETY: a committed view of the test's pages.
         unsafe { ((b + 8) as *mut u8).write_volatile(0x22) };
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         title_memory_written(b, PAGE);

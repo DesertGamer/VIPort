@@ -35,6 +35,9 @@ enum Val {
 /// properties.
 type HandleKey = (usize, Site, u8, bool, (u32, u32));
 type MarkKey = (V, u32, Option<V>, bool);
+/// What a heap index was made from: the descriptor base, the constant byte
+/// offset and the `soffset` value, if any.
+type HeapKey = (V, u32, Option<V>);
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
@@ -102,10 +105,12 @@ enum Stop {
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let compute = matches!(parts.native.io, StageIo::Cs(_));
-    if compute && parts.native.wave64 && super::wave64_on_32() {
-        if let Ok(lowered) = lower_with(parts, true) {
-            return Ok(lowered);
-        }
+    if compute
+        && parts.native.wave64
+        && super::wave64_on_32()
+        && let Ok(lowered) = lower_with(parts, true)
+    {
+        return Ok(lowered);
     }
     lower_with(parts, false)
 }
@@ -6149,7 +6154,7 @@ impl<'a> Lower<'a> {
         load: Site,
         first: u8,
         sampler: bool,
-    ) -> Result<(V, (V, u32, Option<V>)), Why> {
+    ) -> Result<(V, HeapKey), Why> {
         let a = *self
             .scalar
             .get(&load)

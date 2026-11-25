@@ -629,6 +629,7 @@ extern "system" fn copy_texture_region(
                 list.defer_host(move || {
                     let mut guest = vec![0; bytes as usize];
                     crate::host::copy_mapped(guest.as_mut_ptr(), data as *const u8, guest.len(), false);
+                    // SAFETY: the list's mapped upload buffer, `host_bytes` long, alive until the list has run.
                     let rgba = unsafe { std::slice::from_raw_parts_mut(staging as *mut u8, host_bytes as usize) };
                     for (src, dst) in guest.chunks(title_pitch).zip(rgba.chunks_mut(host_pitch)) {
                         crate::texture::expand_row(format, &src[..row], dst);
@@ -774,6 +775,7 @@ fn read_back_texture(
         let row = footprint.width as usize * 2;
         let (target, len) = (target as usize, bytes as usize);
         list.read_back_with(host, host_bytes, move |data| {
+            // SAFETY: mapped read-back memory of `host_bytes`, and the title's `len` bytes at `target`.
             let (rgba, title) = unsafe {
                 (
                     std::slice::from_raw_parts(data, host_bytes as usize),
@@ -1992,23 +1994,28 @@ mod tests {
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
             VirtualFree, VirtualProtect,
         };
+        // SAFETY: plain allocation, freed at the end of the test.
         let page = unsafe {
             VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
         }
         .cast::<u8>();
         assert!(!page.is_null());
+        // SAFETY: the first 16 bytes of that allocation.
         unsafe { (0..16).for_each(|i| page.add(i).write(i as u8)) };
         let at = page as usize;
         copy_title_memory(at + 4, at, 8);
+        // SAFETY: as above.
         let moved: Vec<u8> = (0..16).map(|i| unsafe { page.add(i).read() }).collect();
         assert_eq!(moved, [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15]);
         let mut old = 0;
         assert!(
+            // SAFETY: the second page of that allocation; `old` is a valid out pointer.
             unsafe { VirtualProtect(page.add(4096).cast(), 4096, PAGE_READONLY, &mut old) } != 0
         );
         copy_title_memory(at + 4096, at, 8);
         copy_title_memory(at, at, usize::MAX / 4);
         copy_title_memory(at, at, usize::MAX);
+        // SAFETY: the allocation made above, freed once.
         unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
     }
 

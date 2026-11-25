@@ -1713,6 +1713,7 @@ mod tests {
         window.bytes().fill(5);
         drop(window);
         assert!(REPORTED.with(|r| r.borrow().is_empty()));
+        // SAFETY: the view the test mapped, still mapped.
         assert_eq!(unsafe { a.cast::<u8>().read() }, 5);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
