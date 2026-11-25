@@ -404,6 +404,12 @@ fn wave_lanes_unsupported(
     }
 }
 
+fn mesh_runs_on_host_waves(ms: &Shader, (_, host_max): (u32, u32)) -> bool {
+    viport_shader::emit::mesh64_on_32()
+        && (32..64).contains(&host_max)
+        && ms.translated().is_some()
+}
+
 /// Returns a human-readable refusal reason when [`wave_lanes_unsupported`]
 /// holds: reports the emitted `PSV0` and host wave-lane ranges when `PSV0`
 /// provides them, and retains the console 64-lane message when `PSV0` is `None`.
@@ -487,15 +493,22 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         let host_lanes = host()?.wave_lanes();
+        let mesh_on_host_waves = mesh.is_some_and(|ms| mesh_runs_on_host_waves(ms, host_lanes));
         if let Some(ms) = mesh
-            && let Some(reason) = wave_lanes_refusal(ms.stage, ms.wave64(), None, host_lanes)
+            && let Some(reason) = wave_lanes_refusal(
+                ms.stage,
+                ms.wave64() && !mesh_on_host_waves,
+                None,
+                host_lanes,
+            )
         {
             return refuse(&reason, shaders);
         }
         for (s, _) in &stages {
             let t = s.translated()?;
             let emitted = dxil_wave_lanes(&t.host.dxil);
-            if let Some(reason) = wave_lanes_refusal(s.stage, s.wave64(), emitted, host_lanes) {
+            let wave64 = s.wave64() && !(s.stage == "mesh" && mesh_on_host_waves);
+            if let Some(reason) = wave_lanes_refusal(s.stage, wave64, emitted, host_lanes) {
                 return refuse(&reason, shaders);
             }
         }

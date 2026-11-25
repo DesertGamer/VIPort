@@ -1,7 +1,7 @@
 //! The offline batch: every shader found goes through the translator, and
 //! what it cannot handle yet is tallied (decision 0003).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +13,8 @@ use viport_shader::structure::{self, Atom, LaneExit};
 use viport_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
 };
+use viport_shader::gfx10::Fields;
+use viport_shader::native::StageIo;
 use viport_shader::{io, resource};
 
 use crate::shader::{MAX_FILE, Source, sources};
@@ -491,7 +493,19 @@ fn translate(
         return t.fail("corrupt record".into(), location);
     };
     let list = t.list;
-    let hash = list.then(|| blake3::hash(&bytes).to_hex().to_string());
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("VIPORT_TRANSLATE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    let hash = (list || !only.is_empty()).then(|| blake3::hash(&bytes).to_hex().to_string());
+    if !only.is_empty() && !hash.as_ref().is_some_and(|h| only.iter().any(|o| h.starts_with(o.as_str()))) {
+        return;
+    }
     let example = || {
         let location = location();
         match &hash {
@@ -578,7 +592,22 @@ fn translate(
                     }
                 };
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
-                    let label = || format!("{} {:?}", example(), p.stage);
+                    let lane_ops = if t.list && p.stage == HwStage::Ms {
+                        mesh_lane_ops(&program)
+                    } else {
+                        String::new()
+                    };
+                    let label = || match &p.io {
+                        StageIo::Ms(ms) => format!(
+                            "{} {:?} wave64={} threads={} lds={} ops=[{lane_ops}]",
+                            example(),
+                            p.stage,
+                            p.wave64,
+                            ms.threads,
+                            ms.lds_bytes
+                        ),
+                        _ => format!("{} {:?}", example(), p.stage),
+                    };
                     *counter(t, p.stage, 0) += 1;
                     match emit::emit(&container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
@@ -604,6 +633,34 @@ fn translate(
     }
 }
 
+fn mesh_lane_ops(program: &ir::Program) -> String {
+    let mut found = BTreeSet::new();
+    for i in program.blocks.iter().flat_map(|b| &b.insts) {
+        let n = i.name();
+        let kind = if n.starts_with("ds_swizzle") {
+            "swizzle"
+        } else if n.contains("permute") {
+            "permute"
+        } else if n.starts_with("v_mbcnt") {
+            "mbcnt"
+        } else if matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some()) {
+            "dpp"
+        } else if matches!(n, "v_readlane_b32" | "v_writelane_b32") {
+            "lane"
+        } else if n == "v_readfirstlane_b32" {
+            "firstlane"
+        } else if n.starts_with("s_bcnt1") {
+            "bcnt"
+        } else if n.starts_with("s_ff1") || n.starts_with("s_flbit") || n.starts_with("s_ff0") {
+            "ff1"
+        } else {
+            continue;
+        };
+        found.insert(kind);
+    }
+    found.into_iter().collect::<Vec<_>>().join(",")
+}
+
 /// Validates an emitted shader if asked to.
 fn check(
     mut shader: emit::HostShader,
@@ -626,6 +683,13 @@ fn check(
             format!("{dir}/{}.dxil", &name[name.len().saturating_sub(100)..]),
             &shader.dxil,
         );
+    }
+    if t.list && shader.stage == HwStage::Ms {
+        let wave_ops = Container::parse(&shader.dxil)
+            .ok()
+            .and_then(|c| c.part(FourCC::SFI0)?.data.get(..4)?.try_into().ok())
+            .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x4000 != 0);
+        t.lines.push(format!("{}  mesh waveops={wave_ops}", label()));
     }
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {

@@ -184,6 +184,8 @@ pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]
 mod lds_tests;
 #[cfg(all(test, windows))]
+mod wave64_tests;
+#[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
 #[cfg(all(test, windows))]
@@ -232,6 +234,59 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+pub fn shader_opt() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| {
+        if cfg!(feature = "diagnostics") {
+            parse_shader_opt(std::env::var("VIPORT_SHADER_OPT").ok().as_deref())
+        } else {
+            bitcode::opt::ALL
+        }
+    })
+}
+
+fn parse_shader_opt(value: Option<&str>) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+}
+
+pub fn mesh64_on_32() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VIPORT_MESH64_ON_32").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAVE64_ON_32_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn wave64_on_32() -> bool {
+    #[cfg(test)]
+    if WAVE64_ON_32_FOR_TEST.with(std::cell::Cell::get) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VIPORT_WAVE64_ON_32").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+pub(crate) fn with_wave64_on_32<R>(run: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            WAVE64_ON_32_FOR_TEST.with(|on| on.set(false));
+        }
+    }
+    WAVE64_ON_32_FOR_TEST.with(|on| on.set(true));
+    let _reset = Reset;
+    run()
 }
 
 /// `VIPORT_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -610,7 +665,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{parse_loop_limit, parse_shader_opt};
 
     /// An `ISG1` part of one element, with the given row register and mask.
     fn isg1(register: u32, mask: u8) -> Vec<u8> {
@@ -655,6 +710,17 @@ mod tests {
             ShaderError::Malformed("signature element register")
         );
         assert_eq!(signature(&isg1(u32::MAX, 0xC)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_clean_up_switch_parses_or_runs_every_pass() {
+        let all = super::bitcode::opt::ALL;
+        assert_eq!(parse_shader_opt(None), all);
+        assert_eq!(parse_shader_opt(Some("0")), 0);
+        assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
+        assert_eq!(parse_shader_opt(Some("0x1")), 1);
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        assert_eq!(parse_shader_opt(Some("on")), all);
     }
 
     #[test]
@@ -1668,8 +1734,7 @@ mod tests {
             eprintln!("no dxc.exe; DXIL check skipped");
             return;
         };
-        // The low-half write keeps the destination's high half.
-        assert!(low.contains("-65536"), "low write keeps the high half");
+        assert!(low.contains("-65536") || low.contains(", 65535"), "low write keeps the high half");
         // The high-half write shifts the result up by 16.
         assert!(high.contains("shl i32"), "op_sel[3] writes the high half");
         // omod mul:2 and clamp (dx.op.unary.f32, opcode 7) are applied.

@@ -71,18 +71,39 @@ fn build() -> &'static [u8; 32] {
                 "VIPORT_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(viport_shader::SOURCE_HASH, ENCODING, limit)
+        key(
+            viport_shader::SOURCE_HASH,
+            ENCODING,
+            limit,
+            viport_shader::emit::shader_opt(),
+            viport_shader::emit::mesh64_on_32(),
+            viport_shader::emit::wave64_on_32(),
+        )
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(
+    translator: &str,
+    encoding: &[u8],
+    limit: u32,
+    passes: u32,
+    mesh64_on_32: bool,
+    wave64_on_32: bool,
+) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&passes.to_le_bytes());
+    if mesh64_on_32 {
+        h.update(b"mesh64_on_32");
+    }
+    if wave64_on_32 {
+        h.update(b"wave64_on_32");
+    }
     *h.finalize().as_bytes()
 }
 
@@ -536,17 +557,27 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, 31, false, false);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, 31, false, false));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, 31, false, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, 31, false, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, 31, false, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 0, false, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 31, true, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 31, false, true));
+        assert_ne!(
+            key("0123456789abcdef", b"encoding", 1 << 20, 31, true, false),
+            key("0123456789abcdef", b"encoding", 1 << 20, 31, false, true)
+        );
         assert_eq!(
             *build(),
             key(
                 viport_shader::SOURCE_HASH,
                 ENCODING,
-                viport_shader::emit::loop_limit()
+                viport_shader::emit::loop_limit(),
+                viport_shader::emit::shader_opt(),
+                viport_shader::emit::mesh64_on_32(),
+                viport_shader::emit::wave64_on_32()
             )
         );
         // The encoding part is this file as built.

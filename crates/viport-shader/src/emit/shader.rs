@@ -113,6 +113,7 @@ pub(crate) struct Shader {
     pub nonuniform_handles: u32,
     /// Prefix min/max scans lowered in place of `wavePrefixOp` kinds 2 and 3.
     pub prefix_scans: u32,
+    pub group_barriers: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -197,6 +198,7 @@ impl Shader {
             fused: false,
             nonuniform_handles: 0,
             prefix_scans: 0,
+            group_barriers: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -582,6 +584,23 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        let passes = super::shader_opt();
+        if passes != 0 {
+            self.m.optimise(passes);
+            let used = self.m.usage();
+            for (flag, used) in [
+                (flags::WAVE_OPS, used.wave_ops),
+                (flags::INT64, used.int64),
+                (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
+                (flags::RESOURCE_HEAP, used.heap_views),
+                (flags::SAMPLER_HEAP, used.heap_samplers),
+                (flags::ATOMIC64_TYPED | flags::ATOMIC64_HEAP, used.atomic64),
+            ] {
+                if !used {
+                    self.flags &= !flag;
+                }
+            }
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
