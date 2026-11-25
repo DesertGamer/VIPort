@@ -727,7 +727,10 @@ impl State {
                             };
                             match offset {
                                 Some(offset) => offset,
-                                None => return false,
+                                None => {
+                                    not_run("root view offset without a title copy");
+                                    return false;
+                                }
                             }
                         }
                         None if is_root_view(u) => {
@@ -905,20 +908,29 @@ impl State {
             once!(slot, "a shader reads a root view the title did not set: dropped");
             return None;
         };
-        let shadow = crate::shadow::find(address, 1)?;
-        let offset = u32::try_from(shadow.offset(address)).ok()?;
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            not_run("root view address without a title copy");
+            return None;
+        };
+        let Ok(offset) = u32::try_from(shadow.offset(address)) else {
+            not_run("root view offset beyond 32 bits");
+            return None;
+        };
         shadow.refresh(list, address, shadow.left(address));
         if uav {
             let full = shadow.left(address).min(1 << 20);
             let key = crate::shadow::write_key(name, slot);
             shadow.gpu_writes_keyed(list, address, crate::shadow::write_extent(key, full), key);
         }
-        let (key, host) = match self.heaps[0] {
-            0 => (MEMORY_HEAP, crate::memory::heap()?),
-            h => (
-                std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
-                crate::descriptor::heap(h as This).host()?,
-            ),
+        let heap = match self.heaps[0] {
+            0 => crate::memory::heap().map(|host| (MEMORY_HEAP, host)),
+            h => crate::descriptor::heap(h as This)
+                .host()
+                .map(|host| (std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize, host)),
+        };
+        let Some((key, host)) = heap else {
+            not_run("root view without a host view heap");
+            return None;
         };
         let copy = std::sync::Arc::as_ptr(&shadow) as usize;
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
