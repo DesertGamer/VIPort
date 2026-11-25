@@ -341,7 +341,7 @@ mod tests {
     #[test]
     fn counter_enum_matches_array_length() {
         assert_eq!(C::Submissions as usize, 0);
-        assert_eq!(C::TexChanged as usize + 1, COUNTERS);
+        assert_eq!(C::CompareUs as usize + 1, COUNTERS);
     }
 
     #[test]
