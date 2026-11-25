@@ -777,6 +777,29 @@ type Resolved = (ID3D12Resource, Vec<Target>);
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
+/// Half-open intervals overlap when each begins before the other ends.
+fn ranges_overlap(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.0 < b.1 && b.0 < a.1
+}
+
+/// Records copying `src[..len]` into upload `dst` if the identical fill is not
+/// already cached; evicts any prior fill whose upload destination overlaps.
+fn record_fill(
+    fills: &mut std::collections::HashSet<(usize, usize, usize)>,
+    dst: usize,
+    src: usize,
+    len: usize,
+) -> bool {
+    if fills.contains(&(dst, src, len)) {
+        return false;
+    }
+    fills.retain(|&(d, _, l)| {
+        !ranges_overlap((d, d.saturating_add(l)), (dst, dst.saturating_add(len)))
+    });
+    fills.insert((dst, src, len));
+    true
+}
+
 #[derive(Default)]
 struct Deferred {
     /// Destination, source, bytes.
@@ -786,9 +809,12 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
-    /// Buffer ranges refreshed since the last title copy (host copy,
+    /// Buffer ranges refreshed since the last overlapping title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Upload fills recorded since the last overlapping title write or upload
+    /// overwrite (upload dst, title src, bytes).
+    fills: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -811,6 +837,32 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+}
+
+impl Deferred {
+    /// Whether a fill of upload memory at `dst` from title memory at `src`
+    /// (`len` bytes) still needs recording.
+    fn first_fill(&mut self, dst: usize, src: usize, len: usize) -> bool {
+        record_fill(&mut self.fills, dst, src, len)
+    }
+
+    /// Invalidates cached refreshes and upload fills whose title source range
+    /// overlaps `[from, to)` (or all when `written` is `None`).
+    fn title_written(&mut self, written: Option<(usize, usize)>) {
+        match written {
+            None => {
+                self.refreshed.clear();
+                self.fills.clear();
+            }
+            Some((from, to)) if from < to => {
+                self.refreshed
+                    .retain(|&(_, addr, len)| !ranges_overlap((addr, addr.saturating_add(len)), (from, to)));
+                self.fills
+                    .retain(|&(_, src, len)| !ranges_overlap((src, src.saturating_add(len)), (from, to)));
+            }
+            Some(_) => {}
+        }
+    }
 }
 
 impl Host {
@@ -1832,15 +1884,19 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        let start = dst as usize;
+        deferred.title_written(Some((start, start.saturating_add(len))));
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+        let mut deferred = self.deferred();
+        if deferred.first_fill(dst as usize, src as usize, len) {
+            deferred
+                .copies
+                .push(Step::Fill(dst as usize, src as usize, len));
+        }
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -1879,7 +1935,7 @@ impl HostList {
     /// date at submission (once until a title copy intervenes).
     pub(crate) fn defer_heap(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
+        let key = (std::sync::Arc::as_ptr(viewed) as usize, 0, usize::MAX);
         if deferred.refreshed.insert(key) {
             deferred.copies.push(Step::Heap(viewed.clone()));
         }
@@ -2025,8 +2081,9 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_written(None);
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -2071,7 +2128,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_written(Some((dst, dst.saturating_add(len))));
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -2086,14 +2143,20 @@ impl HostList {
                         copy_mapped(dst as *mut u8, src as *const u8, len, false);
                         len
                     };
-                    let mut copied = fill(dst, src, len);
+                    let mut copied = if batch.fill_due(dst, src, len) {
+                        fill(dst, src, len)
+                    } else {
+                        0
+                    };
                     // A run of fills (a list's constant buffers, mostly a
                     // few hundred bytes each) is timed as one: reading the
                     // clock around each would cost as much as the copies.
                     while let Some(&Step::Fill(dst, src, len)) =
                         steps.next_if(|s| matches!(s, Step::Fill(..)))
                     {
-                        copied += fill(dst, src, len);
+                        if batch.fill_due(dst, src, len) {
+                            copied += fill(dst, src, len);
+                        }
                     }
                     copied
                 }
@@ -2108,7 +2171,7 @@ impl HostList {
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                        batch.title_written(None);
                     }
                     #[cfg(feature = "diagnostics")]
                     let run = std::time::Instant::now();
@@ -2127,7 +2190,7 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
+                    if batch.texture_due(staging, staging.title_range()) {
                         staging.refresh();
                     }
                     continue;
@@ -2195,11 +2258,15 @@ struct Batch {
     refreshes: Vec<Refresh>,
     /// Where each copy's refresh is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
-    /// The ranges of each copy brought up to date since the last title
-    /// write, by copy (held, so that its address names no other).
+    /// The ranges of each copy brought up to date since the last overlapping
+    /// title write, by copy (held, so that its address names no other).
     current: std::collections::HashMap<usize, Refresh>,
-    /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    /// Staging buffers (by address) mapped to their title `[start, end)` range
+    /// refreshed since the last overlapping title write.
+    textures: std::collections::HashMap<usize, (usize, usize)>,
+    /// Upload fills already copied in this submission since the last overlapping
+    /// title write or upload overwrite (`(upload_dst, title_src, len)`).
+    fills: std::collections::HashSet<(usize, usize, usize)>,
 }
 
 impl Batch {
@@ -2227,18 +2294,80 @@ impl Batch {
         }
     }
 
-    /// Whether `staging` is still to be refreshed in this submission (and
-    /// notes it refreshed).
-    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+    /// Whether `staging` (covering title bytes `[range.0, range.1)`) is still
+    /// to be refreshed in this submission (and notes it refreshed).
+    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>, range: (usize, usize)) -> bool {
+        self.textures
+            .insert(std::sync::Arc::as_ptr(staging) as *const () as usize, range)
+            .is_none()
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
-    fn title_written(&mut self) {
-        self.flush();
-        self.textures.clear();
-        self.current.clear();
+    /// Whether an upload fill `(dst, src, len)` is still to be copied in this
+    /// submission (and notes it copied).
+    fn fill_due(&mut self, dst: usize, src: usize, len: usize) -> bool {
+        record_fill(&mut self.fills, dst, src, len)
+    }
+
+    /// Before a step that writes title memory (`written` if bounded, `None` if
+    /// unknown): overlapping pending refreshes flush first, and overlapping
+    /// texture checks and cached upload fills are invalidated.
+    fn title_written(&mut self, written: Option<(usize, usize)>) {
+        match written {
+            None => {
+                self.flush();
+                self.textures.clear();
+                self.current.clear();
+                self.fills.clear();
+            }
+            Some((from, to)) if from < to => {
+                self.pending.clear();
+                let pending = std::mem::take(&mut self.refreshes);
+                for (shadow, ranges) in pending {
+                    let mut kept = Vec::with_capacity(ranges.len());
+                    let mut flush = Vec::new();
+                    for range in ranges {
+                        if ranges_overlap(range, (from, to)) {
+                            flush.push(range);
+                        } else {
+                            kept.push(range);
+                        }
+                    }
+                    coalesce_ranges(&mut flush, COALESCE_GAP);
+                    for &(flush_from, flush_to) in &flush {
+                        Self::flush_one(&shadow, flush_from, flush_to);
+                    }
+                    if !kept.is_empty() {
+                        self.pending.insert(
+                            std::sync::Arc::as_ptr(&shadow) as usize,
+                            self.refreshes.len(),
+                        );
+                        self.refreshes.push((shadow, kept));
+                    }
+                }
+                self.current.retain(|_, current| {
+                    current
+                        .1
+                        .retain(|&(a, b)| !ranges_overlap((a, b), (from, to)));
+                    !current.1.is_empty()
+                });
+                self.textures
+                    .retain(|_, range| !ranges_overlap(*range, (from, to)));
+                self.fills
+                    .retain(|&(_, src, len)| !ranges_overlap((src, src.saturating_add(len)), (from, to)));
+            }
+            Some(_) => {}
+        }
+    }
+
+    fn flush_one(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> usize {
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        copied
     }
 
     /// Does the refreshes; returns the bytes copied.
@@ -2253,14 +2382,7 @@ impl Batch {
                 continue;
             }
             for &(from, to) in &ranges {
-                let started = std::time::Instant::now();
-                let copied = shadow.update(from, to - from);
-                let us = started.elapsed().as_micros() as u64;
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::range(from, to - from, us, 0);
-                PREPARING[0].fetch_add(us, Ordering::Relaxed);
-                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-                total += copied;
+                total += Self::flush_one(&shadow, from, to);
             }
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
             let (_, kept) = self
@@ -3172,7 +3294,7 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::{Batch, COALESCE_GAP, coalesce_ranges};
+    use super::{Batch, COALESCE_GAP, Deferred, coalesce_ranges};
     use std::sync::Arc;
 
     #[test]
@@ -3180,28 +3302,72 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let mut batch = Batch::default();
         let (a, b) = (Arc::new([0u8; 16]), Arc::new([0u8; 16]));
         // The first list sampling each texture checks it ...
-        assert!(batch.texture_due(&a));
-        assert!(batch.texture_due(&b));
+        assert!(batch.texture_due(&a, (0x1000, 0x2000)));
+        assert!(batch.texture_due(&b, (0x3000, 0x4000)));
         // ... later lists of the same submission do not.
-        assert!(!batch.texture_due(&a));
-        assert!(!batch.texture_due(&a.clone()));
-        assert!(!batch.texture_due(&b));
+        assert!(!batch.texture_due(&a, (0x1000, 0x2000)));
+        assert!(!batch.texture_due(&a.clone(), (0x1000, 0x2000)));
+        assert!(!batch.texture_due(&b, (0x3000, 0x4000)));
     }
 
     #[test]
     fn title_writes_make_textures_due_again() {
         let mut batch = Batch::default();
         let a = Arc::new(1u32);
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
+        assert!(batch.texture_due(&a, (0x1000, 0x2000)));
+        assert!(!batch.texture_due(&a, (0x1000, 0x2000)));
         // A copy into title memory or work that may write it may have
         // changed the texture's memory.
-        batch.title_written();
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
+        batch.title_written(None);
+        assert!(batch.texture_due(&a, (0x1000, 0x2000)));
+        assert!(!batch.texture_due(&a, (0x1000, 0x2000)));
         // A fresh submission starts over.
         let mut next = Batch::default();
-        assert!(next.texture_due(&a));
+        assert!(next.texture_due(&a, (0x1000, 0x2000)));
+    }
+
+    #[test]
+    fn disjoint_title_copy_preserves_unrelated_textures() {
+        let mut batch = Batch::default();
+        let (a, b) = (Arc::new(1u32), Arc::new(2u32));
+        assert!(batch.texture_due(&a, (0x1000, 0x2000)));
+        assert!(batch.texture_due(&b, (0x5000, 0x6000)));
+        // Writing [0x1800, 0x2800) overlaps `a` but not `b`.
+        batch.title_written(Some((0x1800, 0x2800)));
+        assert!(batch.texture_due(&a, (0x1000, 0x2000)));
+        assert!(!batch.texture_due(&b, (0x5000, 0x6000)));
+    }
+
+    #[test]
+    fn upload_fill_dedup_respects_overlapping_writes_and_dst_overwrite() {
+        let mut batch = Batch::default();
+        assert!(batch.fill_due(0x1000, 0xA000, 64));
+        assert!(!batch.fill_due(0x1000, 0xA000, 64));
+        // Overwriting an overlapping upload slice invalidates the prior fill
+        // targeting that upload slice.
+        assert!(batch.fill_due(0x1020, 0xB000, 64));
+        assert!(batch.fill_due(0x1000, 0xA000, 64));
+        assert!(!batch.fill_due(0x1000, 0xA000, 64));
+        // Unrelated title write leaves it cached; overlapping write invalidates it.
+        batch.title_written(Some((0xC000, 0xC100)));
+        assert!(!batch.fill_due(0x1000, 0xA000, 64));
+        batch.title_written(Some((0xA020, 0xA040)));
+        assert!(batch.fill_due(0x1000, 0xA000, 64));
+    }
+
+    #[test]
+    fn deferred_title_written_scopes_refreshes_and_fills() {
+        let mut deferred = Deferred::default();
+        deferred.refreshed.insert((1, 0x2000, 0x100));
+        deferred.refreshed.insert((2, 0x4000, 0x100));
+        assert!(deferred.first_fill(0x8000, 0x2000, 64));
+        assert!(deferred.first_fill(0x8100, 0x4000, 64));
+        // Writing [0x2020, 0x2060) invalidates only the overlapping 0x2000 entries.
+        deferred.title_written(Some((0x2020, 0x2060)));
+        assert!(!deferred.refreshed.contains(&(1, 0x2000, 0x100)));
+        assert!(deferred.refreshed.contains(&(2, 0x4000, 0x100)));
+        assert!(deferred.first_fill(0x8000, 0x2000, 64));
+        assert!(!deferred.first_fill(0x8100, 0x4000, 64));
     }
 
     #[test]
@@ -3259,7 +3425,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         unsafe { (p as *mut u8).write_volatile(1) };
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), 0, "nothing again in the submission");
-        batch.title_written();
+        batch.title_written(None);
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
         crate::shadow::unregister(p, p as u64);
@@ -3285,8 +3451,8 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             let mut hashed = 0usize;
             let started = std::time::Instant::now();
             for _ in 0..LISTS {
-                for t in &textures {
-                    if !dedupe || batch.texture_due(t) {
+                for (i, t) in textures.iter().enumerate() {
+                    if !dedupe || batch.texture_due(t, (i * SIZE, (i + 1) * SIZE)) {
                         std::hint::black_box(blake3::hash(t));
                         hashed += 1;
                     }
