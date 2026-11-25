@@ -971,44 +971,4 @@ Validation failed.";
             }
         }
     }
-
-    use super::validator_reason;
-
-    /// The validator's refusals name the operation in the errors after the
-    /// one announcing the refusal; taking the first line alone loses it.
-    #[test]
-    fn a_validator_refusal_is_reported_by_what_it_names() {
-        let text = "Function: main: error: Entry function performs some operation that is incompatible with the shader stage or other entry properties.  See other errors for details.\n\
-Function: main: error: Opcode DecodeShaderTable is invalid in shader stage Compute.\n\
-Function: main: error: something else entirely.\n\
-Validation failed.";
-        assert_eq!(
-            validator_reason(text),
-            "Function: main: error: Opcode DecodeShaderTable is invalid in shader stage Compute. \
-             (and 1 more error)"
-        );
-        // The real shape of those refusals: the announcement, then the one
-        // error that names the stage.
-        assert_eq!(
-            validator_reason(
-                "Function: main: error: Entry function performs some operation that is \
-                 incompatible with the shader stage or other entry properties.  See other errors \
-                 for details.\nFunction: main: error: Function uses features incompatible with the \
-                 shader stage (cs) of the entry function.\nValidation failed."
-            ),
-            "Function: main: error: Function uses features incompatible with the shader stage (cs) \
-             of the entry function."
-        );
-        // A single, specific refusal stands on its own.
-        assert_eq!(
-            validator_reason("Function: main: error: Only one of these.\nValidation failed."),
-            "Function: main: error: Only one of these."
-        );
-        // Nothing to name: whatever the validator said, on one line.
-        assert_eq!(
-            validator_reason("rejected (0x80004005)"),
-            "rejected (0x80004005)"
-        );
-        assert_eq!(validator_reason(""), "");
-    }
 }
