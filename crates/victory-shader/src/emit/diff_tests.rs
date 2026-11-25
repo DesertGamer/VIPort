@@ -1501,7 +1501,7 @@ fn translated_compute_matches_pc() {
         let pso_p = host.compute_pipeline_with(&root_p, &cs_p).unwrap();
         let table = |sampler, index| Root::Table { sampler, index };
         let theirs = host
-            .dispatch(
+            .dispatch_pc(
                 &root_p,
                 &pso_p,
                 &dispatch(vec![
