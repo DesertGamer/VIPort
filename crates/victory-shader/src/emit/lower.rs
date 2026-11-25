@@ -6704,8 +6704,9 @@ impl<'a> Lower<'a> {
     }
 
     /// Operand `k` of a 64-bit instruction as its low and high dwords (i32),
-    /// as [`Self::src64`] reads it: register pairs, inline constants
-    /// sign-extended, literals and the null register zero-extended.
+    /// as [`Self::src64`] reads it: register pairs, inline constants and the
+    /// literals of signed operands sign-extended, other literals and the null
+    /// register zero-extended.
     fn src64_dwords(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -6726,6 +6727,10 @@ impl<'a> Lower<'a> {
             }
             Operand::Const(k @ 128..=208) => {
                 let x = crate::resource::inline(k).ok_or("a special operand")?;
+                let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
+                Ok((self.s.m.i32(x), self.s.m.i32(hi)))
+            }
+            Operand::Literal(x) if inst.name().ends_with("_i64") => {
                 let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
                 Ok((self.s.m.i32(x), self.s.m.i32(hi)))
             }
