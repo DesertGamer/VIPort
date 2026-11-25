@@ -107,6 +107,11 @@ notes above on Windows 11 with an NVIDIA RTX 5070.
 > run can also end on a GPU fault (`crashes.log`). A diagnostics build with
 > `VICTORY_D3D12_WARP=1` renders on the software adapter instead (too slow
 > to reach the world in minutes).
+> A world frame can also outlast Windows' 2 s GPU timeout on slower GPUs
+> (`slow host submission` above 2000 ms, then the device is removed as hung);
+> raising `TdrDelay` and `TdrDdiDelay` (for example to 60) under
+> `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` and rebooting
+> avoids that reset.
 
 What each part does today and what it still needs:
 
