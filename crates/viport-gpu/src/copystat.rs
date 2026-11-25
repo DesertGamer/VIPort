@@ -30,6 +30,8 @@ pub(crate) enum C {
     Unchanged,
     /// Copies that met an unmapped page.
     Fallbacks,
+    FallbackBytes,
+    FallbackUs,
     /// Writes taken by the guard on view memory.
     GuardFaults,
     /// Texture bytes detiled after a watched write; hashed; detiled after a
@@ -81,12 +83,22 @@ pub(crate) enum C {
     StepMemoryUs,
     UploadsUs,
     PreludeUs,
+    SyncUs,
+    SyncPages,
+    SyncSlots,
+    SyncMade,
+    SyncMadeConstant,
+    SyncMadeShader,
+    SyncMadeUnordered,
+    SyncMadePlaced,
+    SyncMakeUs,
+    SyncLazy,
     /// Copying back: bytes of copies compared with their snapshots, and
     /// the time.
     CompareBytes,
     CompareUs,
 }
-const COUNTERS: usize = 52;
+const COUNTERS: usize = 64;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -217,14 +229,14 @@ pub(crate) fn log(frames: f64) {
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
+         unchanged; {:.1} fallbacks ({:.1} MB in {:.1} ms); {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed; watch time: kernel {:.1} ms, view queries {:.1} ms, protecting {:.1} ms; copied whole (not tracked) {:.1} MB in {:.1} ms; snapshots {:.1} MB in {:.1} ms; page faults {:.0} preparing, {:.0} copying back; {:.0} tracked pages marked through another mapping; \
          guards: {:.2} ms in the handler, {:.0} protect calls for {:.0} pages, {:.0} pages opened; \
          {:.0} tracked pages written ({:.0} of them the frame before too); change checks: {:.1} ms \
          asking for other mappings, {:.1} ms waiting for the guard lock; preparing: {:.1} ms in \
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
-         heap texture uploads {:.1} ms, state preludes {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; working set {:.0} MB, \
+         heap texture uploads {:.1} ms, state preludes {:.1} ms, descriptor sync {:.1} ms ({:.0} pages, {:.0} slots, {:.0} made: {:.0} constant, {:.0} shader, {:.0} unordered, {:.0} placed, make {:.1} ms, {:.0} left lazy); copying back compared {:.1} MB          in {:.1} ms; working set {:.0} MB, \
          {:.0} hard faults",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -245,6 +257,8 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
+        mb(c[C::FallbackBytes as usize]),
+        ms(c[C::FallbackUs as usize]),
         c[C::GuardFaults as usize],
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
@@ -277,6 +291,16 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::StepMemoryUs as usize]),
         ms(c[C::UploadsUs as usize]),
         ms(c[C::PreludeUs as usize]),
+        ms(c[C::SyncUs as usize]),
+        c[C::SyncPages as usize],
+        c[C::SyncSlots as usize],
+        c[C::SyncMade as usize],
+        c[C::SyncMadeConstant as usize],
+        c[C::SyncMadeShader as usize],
+        c[C::SyncMadeUnordered as usize],
+        c[C::SyncMadePlaced as usize],
+        ms(c[C::SyncMakeUs as usize]),
+        c[C::SyncLazy as usize],
         mb(c[C::CompareBytes as usize]),
         ms(c[C::CompareUs as usize]),
         working_set() as f64 / 1e6,
@@ -333,10 +357,14 @@ pub(crate) fn log(frames: f64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    static LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn count(c: C) -> u64 {
+        COUNT[c as usize].load(Relaxed)
+    }
 
     #[test]
     fn counter_enum_matches_array_length() {

@@ -1209,7 +1209,11 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
-        crate::descriptor::sync_heaps();
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncUs);
+            crate::descriptor::sync_heaps();
+        }
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -2864,7 +2868,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+    {
+        crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+        crate::copystat::add(crate::copystat::C::FallbackBytes, len as u64);
+    }
+    #[cfg(feature = "diagnostics")]
+    let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FallbackUs);
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {

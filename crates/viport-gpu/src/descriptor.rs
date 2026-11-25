@@ -186,8 +186,20 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                for index in first..last.min(u64::from(heap.desc.count)) {
-                    host.mirror(index as u32, start + index * step, false);
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(crate::copystat::C::SyncPages, 1);
+                    crate::copystat::add(
+                        crate::copystat::C::SyncSlots,
+                        last.min(u64::from(heap.desc.count)).saturating_sub(first),
+                    );
+                }
+                let last = last.min(u64::from(heap.desc.count));
+                if first >= last {
+                    continue;
+                }
+                for index in host.changed(start, step, first as u32, last as u32) {
+                    host.mirror(index, start + u64::from(index) * step, false);
                 }
             }
         }
@@ -492,6 +504,13 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     free: Vec::new(),
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+
+impl Views {
+    #[cfg(windows)]
+    fn current(&self, i: u32, generation: u32) -> bool {
+        self.list.get(i as usize).is_some_and(|&(_, current)| current == generation)
+    }
+}
 
 impl View {
     /// The resource objects the view names.
@@ -959,6 +978,162 @@ mod tests {
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         crate::watch::tests::free(memory);
+    }
+
+    #[cfg(windows)]
+    fn view_heap(slots: u32) -> (This, usize) {
+        let bytes = slots as usize * 32;
+        let memory = crate::watch::tests::pool(bytes.div_ceil(crate::watch::PAGE));
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: slots,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: memory as u64,
+            size: bytes as u64,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        (h, memory)
+    }
+
+    #[cfg(windows)]
+    fn release_view_heap(h: This, memory: usize) {
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+    }
+
+    #[cfg(windows)]
+    fn placed_records(slots: usize) -> Vec<u8> {
+        let mut records = vec![0u8; slots * 32];
+        for i in 0..slots {
+            let at = records.as_mut_ptr() as u64 + i as u64 * 32;
+            let mut resource = [0u32; 14];
+            let mut desc = [0u32; 16];
+            desc[10] = (i as u32 + 1) * 256;
+            match i % 10 {
+                0..=6 => resource[0] = 4,
+                7 | 8 => {
+                    resource[0] = 1;
+                    resource[4] = 4096;
+                    desc[1] = 1;
+                }
+                _ => continue,
+            }
+            create_placed_srv(std::ptr::null(), &resource, &desc, at);
+        }
+        records
+    }
+
+    #[cfg(windows)]
+    fn write_records(memory: usize, records: &[u8]) {
+        unsafe { std::ptr::copy_nonoverlapping(records.as_ptr(), memory as *mut u8, records.len()) };
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn counted_sync() -> u64 {
+        let before = crate::copystat::tests::count(crate::copystat::C::SyncMade);
+        sync_heaps();
+        crate::copystat::tests::count(crate::copystat::C::SyncMade) - before
+    }
+
+    #[cfg(all(windows, not(feature = "diagnostics")))]
+    fn counted_sync() -> u64 {
+        sync_heaps();
+        0
+    }
+
+    #[cfg(windows)]
+    fn write_view(memory: usize, index: usize, record: impl FnOnce(u64)) {
+        let mut scratch = [0u8; 32];
+        record(scratch.as_mut_ptr() as u64);
+        unsafe { std::ptr::copy_nonoverlapping(scratch.as_ptr(), (memory + index * 32) as *mut u8, 32) };
+    }
+
+    #[cfg(windows)]
+    fn placed_texture(address: u32) -> ([u32; 14], [u32; 16]) {
+        let mut desc = [0u32; 16];
+        desc[10] = address;
+        ([4; 14], desc)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unchanged_records_are_not_made_again() {
+        #[cfg(feature = "diagnostics")]
+        let _guard = crate::copystat::tests::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = 50_000;
+        let (h, memory) = view_heap(slots);
+        if let Some(host) = heap(h).host() {
+            let records = placed_records(slots as usize);
+            write_records(memory, &records);
+            let first = counted_sync();
+            assert!(host.parked(0) && !host.made(0), "a placed texture is left for later");
+            assert!(host.made(7) && !host.parked(7), "a placed buffer is made");
+            write_records(memory, &records);
+            let second = counted_sync();
+            assert!(host.parked(0) && host.made(7));
+            write_view(memory, 0, |at| {
+                let (resource, desc) = placed_texture(0x1234_5000);
+                create_placed_srv(std::ptr::null(), &resource, &desc, at);
+            });
+            let third = counted_sync();
+            assert!(host.parked(0));
+            #[cfg(feature = "diagnostics")]
+            assert_eq!((first >= 45_000, second, third), (true, 0, 1));
+            #[cfg(not(feature = "diagnostics"))]
+            assert_eq!((first, second, third), (0, 0, 0));
+        }
+        release_view_heap(h, memory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slots_of_released_resources_and_overwritten_records_become_null() {
+        let (h, memory) = view_heap(64);
+        let data = crate::watch::tests::pool(1);
+        if let Some(host) = heap(h).host() {
+            let buffer = crate::resource::tests::placed_buffer_for_test(data as u64, 4096);
+            write_view(memory, 3, |at| {
+                let (resource, desc) = placed_texture(0x4000);
+                create_placed_srv(std::ptr::null(), &resource, &desc, at);
+            });
+            write_view(memory, 4, |at| create_srv(std::ptr::null(), buffer, std::ptr::null(), at));
+            sync_heaps();
+            assert!(host.parked(3) && host.made(4));
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(buffer, 0x10)(buffer), 0);
+            let record = (memory + 4 * 32) as *mut [u8; 12];
+            unsafe { record.write(record.read()) };
+            sync_heaps();
+            assert!(!host.made(4), "the released resource's slot is null");
+            write_view(memory, 3, |_| {});
+            sync_heaps();
+            assert!(!host.parked(3), "the overwritten record's slot is null");
+        }
+        crate::watch::tests::free(data);
+        release_view_heap(h, memory);
+    }
+
+    #[cfg(windows)]
+    #[ignore]
+    #[test]
+    fn bench_sync_heaps_on_400k_slots() {
+        #[cfg(feature = "diagnostics")]
+        let _guard = crate::copystat::tests::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = 400_000;
+        let (h, memory) = view_heap(slots);
+        if heap(h).host().is_some() {
+            let records = placed_records(slots as usize);
+            for round in 0..5 {
+                write_records(memory, &records);
+                let started = std::time::Instant::now();
+                let made = counted_sync();
+                println!("sync {round}: {:?}, {made} slots made", started.elapsed());
+            }
+        }
+        release_view_heap(h, memory);
     }
 
     /// Grand Theft Auto VI places its shader-visible heap in its own memory

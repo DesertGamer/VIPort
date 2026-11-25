@@ -24,7 +24,8 @@ pub(crate) struct HostHeap {
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    made: Mutex<Vec<Slot>>,
+    read: Vec<std::sync::atomic::AtomicBool>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -51,6 +52,13 @@ pub(crate) struct HostHeap {
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    made: u64,
+    parked: u64,
+    lazy: bool,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -181,7 +189,8 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: Mutex::new(vec![Slot::default(); count as usize]),
+            read: (0..count).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -535,7 +544,8 @@ impl HostHeap {
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (i, &key) in made.iter().enumerate() {
+            for (i, slot) in made.iter().enumerate() {
+                let key = if slot.made != 0 { slot.made } else { slot.parked };
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
                 write_address(data, i, view.as_ref());
             }
@@ -627,12 +637,13 @@ impl HostHeap {
             PLACED_WHY[0].fetch_add(1, Relaxed);
             return false;
         }
+        self.read[index as usize].store(true, Relaxed);
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         let key = u64::from(generation) << 32 | u64::from(i);
         {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            if made[index as usize] == key {
+            if made[index as usize].made == key {
                 PLACED_WHY[1].fetch_add(1, Relaxed);
                 return false;
             }
@@ -641,7 +652,7 @@ impl HostHeap {
             PLACED_WHY[2].fetch_add(1, Relaxed);
             return false;
         };
-        if !is_placed_texture(&view) {
+        if !is_placed_texture(&view) && !(lazy_views() && is_placed_buffer_view(&view)) {
             PLACED_WHY[3].fetch_add(1, Relaxed);
             return false;
         }
@@ -677,14 +688,31 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
+            let slot = &mut made[index as usize];
+            if slot.made != 0 || slot.parked != 0 {
+                *slot = Slot::default();
                 self.make_null(index);
                 self.note_address(index, None);
             }
             return None;
         };
-        if made[index as usize] != key {
+        let slot = made[index as usize];
+        if slot.made != key && (for_draw || slot.parked != key) {
+            #[cfg(feature = "diagnostics")]
+            if !for_draw {
+                use crate::copystat::C;
+                crate::copystat::add(C::SyncMade, 1);
+                let kind = match &view {
+                    View::Constant(..) => Some(C::SyncMadeConstant),
+                    View::Shader(..) => Some(C::SyncMadeShader),
+                    View::Unordered(..) => Some(C::SyncMadeUnordered),
+                    View::Placed(..) => Some(C::SyncMadePlaced),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    crate::copystat::add(kind, 1);
+                }
+            }
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -693,11 +721,31 @@ impl HostHeap {
             // when a draw reads them through a table: a host texture (and a
             // staging copy) for each of the ~20,000 the title has views of
             // ran the host out of memory (run b2).
-            let later = !for_draw && is_placed_texture(&view);
-            made[index as usize] = if later { 0 } else { key };
+            if for_draw {
+                self.read[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let lazy = !for_draw && lazy_views() && is_placed_buffer_view(&view) && !self.read[index as usize].load(std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            if lazy {
+                crate::copystat::add(crate::copystat::C::SyncLazy, 1);
+            }
+            if lazy && slot.lazy {
+                made[index as usize] = Slot { made: 0, parked: key, lazy };
+                return Some(view);
+            }
+            let later = !for_draw && is_placed_texture(&view) || lazy;
+            made[index as usize] = if later {
+                Slot { made: 0, parked: key, lazy }
+            } else {
+                Slot { made: key, parked: 0, lazy: false }
+            };
             let kept = if later {
                 None
             } else {
+                #[cfg(feature = "diagnostics")]
+                let _timed = (!for_draw).then(|| {
+                    crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncMakeUs)
+                });
                 make(&view, self.cpu(index))
             };
             if kept.is_none() && !self.sampler {
@@ -719,7 +767,7 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?.made;
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
@@ -738,7 +786,30 @@ impl HostHeap {
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize].made != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parked(&self, index: u32) -> bool {
+        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize].parked != 0
+    }
+
+    pub(crate) fn changed(&self, start: u64, step: u64, first: u32, last: u32) -> Vec<u32> {
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let views = super::VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        (first..last.min(self.count))
+            .filter(|&index| {
+                let handle = start + u64::from(index) * step;
+                let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+                let key = u64::from(generation) << 32 | u64::from(i);
+                let slot = made[index as usize];
+                if tag == VIEW_TAG && views.current(i, generation) {
+                    slot.made != key && slot.parked != key
+                } else {
+                    slot.made != 0 || slot.parked != 0
+                }
+            })
+            .collect()
     }
 }
 
@@ -1300,6 +1371,15 @@ pub(crate) static PLACED_WHY: [std::sync::atomic::AtomicU64; 4] = [const { std::
 
 fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
+}
+
+fn is_placed_buffer_view(view: &View) -> bool {
+    matches!(view, View::Placed(false, resource, _) if resource[0] == 1)
+}
+
+fn lazy_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VIPORT_LAZY_VIEWS").is_ok_and(|v| v == "1"))
 }
 
 /// A shader view of a texture the title placed in memory itself, as a view
