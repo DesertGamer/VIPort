@@ -60,7 +60,7 @@ otherwise. See [docs/architecture.md](docs/architecture.md).
 ## Where VIPort is today
 
 **Not playable yet.** The title boots, shows its menus and intro, loads the
-world and draws it: slowly, and with rendering defects. The road from here:
+world and draws it: slowly, and with rendering defects. On 2026-11-26 (NVIDIA RTX 5070, warm caches) three runs of the world scene took between 0.55 and 1.4 seconds per frame; the target is 33 milliseconds. The road from here:
 
 ```mermaid
 flowchart LR
@@ -89,11 +89,11 @@ Vertex/px  ███████████████░  99.7%   42 left of 
 Compute    ███████████████░  97.8%   58 left of  2,637
 ```
 
-### By the numbers (2026-11-25)
+### By the numbers (tests and lines recounted 2026-11-26; the first two figures are from 2026-11-25)
 
-| 292 | 232 | 124,000 | 3 |
+| 292 | 232 | 127,700 | 978 |
 |:---:|:---:|:---:|:---:|
-| community pull requests merged | authors in the history | lines of Rust in 9 crates | red tests, each with an issue |
+| community pull requests merged | authors in the history | lines of Rust in 9 crates | tests pass, none fail |
 
 ### What works, what is missing
 
