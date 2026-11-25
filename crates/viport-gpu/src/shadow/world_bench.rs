@@ -210,3 +210,78 @@ fn world_frame_copies() {
     totals.sort_by(f64::total_cmp);
     println!("median total: {:.1} ms per frame", totals[totals.len() / 2]);
 }
+
+const COPIES: usize = 300;
+const LOOKUPS: usize = 10_000;
+const SPARES: usize = 4000;
+
+#[test]
+#[ignore = "benchmark: needs a host D3D12 device; run in release with --ignored --nocapture"]
+fn view_lookups_speed() {
+    let Some(host) = crate::host::host() else {
+        eprintln!("no host D3D12 device: skipped");
+        return;
+    };
+    let pool = crate::watch::tests::pool(COPIES);
+    let page = crate::watch::PAGE;
+    for i in 0..COPIES {
+        register(0xbe00 + i, (pool + i * page) as u64, page as u64);
+    }
+    let held: Vec<_> = (0..COPIES)
+        .map(|i| find((pool + i * page) as u64, 1).expect("a copy"))
+        .collect();
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let addresses: Vec<u64> = (0..LOOKUPS)
+        .map(|_| (pool + rng.below(COPIES) * page + rng.below(page / 256 - 1) * 256) as u64)
+        .collect();
+
+    let started = Instant::now();
+    for &address in &addresses {
+        assert!(find(address, 16).is_some());
+    }
+    let find_all = started.elapsed();
+
+    let started = Instant::now();
+    for &address in &addresses {
+        assert!(for_view(address, 256, 16).is_some());
+    }
+    let aligned = started.elapsed();
+
+    let off: Vec<u64> = addresses.iter().take(64).map(|a| a + 4).collect();
+    let views: Vec<_> = off.iter().map(|&a| for_view(a, 256, 16).expect("a view copy")).collect();
+    let started = Instant::now();
+    for i in 0..LOOKUPS {
+        assert!(for_view(off[i % off.len()], 256, 16).is_some());
+    }
+    let exact = started.elapsed();
+
+    let mut spare_buffers = Vec::new();
+    for _ in 0..SPARES {
+        let (buffer, data) = host.shared_buffer(256).expect("a buffer");
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(buffer, data, gpu, 0, 256);
+        shadow.spare_capacity = 256;
+        spare_buffers.push(shadow);
+    }
+    drop(spare_buffers);
+    let started = Instant::now();
+    for _ in 0..LOOKUPS {
+        assert!(take_spare(512).is_none());
+    }
+    let spare_miss = started.elapsed();
+
+    drop(views);
+    drop(held);
+    for i in 0..COPIES {
+        unregister(0xbe00 + i, (pool + i * page) as u64);
+    }
+    let us = |d: Duration| d.as_secs_f64() * 1e6 / LOOKUPS as f64;
+    println!(
+        "per call, us: find {:.3}, for_view on elements {:.3}, for_view off elements (cached copy) {:.3}, take_spare miss with {SPARES} spares {:.3}",
+        us(find_all),
+        us(aligned),
+        us(exact),
+        us(spare_miss)
+    );
+}

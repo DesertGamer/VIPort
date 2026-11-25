@@ -16,7 +16,7 @@
 //! themselves, every buffer range the heap's views reach
 //! (`crate::bindless`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
@@ -164,7 +164,6 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 struct Spare {
-    capacity: u64,
     buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
@@ -172,7 +171,15 @@ struct Spare {
     frame: u64,
 }
 
-static SPARE: Mutex<Vec<Spare>> = Mutex::new(Vec::new());
+struct Spares {
+    total: usize,
+    by_capacity: BTreeMap<u64, VecDeque<Spare>>,
+}
+
+static SPARE: Mutex<Spares> = Mutex::new(Spares {
+    total: 0,
+    by_capacity: BTreeMap::new(),
+});
 
 const SPARE_MAX: usize = 8192;
 const SPARE_FRAMES: u64 = 3;
@@ -180,10 +187,13 @@ const SPARE_FRAMES: u64 = 3;
 fn take_spare(capacity: u64) -> Option<Spare> {
     let now = crate::queue::presented();
     let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-    let at = spare
-        .iter()
-        .position(|s| s.capacity == capacity && s.frame + SPARE_FRAMES <= now)?;
-    Some(spare.swap_remove(at))
+    let queue = spare.by_capacity.get_mut(&capacity)?;
+    if queue.front()?.frame + SPARE_FRAMES > now {
+        return None;
+    }
+    let taken = queue.pop_front();
+    spare.total -= 1;
+    taken
 }
 
 impl Drop for Shadow {
@@ -192,9 +202,9 @@ impl Drop for Shadow {
             return;
         }
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        if spare.len() < SPARE_MAX {
-            spare.push(Spare {
-                capacity: self.spare_capacity,
+        if spare.total < SPARE_MAX {
+            spare.total += 1;
+            spare.by_capacity.entry(self.spare_capacity).or_default().push_back(Spare {
                 buffer: self.buffer.clone(),
                 data: self.data as usize,
                 gpu: self.gpu,
