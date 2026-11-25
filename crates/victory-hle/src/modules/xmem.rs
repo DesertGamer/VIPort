@@ -748,10 +748,7 @@ fn coalesce_placeholders(base: usize, len: usize) {
         let Some(next) = query(end) else {
             return;
         };
-        if next.AllocationBase != first.AllocationBase
-            || next.State != MEM_RESERVE
-            || next.RegionSize == 0
-        {
+        if next.State != MEM_RESERVE || next.RegionSize == 0 {
             return;
         }
         let next_end = next.BaseAddress as usize + next.RegionSize;
@@ -760,7 +757,7 @@ fn coalesce_placeholders(base: usize, len: usize) {
         }
         end = next_end;
     }
-    // SAFETY: `[start, end)` spans adjacent reserve placeholders in one allocation.
+    // SAFETY: `[start, end)` spans adjacent reserve placeholders.
     let ok = unsafe {
         VirtualFree(
             start as *mut c_void,
