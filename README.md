@@ -1,22 +1,53 @@
-# VIctory V2
+<div align="center">
 
-[![Telegram](https://img.shields.io/badge/Telegram-@desertdev-26A5E4?logo=telegram&logoColor=white)](https://t.me/desertdev)
-![Discord](https://img.shields.io/badge/Discord-desert__gamer-5865F2?logo=discord&logoColor=white)
-[![E-mail](https://img.shields.io/badge/E--mail-desert__gamer@icloud.com-3693F3?logo=icloud&logoColor=white)](mailto:desert_gamer@icloud.com)
-[![Issues](https://img.shields.io/github/issues/DesertGamer/VIctory-V2?logo=github)](https://github.com/DesertGamer/VIctory-V2/issues)
+# VIPort
 
-> **This is VIctory V2, an integration fork of
-> [Marvisak/VIctory](https://github.com/Marvisak/VIctory).**
+**Grand Theft Auto VI (Xbox Series X|S), running natively on Windows, from files you supply.**<br>
+An independent, community-built project on the VIctory codebase: hundreds of pull requests in one tree that builds and is tested.
+
+![Status](https://img.shields.io/badge/status-not%20playable%20yet-orange?style=for-the-badge)
+![Reaches](https://img.shields.io/badge/reaches-the%20first%20cutscene-2ea44f?style=for-the-badge)
+
+[![Stars](https://img.shields.io/github/stars/DesertGamer/VIPort?style=flat-square&logo=github)](https://github.com/DesertGamer/VIPort/stargazers)
+[![Last commit](https://img.shields.io/github/last-commit/DesertGamer/VIPort?style=flat-square)](https://github.com/DesertGamer/VIPort/commits/main)
+[![Issues](https://img.shields.io/github/issues/DesertGamer/VIPort?style=flat-square)](https://github.com/DesertGamer/VIPort/issues)
+![Rust](https://img.shields.io/badge/Rust-2024-b7410e?style=flat-square&logo=rust&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4?style=flat-square&logo=windows&logoColor=white)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
+
+[![Telegram](https://img.shields.io/badge/Telegram-@desertdev-26A5E4?style=flat-square&logo=telegram&logoColor=white)](https://t.me/desertdev)
+![Discord](https://img.shields.io/badge/Discord-desert__gamer-5865F2?style=flat-square&logo=discord&logoColor=white)
+[![E-mail](https://img.shields.io/badge/E--mail-desert__gamer@icloud.com-3693F3?style=flat-square&logo=icloud&logoColor=white)](mailto:desert_gamer@icloud.com)
+
+[**Progress**](#where-viport-is-today) · [**Help wanted**](#help-wanted) · [**Getting started**](#getting-started) · [**Talk to us**](#where-to-talk)
+
+</div>
+
+> **VIPort is built on the VIctory codebase by
+> [Marvisak](https://github.com/Marvisak/VIctory) and its contributors.** It
+> started as an integration fork of it and is now developed independently.
 >
 > VIctory is developed in the open and receives a lot of community pull
 > requests (shader lowering, GPU fixes, HLE, formats, tooling). A big queue of
-> them builds up faster than one maintainer can review. V2 exists to put those
+> them builds up faster than one maintainer can review. VIPort put those
 > contributions together in one tree that builds, passes the tests, and can be
 > tried today, without waiting for each one to land upstream.
 >
-> **V2 is not the official project and is not endorsed by its author.** The
-> original lives at the link above; its history is kept here intact, and V2 is
-> synchronized from it.
+> **VIPort is not the official VIctory project and is not endorsed by its
+> author.** Its history, with every author, is kept here intact. VIPort merged
+> from the original until 2026-11-25 and no longer does; the original stays a
+> reference. The code is GPL-3.0, as the original.
+
+<details>
+<summary><b>На русском</b></summary>
+
+**VIPort** — независимый проект на кодовой базе VIctory (неофициальный, GPL-3.0): запуск GTA VI (Xbox Series X|S) на Windows из ваших файлов. Игра пока не играбельна: меню и вступительное видео работают, дальше игра загружает мир и рисует его по 1–2 секунды на кадр, с дефектами. В репозитории нет игровых данных, их вы приносите сами.
+
+Нужна помощь: отчёты по железу ([#4](https://github.com/DesertGamer/VIPort/issues/4)), небольшие задачи ([#16](https://github.com/DesertGamer/VIPort/issues/16), [#17](https://github.com/DesertGamer/VIPort/issues/17), [#18](https://github.com/DesertGamer/VIPort/issues/18)) и подсчёт сбоев DirectStorage на вашей видеокарте ([#15](https://github.com/DesertGamer/VIPort/issues/15)). Связь: Telegram [@desertdev](https://t.me/desertdev).
+
+</details>
+
+## What it is
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
@@ -26,9 +57,81 @@ the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
 
-## What V2 changes
+## Where VIPort is today
 
-- **Community pull requests, merged.** Open upstream PRs were merged into V2 in
+**Not playable yet.** The title boots, shows its menus and intro, loads the
+world and draws it: slowly, and with rendering defects. The road from here:
+
+```mermaid
+flowchart LR
+    A["Boot and<br/>first-boot screens"] --> B["Intro video<br/>with sound"] --> C["Start screen,<br/>profile, saves"] --> D["Loading into<br/>the world<br/>(about 50 s)"] --> E["The world<br/>1-2 s per frame,<br/>unlit surfaces"] --> F["Playable"]
+    classDef done fill:#1f883d,stroke:#1a7f37,color:#ffffff
+    classDef partial fill:#bf8700,stroke:#9a6700,color:#ffffff
+    classDef todo fill:#6e7781,stroke:#57606a,color:#ffffff
+    class A,B,C,D done
+    class E partial
+    class F todo
+```
+
+Green works, amber works with visible defects, grey is not there yet. The stages
+follow upstream's table of 2026-11-23 (AMD RX 6700 XT); VIPort's own runs of
+2026-11-25 (NVIDIA RTX 5070) reach the first cutscene. Details, and where it
+still fails, are under [Status details](#status-details-2026-11-25).
+
+### The shaders, world scene
+
+The title's console GPU code is recompiled to DXIL. Coverage of the world's
+shaders, from the Status details tables:
+
+```text
+Mesh shaders     ████████████████████  100%     8,765 / 8,765
+Vertex / pixel   ███████████████████░  99.7%   12,550 / 12,592
+Compute          ███████████████████░  97.8%    2,579 / 2,637
+```
+
+### By the numbers (2026-11-25)
+
+| 292 | 232 | 124,000 | 3 |
+|:---:|:---:|:---:|:---:|
+| community pull requests merged | authors in the history | lines of Rust in 9 crates | red tests, each with an issue |
+
+### What works, what is missing
+
+| | Subsystem | What is still missing |
+|:-:|-----------|-----------------------|
+| ✅ | Loader | nothing known |
+| ✅ | Network | offline by design |
+| 🟡 | Files and streaming | loading is limited by writes into title memory |
+| 🟡 | Input | rumble is unverified in game |
+| 🟡 | Audio | reverb is silent |
+| 🟡 | Runtime services | the text entry dialog and relaunch are untested live |
+| 🟡 | GPU: menus | frame pacing drifts on one screen in release builds |
+| 🟡 | GPU: world | lighting, some geometry; frames take 1-2 s |
+| 🟡 | Shaders | merged geometry stages (195 programs) and about 100 others |
+| 🟡 | Textures | render-target metadata planes |
+| 🟡 | Series S mode | the world |
+
+✅ nothing known missing, 🟡 works with the gaps listed. The full table is under
+Status details.
+
+## Help wanted
+
+VIPort moves as fast as people help it. Small tasks are the quickest way in:
+
+| You have | You can | Where |
+|----------|---------|-------|
+| a Windows PC with a GPU and your own game files | run it and report how far it got | [#4](https://github.com/DesertGamer/VIPort/issues/4) |
+| the same, and two minutes | count the DirectStorage failures on your GPU (zero is a useful answer) | [#15](https://github.com/DesertGamer/VIPort/issues/15) |
+| a Windows PC and Rust | fix a stale test | [#16](https://github.com/DesertGamer/VIPort/issues/16), [#17](https://github.com/DesertGamer/VIPort/issues/17) |
+| a GPU of any vendor | run one test and say which rows differ | [#18](https://github.com/DesertGamer/VIPort/issues/18) |
+
+Every issue has the exact failure and what "done" looks like (label
+`help wanted`). Authorship stays: every merged pull request keeps its author in
+the history.
+
+## What VIPort changes
+
+- **Community pull requests, merged.** Open upstream PRs were merged into VIPort in
   batches until 2026-11-25. The authors of the original commits stay the authors
   in the history.
 - **Reviewed before merging.** Every PR is checked first for things that do not
@@ -40,44 +143,23 @@ otherwise. See [docs/architecture.md](docs/architecture.md).
   If a batch fails, the PR that caused it is found and dealt with before
   anything else is merged.
 - **Conflicts are resolved, not hidden.** When two PRs are fine alone but
-  contradict each other (they change the same behaviour in different ways), V2
-  keeps one and records why in the commit message of the change that removes
-  the other.
+  contradict each other (they change the same behaviour in different ways),
+  VIPort keeps one and records why in the commit message of the change that
+  removes the other.
 
-## What V2 does not do
+## What VIPort does not do
 
 - It does not contain, and will never contain, any game data. The asset policy
   from upstream applies unchanged: see
   [docs/asset-policy.md](docs/asset-policy.md). You supply your own files.
 - It does not promise that the game is playable. See *Status* below.
 
-## Help wanted
-
-V2 reaches the first cutscene on the machine we test on. It is not playable yet.
-What would move it forward fastest:
-
-- **Run it and tell us how far it got.** One comment per machine in
-  [#4](https://github.com/DesertGamer/VIctory-V2/issues/4), there is a form.
-  Different GPUs and drivers matter most: some failures depend on the machine.
-- **Pick a small task.** Three tests are red. Two of them look like stale tests
-  rather than product bugs
-  ([#16](https://github.com/DesertGamer/VIctory-V2/issues/16),
-  [#17](https://github.com/DesertGamer/VIctory-V2/issues/17)); one needs a run
-  on your GPU
-  ([#18](https://github.com/DesertGamer/VIctory-V2/issues/18)). Each issue has
-  the exact failure and what "done" looks like (labelled `help wanted`).
-- **Count the DirectStorage failures on your GPU**
-  ([#15](https://github.com/DesertGamer/VIctory-V2/issues/15)): zero is a useful
-  answer too.
-- **Authorship stays.** Every merged pull request keeps its author in the
-  history.
-
 ## Where to talk
 
-- [#1: entering the world fails with a GPU device removed](https://github.com/DesertGamer/VIctory-V2/issues/1): the main blocker; post diagnostics and findings here.
-- [#2: what is merged into V2 and what is not](https://github.com/DesertGamer/VIctory-V2/issues/2): the list of merged bundles and of those that still need a hand merge.
-- [#3: single upstream pull requests](https://github.com/DesertGamer/VIctory-V2/issues/3): how to take one and how to report a clash.
-- [#4: hardware reports](https://github.com/DesertGamer/VIctory-V2/issues/4): how far it gets on your machine.
+- [#1: entering the world fails with a GPU device removed](https://github.com/DesertGamer/VIPort/issues/1): the main blocker; post diagnostics and findings here.
+- [#2: what is merged and what is not](https://github.com/DesertGamer/VIPort/issues/2): the list of merged bundles and of those that still need a hand merge.
+- [#3: single upstream pull requests](https://github.com/DesertGamer/VIPort/issues/3): how to take one and how to report a clash.
+- [#4: hardware reports](https://github.com/DesertGamer/VIPort/issues/4): how far it gets on your machine.
 
 Outside GitHub: Telegram `desertdev`, Discord `desert_gamer`, e-mail
 desert_gamer@icloud.com.
@@ -87,17 +169,17 @@ desert_gamer@icloud.com.
 - How to contribute: [CONTRIBUTING.md](CONTRIBUTING.md).
 - Found a security problem: [SECURITY.md](SECURITY.md). This code runs inside a
   process with your user's rights, so please read it before reporting in public.
-- V2 no longer merges from the upstream repository. Upstream stays a reference:
-  its pull requests, discussions and issues. A fix that is useful to everyone
-  belongs upstream too: if you send a change to V2, consider sending it to the
-  original project as well.
+- VIPort no longer merges from the upstream repository. Upstream stays a
+  reference: its pull requests, discussions and issues. A fix that is useful to
+  everyone belongs upstream too: if you send a change to VIPort, consider
+  sending it to the original project as well.
 
-## Status (2026-11-24)
+## Status details (2026-11-25)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps,
 loads the world and shows it: slowly, and with rendering defects.
 
-V2, 2026-11-25, on Windows 11 with an NVIDIA RTX 5070: the title no longer
+VIPort, 2026-11-25, on Windows 11 with an NVIDIA RTX 5070: the title no longer
 loses the host GPU at start. Two fixes made that so: textures in formats the
 GPU refuses to render to or write (B4G4R4A4, B5G5R5A1) are created without
 those uses, and typed unordered views are made only in formats the GPU can
@@ -107,11 +189,11 @@ with the host GPU removed after a single submission that took about 5
 seconds, longer than the Windows driver watchdog allows. In a release run the
 frame counter read 16 to 30 fps, and 127 shaders were translated at first use
 (70 seconds in all, the slowest 13 seconds); a run with the shader cache warm
-has not been measured yet. V2 makes no claim that it renders more than
+has not been measured yet. VIPort makes no claim that it renders more than
 upstream; that needs a measurement under the same conditions.
 
-The tables below are upstream's findings of 2026-11-23; V2 has not re-measured
-them.
+The tables below are upstream's findings of 2026-11-23; VIPort has not
+re-measured them.
 
 | Stage | State |
 |-------|-------|
@@ -121,7 +203,7 @@ them.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | drawn and shown: streets, buildings, vehicles, characters, the title card and credits; 1-2 s per frame. Surfaces are unlit, a band of distant geometry is missing, characters come out broken in some shots |
 
-Upstream's table was measured on Windows 11 with an AMD RX 6700 XT; V2's
+Upstream's table was measured on Windows 11 with an AMD RX 6700 XT; VIPort's
 notes above on Windows 11 with an NVIDIA RTX 5070.
 
 > **Warning.** Entering the world on a real GPU has hung it in earlier

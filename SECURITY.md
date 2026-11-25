@@ -8,7 +8,7 @@ here is more serious than in an ordinary application.
 ## Report a problem privately
 
 Use **Report a vulnerability** on the repository's *Security* tab
-(<https://github.com/DesertGamer/VIctory-V2/security/advisories/new>).
+(<https://github.com/DesertGamer/VIPort/security/advisories/new>).
 Please do not open a public issue or pull request for it.
 
 If that is not possible, write to desert_gamer@icloud.com. Do not put details

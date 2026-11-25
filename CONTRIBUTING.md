@@ -1,9 +1,9 @@
-# Contributing to VIctory V2
+# Contributing to VIPort
 
-Thanks for helping. V2 is an integration fork of
-[Marvisak/VIctory](https://github.com/Marvisak/VIctory): it collects community
-changes in one tree that builds and passes its tests. This page says what we
-accept and how a change gets in.
+Thanks for helping. VIPort is built on the VIctory codebase by
+[Marvisak](https://github.com/Marvisak/VIctory) and its contributors: it
+collects community changes in one tree that builds and passes its tests. This
+page says what we accept and how a change gets in.
 
 ## Rule 1: nothing from the game, ever
 
@@ -64,7 +64,7 @@ Open an issue before sending a pull request that:
 These are the places where a code change can do more than it says, so each is
 read line by line, and many are declined.
 
-## How a pull request reaches V2
+## How a pull request reaches VIPort
 
 1. It is looked at for the things above: file types, scripts, dependencies,
    network and process use. Anything unusual gets a manual read of the diff.
@@ -81,7 +81,7 @@ Authorship is kept: merged commits stay under their authors' names.
 ## Upstream
 
 A fix that is useful to everyone should also go to the original project. If
-your change does not depend on anything V2-specific, send it there too.
+your change does not depend on anything VIPort-specific, send it there too.
 
 ## Conduct
 
