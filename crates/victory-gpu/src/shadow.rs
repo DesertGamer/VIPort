@@ -877,7 +877,7 @@ fn place(offset: u64, len: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod place_tests {
     use super::place;
 
     #[test]

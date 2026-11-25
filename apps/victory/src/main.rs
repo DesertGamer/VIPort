@@ -308,10 +308,7 @@ mod tests {
         let err = victory_core::ensure_outside_repo(&inside).unwrap_err();
         assert!(err.to_string().contains("inside"));
     }
-}
 
-#[cfg(test)]
-mod tests {
     use std::path::PathBuf;
 
     use super::check_policy;

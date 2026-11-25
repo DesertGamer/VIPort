@@ -2921,11 +2921,6 @@ mod breadcrumb_tests {
         assert_eq!(last.take_dynamic(&heap, key, total), None);
         assert!(!reset.lease().is_lost());
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn changing_root_signatures_invalidates_only_the_matching_bindings() {

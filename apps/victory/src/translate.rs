@@ -940,10 +940,7 @@ Validation failed.";
         );
         assert_eq!(validator_reason(""), "");
     }
-}
 
-#[cfg(test)]
-mod tests {
     use super::Tally;
 
     #[test]

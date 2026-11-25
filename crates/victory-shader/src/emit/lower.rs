@@ -4657,7 +4657,7 @@ impl<'a> Lower<'a> {
                 // when the program reads that word as data.
                 let reads_word3 = (0..count)
                     .filter(|&k| k.wrapping_sub(u32::from(first)) == 3)
-                    .filter_map(|k| inst.write(Reg::S(code + k as u8)))
+                    .filter_map(|k| inst.write(self.x.p, Reg::S(code + k as u8)))
                     .any(|v| self.read_as_data(v));
                 let levels = if uav || !reads_word3 {
                     one
@@ -4981,7 +4981,7 @@ impl<'a> Lower<'a> {
                     !matches!(
                         i.fields,
                         Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }
-                    ) && i.reads.iter().any(|r| r.1 == v)
+                    ) && i.reads(self.x.p).iter().any(|r| r.1 == v)
                 })
         })
     }
