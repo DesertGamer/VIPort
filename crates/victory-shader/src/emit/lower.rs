@@ -1626,7 +1626,6 @@ impl<'a> Lower<'a> {
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             #[cfg(test)]
-            #[cfg(test)]
             unaligned_typed_loads: self.s.unaligned_typed_loads,
             cmp_samplers,
             root_cbvs,
@@ -5150,11 +5149,13 @@ impl<'a> Lower<'a> {
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
     // shortcut: the descriptor's channel swizzle is taken as the identity
-    // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned. Norm formats divide, which the AMD
-    // driver does 1 ULP off the hardware's correctly rounded conversion for
-    // some values; correct it with an integer check if a title compares
-    // converted values exactly.
+    // (it is for raw views and the descriptors code builds). An element of 4
+    // bytes or more at a constant offset inside a dword is read from the
+    // aligned words around it; at a run-time offset it is still taken as
+    // dword-aligned. Norm formats divide, which the AMD driver does 1 ULP
+    // off the hardware's correctly rounded conversion for some values;
+    // correct it with an integer check if a title compares converted values
+    // exactly.
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;

@@ -164,7 +164,6 @@ impl Shader {
         Shader {
             m,
             #[cfg(test)]
-            #[cfg(test)]
             unaligned_typed_loads: 0,
             t: Types {
                 void,
