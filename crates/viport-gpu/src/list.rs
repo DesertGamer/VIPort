@@ -532,6 +532,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::texture::incompatible_copy(crate::resource::packed_format(src), crate::resource::packed_format(dst)) {
                 return;
             }
+            if std::ptr::eq(to, from) {
+                return;
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
@@ -645,6 +648,9 @@ extern "system" fn copy_texture_region(
             if crate::texture::incompatible_copy(crate::resource::packed_format(src.resource), packed) {
                 return;
             }
+            if std::ptr::eq(to, texture) && same_subresource(&dst, &src) {
+                return;
+            }
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
@@ -695,6 +701,11 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+fn same_subresource(a: &CopyLocation, b: &CopyLocation) -> bool {
+    const SUBRESOURCE: u32 = 0;
+    a.kind == SUBRESOURCE && b.kind == SUBRESOURCE && a.footprint.offset as u32 == b.footprint.offset as u32
 }
 
 #[cfg(windows)]
@@ -1927,6 +1938,22 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tracing::{Event, Metadata, Subscriber, span};
+
+    fn location(kind: u32, offset: u64) -> CopyLocation {
+        CopyLocation {
+            resource: std::ptr::null(),
+            kind,
+            footprint: crate::resource::PlacedFootprint { offset, format: 0, width: 0, height: 0, depth: 0, row_pitch: 0 },
+        }
+    }
+
+    #[test]
+    fn only_equal_subresources_of_a_texture_are_one_place() {
+        assert!(same_subresource(&location(0, 3), &location(0, 3)));
+        assert!(!same_subresource(&location(0, 3), &location(0, 4)));
+        assert!(!same_subresource(&location(1, 3), &location(1, 3)));
+        assert!(!same_subresource(&location(0, 3), &location(1, 3)));
+    }
 
     struct PipelineBinds(Arc<AtomicUsize>);
 

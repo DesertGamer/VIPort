@@ -211,13 +211,12 @@ pub fn title() -> Title {
 pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_STATE,
         ProcessPowerThrottling, SetProcessInformation,
     };
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: throttling_opt_outs(std::env::var_os("VIPORT_EFFICIENCY_MODE").is_some_and(|v| v == "1")),
         StateMask: 0,
     };
     // SAFETY: plain process settings; `keep` outlives the call.
@@ -232,9 +231,34 @@ pub fn use_console_timers() {
     }
 }
 
+#[cfg(windows)]
+fn throttling_opt_outs(efficiency_mode_allowed: bool) -> u32 {
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+    };
+    if efficiency_mode_allowed {
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+    } else {
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn the_process_opts_out_of_efficiency_mode_unless_allowed() {
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        };
+        assert_eq!(
+            throttling_opt_outs(false),
+            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        );
+        assert_eq!(throttling_opt_outs(true), PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION);
+    }
 
     #[test]
     fn reads_title_id_store_id_and_storage_quota() {
