@@ -274,6 +274,12 @@ fn sums_of_absolute_differences_lower() {
 }
 
 #[test]
+fn buffer_cache_invalidations_lower_as_no_ops() {
+    assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
+    assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
+}
+
+#[test]
 fn a_scalar_carry_chain_reaches_the_select() {
     // The high dword of a 64-bit add or subtract, then a select on the
     // carry (borrow) the high half leaves in SCC, and a branch on it
