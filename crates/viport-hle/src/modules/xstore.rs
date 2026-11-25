@@ -7,7 +7,7 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::xasync::{self, AsyncBlock, E_ILLEGAL_METHOD_CALL};
+use super::xasync::{self, AsyncBlock, E_ILLEGAL_METHOD_CALL, E_INVALIDARG};
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
 };
@@ -308,7 +308,8 @@ fn installed_package(title: &runtime::Title, store_id: Option<&str>) -> Option<S
 }
 
 /// The game's own store id maps to its installation; nothing else is
-/// installed.
+/// installed, and any other id gets the documented E_INVALIDARG (not
+/// XPackage's "could not resolve" error).
 extern "system" fn package_identifier(
     _: This,
     store_id: *const c_char,
@@ -316,7 +317,7 @@ extern "system" fn package_identifier(
     buffer: *mut u8,
 ) -> HRESULT {
     let Some(identifier) = installed_package(&runtime::title(), text(store_id).as_deref()) else {
-        return xpackage::NO_PACKAGE;
+        return E_INVALIDARG;
     };
     put_string(&identifier, size, buffer, std::ptr::null_mut())
 }
@@ -1023,11 +1024,11 @@ mod tests {
         // This test's title has no store id, so nothing resolves.
         assert_eq!(
             ident(this, std::ptr::null(), buffer.len(), buffer.as_mut_ptr()),
-            xpackage::NO_PACKAGE
+            E_INVALIDARG
         );
         assert_eq!(
             ident(this, c"9XYZ".as_ptr(), buffer.len(), buffer.as_mut_ptr()),
-            xpackage::NO_PACKAGE
+            E_INVALIDARG
         );
         assert_eq!(buffer, [0u8; 33], "nothing written");
 
@@ -1103,5 +1104,16 @@ mod tests {
         assert!(!method::<extern "system" fn(This, Handle) -> bool>(
             &OBJECT, 0xb0
         )(this, l));
+    }
+
+    #[test]
+    fn a_store_id_without_a_package_is_an_invalid_argument() {
+        type Query = extern "system" fn(This, *const c_char, usize, *mut u8) -> HRESULT;
+        let query = method::<Query>(&OBJECT, 0x208);
+        let mut id = [0u8; 33];
+        assert_eq!(
+            query(&OBJECT, c"9NOTINSTALLED".as_ptr(), 33, id.as_mut_ptr()),
+            E_INVALIDARG
+        );
     }
 }
