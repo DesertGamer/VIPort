@@ -87,6 +87,10 @@ extern "system" fn completed(this: This) -> u64 {
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
+    #[cfg(windows)]
+    if event.is_null() && fence.value.load(Ordering::Acquire) < value {
+        crate::host::settle();
+    }
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {

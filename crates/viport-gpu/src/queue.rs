@@ -141,6 +141,10 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
                 );
             }
         }
+        if crate::host::async_submit() {
+            host.execute_async(&host_lists, leases);
+            return;
+        }
         host.execute(&host_lists);
         for lease in leases {
             lease.finish();
@@ -184,6 +188,14 @@ extern "system" fn signal(_queue: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(feature = "diagnostics")]
     tracing::trace!(target: "viport_gpu::sync_wait", queue = ?_queue, ?fence, value, "queue signal requested");
+    #[cfg(windows)]
+    if crate::host::async_submit() {
+        let at = fence as usize;
+        crate::host::after_landing(move || {
+            crate::fence::signal(at as This, value);
+        });
+        return S_OK;
+    }
     crate::fence::signal(fence, value)
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
@@ -396,6 +408,8 @@ extern "system" fn copy_page_mappings(
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
+    #[cfg(windows)]
+    crate::host::settle();
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };

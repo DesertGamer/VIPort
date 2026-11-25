@@ -502,7 +502,12 @@ fn translate(
             .filter(|h| !h.is_empty())
             .collect()
     });
-    let hash = (list || !only.is_empty()).then(|| blake3::hash(&bytes).to_hex().to_string());
+    let hash = (list || !only.is_empty()).then(|| {
+        let size = bytes.get(0x18..0x1c).map_or(0, |b| {
+            u32::from_le_bytes(b.try_into().expect("4")) as usize
+        });
+        blake3::hash(&bytes[..size.min(bytes.len())]).to_hex().to_string()
+    });
     if !only.is_empty() && !hash.as_ref().is_some_and(|h| only.iter().any(|o| h.starts_with(o.as_str()))) {
         return;
     }

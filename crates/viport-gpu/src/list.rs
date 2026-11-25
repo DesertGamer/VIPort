@@ -299,6 +299,10 @@ extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HR
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
 extern "system" fn list_release(this: This) -> u32 {
+    #[cfg(windows)]
+    if let Some(host) = host_list(this) {
+        crate::host::wait_list(host);
+    }
     object::release_boxed::<List>(this)
 }
 extern "system" fn list_type(this: This) -> u32 {

@@ -246,7 +246,7 @@ pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<
         }
     });
     let data = data as usize;
-    list.defer_after(move || {
+    list.defer_after_host(move || {
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
         let on = heap_usage_on() && heap != 0;

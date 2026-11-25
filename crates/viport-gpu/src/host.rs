@@ -210,6 +210,40 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+static AIR: crate::flight::Air = crate::flight::Air::new();
+static LANDER: std::sync::Once = std::sync::Once::new();
+
+pub(crate) fn async_submit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        #[cfg(feature = "diagnostics")]
+        let single_lists = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let single_lists = false;
+        let on = crate::switch::on("VIPORT_ASYNC_SUBMIT") && !single_lists;
+        if on {
+            tracing::info!("submissions are landed by a thread of ours while the next is prepared (VIPORT_ASYNC_SUBMIT=1)");
+        }
+        on
+    })
+}
+
+pub(crate) fn settle() {
+    AIR.settle();
+}
+
+pub(crate) fn wait_list(list: &HostList) {
+    AIR.wait_lists(&[std::ptr::from_ref(list) as usize]);
+}
+
+pub(crate) fn after_landing(work: impl FnOnce() + Send + 'static) {
+    AIR.after_landing(Box::new(work));
+}
+
+fn gate(from: usize, to: usize) {
+    AIR.gate(from, to);
+}
+
 /// Verifies that the host device is usable before starting a title.
 pub fn ensure_ready() -> Result<(), String> {
     if host().is_some() {
@@ -985,6 +1019,7 @@ struct Deferred {
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
+    after_open: bool,
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
@@ -1196,19 +1231,40 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.submit(runs, None);
+    }
+
+    pub(crate) fn execute_async(&self, runs: &[&HostList], leases: Vec<std::sync::Arc<crate::descriptor::lease::Lease>>) {
+        self.submit(runs, Some(leases));
+    }
+
+    fn submit(&self, runs: &[&HostList], mut leases: Option<Vec<std::sync::Arc<crate::descriptor::lease::Lease>>>) {
         if runs.is_empty() {
+            for lease in leases.into_iter().flatten() {
+                lease.finish();
+            }
             return;
+        }
+        if crate::flight::landing_here() {
+            fail(format_args!("a host submission was made while a landing was running: it would wait for the submission it lands"));
         }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
+        let addresses: Vec<usize> = runs.iter().map(|&l| std::ptr::from_ref(l) as usize).collect();
+        if leases.is_some() {
+            AIR.wait_lists(&addresses);
+        } else {
+            AIR.settle();
+        }
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
+        AIR.gate_open();
         {
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncUs);
@@ -1231,6 +1287,9 @@ impl Host {
             .collect();
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        if !heaps.is_empty() {
+            AIR.settle();
+        }
         let uploads = (!heaps.is_empty())
             .then(|| crate::bindless::uploads(&heaps))
             .flatten();
@@ -1310,6 +1369,46 @@ impl Host {
                 .map(|chunk| &lists[chunk[0].0..chunk[chunk.len() - 1].1])
                 .collect()
         };
+        #[cfg(feature = "diagnostics")]
+        let landed_here = traced;
+        #[cfg(not(feature = "diagnostics"))]
+        let landed_here = false;
+        if leases.is_some() && groups.len() == 1 && uploads.is_none() && !landed_here {
+            AIR.settle();
+            *submitted += 1;
+            let value = *submitted;
+            let armed = unsafe {
+                self.queue.ExecuteCommandLists(groups[0]);
+                let waited = self
+                    .queue
+                    .Signal(&self.fence, value)
+                    .and_then(|()| self.fence.SetEventOnCompletion(value, self.event));
+                if let Err(e) = &waited {
+                    tracing::warn!(error = %e, "host submission not waited for");
+                }
+                waited.is_ok()
+            };
+            let mut footprint = crate::flight::Footprint::default();
+            for list in runs {
+                list.footprint(&mut footprint);
+            }
+            let leases = leases.take().unwrap_or_default();
+            LANDER.call_once(|| {
+                if let Err(e) = std::thread::Builder::new().name("viport-landing".into()).spawn(|| AIR.serve()) {
+                    fail(format_args!("the landing thread could not start: {e}"));
+                }
+            });
+            AIR.fly(
+                addresses.clone(),
+                footprint,
+                Box::new(move || {
+                    if let Some(host) = host() {
+                        host.land_flight(&addresses, leases, armed, started, prepared);
+                    }
+                }),
+            );
+            return;
+        }
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -1377,6 +1476,70 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        self.land(runs, started, prepared, removed_in);
+        // A listed frame: what this submission's lists drew, as it is now
+        // (the dumps submit lists of their own).
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            let sub = *submitted;
+            drop(submitted);
+            let mut targets: Vec<(usize, String)> = Vec::new();
+            for r in runs {
+                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                    if !targets.iter().any(|x| x.0 == t.0) {
+                        targets.push(t.clone());
+                    }
+                }
+            }
+            crate::capture::dump_submission(sub, &targets);
+        }
+        for lease in leases.into_iter().flatten() {
+            lease.finish();
+        }
+    }
+
+    fn land_flight(
+        &self,
+        addresses: &[usize],
+        leases: Vec<std::sync::Arc<crate::descriptor::lease::Lease>>,
+        armed: bool,
+        started: std::time::Instant,
+        prepared: std::time::Instant,
+    ) {
+        let runs: Vec<&HostList> = addresses.iter().map(|&a| unsafe { &*(a as *const HostList) }).collect();
+        if armed {
+            let ended = unsafe {
+                wait_for_submission(
+                    || WaitForSingleObject(self.event, WAIT_SLICE_MS) != WAIT_TIMEOUT,
+                    || self.device.GetDeviceRemovedReason().is_err(),
+                    |secs| {
+                        tracing::warn!(secs, lists = runs.len(), "host submission still on the GPU");
+                    },
+                )
+            };
+            if matches!(ended, Waited::Stalled) {
+                fail(format_args!(
+                    "host GPU has not finished a submission of {} lists in {STALL_SECS} s and reports \
+                     no removal: the GPU has most likely faulted or hung (on Linux the kernel log \
+                     names a fault){}",
+                    runs.len(),
+                    last_notes(&runs)
+                ));
+            }
+        }
+        self.land(&runs, started, prepared, None);
+        for lease in leases {
+            lease.finish();
+        }
+    }
+
+    fn land(
+        &self,
+        runs: &[&HostList],
+        started: std::time::Instant,
+        prepared: std::time::Instant,
+        removed_in: Option<usize>,
+    ) {
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1500,22 +1663,6 @@ impl Host {
         // The submission has run and the next waits for our lock.
         release_retired();
         self.log_messages();
-        // A listed frame: what this submission's lists drew, as it is now
-        // (the dumps submit lists of their own).
-        #[cfg(feature = "diagnostics")]
-        if traced {
-            let sub = *submitted;
-            drop(submitted);
-            let mut targets: Vec<(usize, String)> = Vec::new();
-            for r in runs {
-                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                    if !targets.iter().any(|x| x.0 == t.0) {
-                        targets.push(t.clone());
-                    }
-                }
-            }
-            crate::capture::dump_submission(sub, &targets);
-        }
     }
 
     /// With `VIPORT_D3D12_DRED`: the faulting address and the allocations
@@ -1857,6 +2004,31 @@ impl HostList {
             || node_is_list(None, ansi.as_deref(), &pointers, &name)
     }
 
+    fn footprint(&self, out: &mut crate::flight::Footprint) {
+        let deferred = self.deferred();
+        if deferred.after_open || !deferred.missed.is_empty() {
+            out.open_ended();
+        }
+        for step in &deferred.copies {
+            match step {
+                Step::GpuWrite(_, address, len) => out.add(*address, address.saturating_add(*len)),
+                Step::Memory(_) => out.open_ended(),
+                _ => {}
+            }
+        }
+        for &(_, to, len) in &deferred.readbacks {
+            out.add(to, to.saturating_add(len));
+        }
+        for (_, targets) in &deferred.resolves {
+            for &(at, _, bytes) in targets {
+                out.add(at, at.saturating_add(bytes));
+            }
+        }
+        for &(at, _, bytes) in &deferred.writes {
+            out.add(at, at.saturating_add(bytes));
+        }
+    }
+
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -1882,6 +2054,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        wait_list(self);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2322,6 +2495,12 @@ impl HostList {
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        let mut deferred = self.deferred();
+        deferred.after_open = true;
+        deferred.after.push(Box::new(work));
+    }
+
+    pub(crate) fn defer_after_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
     }
 
@@ -2388,6 +2567,7 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.uploads.push(buffer.clone());
         let data = data as usize;
+        deferred.after_open = true;
         deferred.after.push(Box::new(move || work(data as *const u8)));
         Some(buffer)
     }
@@ -2518,6 +2698,8 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    gate(dst, dst.saturating_add(len));
+                    gate(src, src.saturating_add(len));
                     batch.title_written(Some((dst, dst.saturating_add(len))));
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
@@ -2530,6 +2712,7 @@ impl HostList {
                 } => {
                     started = std::time::Instant::now();
                     let fill = |dst: usize, src: usize, len: usize, padded: usize| {
+                        gate(src, src.saturating_add(len));
                         #[cfg(feature = "diagnostics")]
                         {
                             add(C::Copies, 1);
@@ -2575,6 +2758,7 @@ impl HostList {
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
+                        AIR.settle();
                         batch.title_written(None);
                     }
                     #[cfg(feature = "diagnostics")]
@@ -2590,11 +2774,13 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
+                    gate(*address, address.saturating_add(*len));
                     shadow.writing(*address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging, staging.title_range()) {
+                        AIR.settle();
                         staging.refresh();
                     }
                     continue;
@@ -2604,6 +2790,7 @@ impl HostList {
                     continue;
                 }
                 &Step::Memory(heap) => {
+                    AIR.settle();
                     crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
@@ -2784,6 +2971,7 @@ impl Batch {
     }
 
     fn flush_one(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> usize {
+        gate(from, to);
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
@@ -3475,6 +3663,7 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        AIR.settle();
         crate::screenshot::presenter_seen();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };

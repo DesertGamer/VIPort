@@ -33,6 +33,8 @@ pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
 pub mod fence;
+#[cfg(windows)]
+mod flight;
 pub mod frame;
 #[cfg(windows)]
 mod host;
