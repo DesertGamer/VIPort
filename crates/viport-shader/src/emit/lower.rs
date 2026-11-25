@@ -34,6 +34,7 @@ enum Val {
 /// A handle's block, load, first dword, sampler flag and resource
 /// properties.
 type HandleKey = (usize, Site, u8, bool, (u32, u32));
+type MarkKey = (V, u32, Option<V>, bool);
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
@@ -333,6 +334,9 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<HandleKey, V>,
+    marked: HashMap<MarkKey, Vec<usize>>,
+    idom: Vec<usize>,
+    guard_depth: u32,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: whether lanes entering it have already executed a `done`
@@ -822,6 +826,9 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            marked: HashMap::new(),
+            idom: Vec::new(),
+            guard_depth: 0,
             edges: HashMap::new(),
             exported: vec![ExportState::Never; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -1483,6 +1490,7 @@ impl<'a> Lower<'a> {
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
         }
+        self.idom = crate::ir::idoms(&p.blocks, &order, &self.rpo);
         for (n, &b) in order.iter().enumerate() {
             self.block[b] = Some(if n == 0 {
                 self.s.entry
@@ -3169,6 +3177,7 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(self.cur, Term::CondBr(g, then, join));
         let head = self.cur;
         self.cur = then;
+        self.guard_depth += 1;
         Some((head, join))
     }
 
@@ -3180,6 +3189,7 @@ impl<'a> Lower<'a> {
         let then = self.cur;
         self.s.m.terminate(then, Term::Br(join));
         self.cur = join;
+        self.guard_depth -= 1;
         values
             .iter()
             .map(|&(inside, outside)| {
@@ -5451,13 +5461,17 @@ impl<'a> Lower<'a> {
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
-                let index = self.heap_index(*load, *first, sampler)?;
-                let index = self.buffer_guard(src, index, sampler, props);
+                let (raw, src_key) = self.heap_index_keyed(*load, *first, sampler)?;
+                let index = self.buffer_guard(src, raw, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
                 if mark {
-                    self.mark_heap_use(index, !per_lane);
+                    if per_lane {
+                        self.mark_heap_use(index, false);
+                    } else {
+                        self.mark_heap_use_once(index, (src_key.0, src_key.1, src_key.2, index != raw));
+                    }
                 }
                 let h = self
                     .s
@@ -5774,6 +5788,32 @@ impl<'a> Lower<'a> {
     /// callers keep emitting into the block they started in, so a split
     /// here broke dominance ("forward reference outside a phi", run vu12);
     /// every lane's atomic OR costs more GPU time.
+    fn mark_heap_use_once(&mut self, index: V, key: MarkKey) {
+        let at = self.cur_ir;
+        let covered = self.marked.get(&key).is_some_and(|marks| {
+            marks.iter().any(|&m| {
+                let mut d = at;
+                loop {
+                    if d == m {
+                        break true;
+                    }
+                    let up = self.idom[d];
+                    if up == d || up == usize::MAX {
+                        break false;
+                    }
+                    d = up;
+                }
+            })
+        });
+        if covered {
+            return;
+        }
+        self.mark_heap_use(index, true);
+        if self.guard_depth == 0 {
+            self.marked.entry(key).or_default().push(at);
+        }
+    }
+
     fn mark_heap_use(&mut self, index: V, _uniform: bool) {
         let bitmap = self.s.heap_used_handle();
         let c = self.cur;
@@ -5792,6 +5832,15 @@ impl<'a> Lower<'a> {
     }
 
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+        Ok(self.heap_index_keyed(load, first, sampler)?.0)
+    }
+
+    fn heap_index_keyed(
+        &mut self,
+        load: Site,
+        first: u8,
+        sampler: bool,
+    ) -> Result<(V, (V, u32, Option<V>)), Why> {
         let a = *self
             .scalar
             .get(&load)
@@ -5815,18 +5864,19 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let base = li.read(self.x.p, Reg::S(code)).ok_or("a descriptor load")?;
-        let mut addr = self.i32_of(base)?;
-        let k = self
-            .s
-            .m
-            .i32((*offset as u32).wrapping_add(4 * u32::from(first)));
-        addr = self.s.m.bin(c, Bin::Add, addr, k);
+        let base = self.i32_of(base)?;
+        let add = (*offset as u32).wrapping_add(4 * u32::from(first));
+        let k = self.s.m.i32(add);
+        let mut addr = self.s.m.bin(c, Bin::Add, base, k);
+        let mut so_key = None;
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(li, soffset)?;
+            so_key = Some(so);
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        Ok((index, (base, add, so_key)))
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
