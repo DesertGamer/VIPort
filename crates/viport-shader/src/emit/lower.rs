@@ -6574,7 +6574,7 @@ impl<'a> Lower<'a> {
                 );
                 int(self, r)
             }
-            "v_dot4_i32_i8" => {
+            "v_dot4_i32_i8" | "v_dot8_i32_i4" => {
                 // VOP3P: op_sel picks the half each multiplicand's low half
                 // reads, op_sel_hi its high half's; the accumulator is read
                 // whole (as AMD's compilers fold constants into it).
@@ -6612,6 +6612,24 @@ impl<'a> Lower<'a> {
                     xs.push(self.s.m.bin(c, Bin::Or, if lo { top } else { bottom }, hi));
                 }
                 let acc = s(self, 2)?;
+                if name == "v_dot8_i32_i4" {
+                    // Eight signed nibble products and the accumulator,
+                    // wrapping (RDNA2 ISA): each nibble is moved to the top
+                    // and shifted back arithmetically to extend its sign.
+                    let k28 = self.s.m.i32(28);
+                    let mut dot = acc;
+                    for n in 0..8 {
+                        let up = self.s.m.i32(28 - 4 * n);
+                        let mut f = [xs[0], xs[1]];
+                        for x in &mut f {
+                            let t = self.s.m.bin(c, Bin::Shl, *x, up);
+                            *x = self.s.m.bin(c, Bin::AShr, t, k28);
+                        }
+                        let p = self.s.m.bin(c, Bin::Mul, f[0], f[1]);
+                        dot = self.s.m.bin(c, Bin::Add, dot, p);
+                    }
+                    return int(self, dot);
+                }
                 let i32_ty = self.s.t.i32;
                 let r = if folded {
                     let mut dot = acc;
@@ -11852,6 +11870,20 @@ mod tests {
             S_ENDPGM,
         ];
         lowers(&words, 0x8001).unwrap();
+    }
+
+    #[test]
+    fn signed_nibble_dot_products_decode_and_lower() {
+        // VOP3P 0x18 `v_dot8_i32_i4 v1, v0, v0, v0` with op_sel_hi set, then
+        // stored so the product is live.
+        let dot = [0xCC18_4001u32, 0x100 | 0x100 << 9 | 0x100 << 18 | 3 << 27];
+        let program = |dot: [u32; 2]| [dot[0], dot[1], 0xD834_0000, 0x0000_0100, S_ENDPGM];
+        let code: Vec<u8> = program(dot).iter().flat_map(|w| w.to_le_bytes()).collect();
+        let decoded = crate::gfx10::decode(&code).unwrap();
+        assert_eq!(decoded[0].name(), Some("v_dot8_i32_i4"));
+        lowers(&program(dot), 1 << 15).unwrap();
+        // Saturation is not modelled: refused, not computed wrongly.
+        assert!(lowers(&program([dot[0] | 1 << 15, dot[1]]), 1 << 15).is_err());
     }
 
     fn perm_features(selector: u32) -> u64 {
