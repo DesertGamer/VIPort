@@ -32,6 +32,11 @@ const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
         | src0 as u32
 }
 
+/// SOPK `op sdst, simm16`; the arithmetic forms read `sdst` as their first operand.
+const fn sopk(op: u8, sdst: u8, simm16: u16) -> u32 {
+    0xB000_0000 | (op as u32 & 0x1F) << 23 | (sdst as u32 & 0x7F) << 16 | simm16 as u32
+}
+
 /// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
 const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
     [
@@ -1219,6 +1224,91 @@ fn s_min_and_s_max_compare_signed_and_unsigned() {
                 inp[0], inp[1],
             );
         });
+    }
+}
+
+#[test]
+fn s_add_sub_carry_chain_and_k_forms_match_rdna2() {
+    // s_{add,sub}_{u32,i32} s6, s0, s1 (SOP2 0x00..0x03): the low 32 bits.
+    let values = [0u32, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF];
+    let mut pairs = Vec::new();
+    for a in values {
+        for b in values {
+            pairs.push([a, b, 0, 0]);
+        }
+    }
+    type Pick = fn(u32, u32) -> u32;
+    let ops: [(&str, u8, Pick); 4] = [
+        ("s_add_u32", 0x00, u32::wrapping_add),
+        ("s_sub_u32", 0x01, u32::wrapping_sub),
+        ("s_add_i32", 0x02, u32::wrapping_add),
+        ("s_sub_i32", 0x03, u32::wrapping_sub),
+    ];
+    for (name, op, pick) in ops {
+        let shader = build_valu_cs(&[sop2(op, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+        run_cases(&shader, &pairs, |backend, _, inp, got| {
+            let want = pick(inp[0], inp[1]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1],
+            );
+        });
+    }
+
+    // A 64-bit add and subtract as a title writes them: the carry or borrow
+    // out of the low dword (SCC) goes into the high dword.
+    // s_add_u32 s6, s0, s1; s_addc_u32 s7, s2, s3 (SOP2 0x04); v_mov_b32 v0, s7.
+    let add = build_valu_cs(&[
+        sop2(0x00, 6, 0, 1),
+        sop2(0x04, 7, 2, 3),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+    // s_sub_u32 s6, s0, s1; s_subb_u32 s7, s2, s3 (SOP2 0x05); v_mov_b32 v0, s7.
+    let sub = build_valu_cs(&[
+        sop2(0x01, 6, 0, 1),
+        sop2(0x05, 7, 2, 3),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+    let mut cases = Vec::new();
+    for a in values {
+        for b in values {
+            for c in [0u32, 7, 0xFFFF_FFFF] {
+                for d in [0u32, 1, 0xFFFF_FFFF] {
+                    cases.push([a, b, c, d]);
+                }
+            }
+        }
+    }
+    run_cases(&add, &cases, |backend, _, inp, got| {
+        let carry = ((u64::from(inp[0]) + u64::from(inp[1])) >> 32) as u32;
+        let want = inp[2].wrapping_add(inp[3]).wrapping_add(carry);
+        assert_eq!(got, want, "{backend}: s_addc_u32 high of {inp:x?}");
+    });
+    run_cases(&sub, &cases, |backend, _, inp, got| {
+        let borrow = u32::from(inp[0] < inp[1]);
+        let want = inp[2].wrapping_sub(inp[3]).wrapping_sub(borrow);
+        assert_eq!(got, want, "{backend}: s_subb_u32 high of {inp:x?}");
+    });
+
+    // s_addk_i32 / s_mulk_i32 s0, imm (SOPK 0x0f, 0x10): the 16-bit immediate
+    // is sign-extended and the destination is also the first operand.
+    for (name, op, pick) in [
+        ("s_addk_i32", 0x0f_u8, u32::wrapping_add as Pick),
+        ("s_mulk_i32", 0x10, u32::wrapping_mul),
+    ] {
+        for imm in [0x0005_u16, 0x7FFF, 0x8000, 0xFFFF] {
+            let shader = build_valu_cs(&[sopk(op, 0, imm), vop1(0x001, 0, sgpr(0))]);
+            let inputs: Vec<[u32; 4]> = values.iter().map(|&v| [v, 0, 0, 0]).collect();
+            run_cases(&shader, &inputs, |backend, _, inp, got| {
+                let want = pick(inp[0], i32::from(imm as i16) as u32);
+                assert_eq!(
+                    got, want,
+                    "{backend}: {name}({:#010x}, {imm:#06x}) = {got:#010x}, want {want:#010x}",
+                    inp[0],
+                );
+            });
+        }
     }
 }
 
