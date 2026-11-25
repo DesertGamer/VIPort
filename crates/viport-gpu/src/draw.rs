@@ -1072,6 +1072,14 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        if let Some(why) = crate::pipeline::held_back(self.pipeline as This) {
+            once!(why, "a dispatch held back");
+            not_run(why);
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(list, self.pipeline, "dispatch");
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -1731,6 +1739,11 @@ impl State {
         };
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        if let Some(held) = crate::pipeline::held_back(self.pipeline as This) {
+            once!(why = held, "an indirect call held back");
+            why(held);
+            return false;
+        }
         // A call with no host pipeline cannot run, and that is the common
         // case while the world builds its pipelines: #400 measures 1 400-1 750
         // indirect calls a frame dropped this way. Drop it here, before the

@@ -831,10 +831,21 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 /// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
 /// zeros for anything else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
-    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
+    let address = view.map_or(0, view_address);
     let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
     // SAFETY: the mapped view addresses hold 8 bytes per title slot.
     unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
+}
+
+fn view_address(view: &View) -> u64 {
+    match view {
+        View::Shader(_, Some(desc))
+            if desc[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32 =>
+        {
+            u64::from(desc[4]) | u64::from(desc[5]) << 32
+        }
+        _ => buffer_range(view).map_or(0, |(address, _)| address),
+    }
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
@@ -1497,6 +1508,25 @@ fn past_heap_step(highest: u32, index: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_acceleration_structures_view_address_is_its_location() {
+        let mut words = [0u32; 10];
+        (words[1], words[2], words[4], words[5]) = (11, 0x1688, 0x5f1c_0000, 0xd);
+        let mut table = [u32::MAX; 4];
+        write_address(table.as_mut_ptr() as usize, 1, Some(&View::Shader(0, Some(words))));
+        assert_eq!(table, [u32::MAX, u32::MAX, 0x5f1c_0000, 0xd]);
+
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        let mut desc = [0u32; 16];
+        (desc[1], desc[2], desc[6], desc[10], desc[11]) = (1, 0x1688, 64, 0x2345_6700, 1);
+        write_address(table.as_mut_ptr() as usize, 0, Some(&View::Placed(false, resource, desc)));
+        assert_eq!(table, [0x2345_6700, 1, 0x5f1c_0000, 0xd]);
+
+        write_address(table.as_mut_ptr() as usize, 1, None);
+        assert_eq!(table, [0x2345_6700, 1, 0, 0]);
+    }
 
     /// Slots past a capped heap are logged once per 64 Ki step, not each.
     #[test]

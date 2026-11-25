@@ -126,6 +126,7 @@ pub fn run(
             .find(|p| p.is_file())
             .unwrap_or_else(|| title_dir.join(name));
         viport_hle::runtime::set_image_path(dll.base(), &path);
+        viport_gpu::pipeline::note_title_dll(name, dll.base(), dll.info().size_of_image as usize);
     }
     let imported: Vec<&str> = image
         .info()
@@ -404,6 +405,11 @@ impl LateDlls {
                         .find(|p| p.is_file())
                         .unwrap_or_else(|| self.title_dirs[0].join(name));
                     set_image_path(dll.base(), &path);
+                    viport_gpu::pipeline::note_title_dll(
+                        name,
+                        dll.base(),
+                        dll.info().size_of_image as usize,
+                    );
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());

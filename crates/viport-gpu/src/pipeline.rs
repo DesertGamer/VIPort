@@ -203,6 +203,10 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    #[cfg(windows)]
+    builder: bool,
+    #[cfg(windows)]
+    walks_bvh: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -239,6 +243,46 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+#[cfg(windows)]
+pub(crate) fn held_back(this: This) -> Option<&'static str> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    if p.builder && !builder::runs() {
+        return Some("the BVH builder held back: not all its pipelines are made");
+    }
+    if p.walks_bvh && !builder::built() {
+        return Some("a BVH walk held back: the builder has not built its structures");
+    }
+    None
+}
+
+#[cfg(windows)]
+fn walks_bvh(container: &[u8]) -> bool {
+    use viport_shader::{Container, FourCC};
+    let Ok(c) = Container::parse(container) else {
+        return false;
+    };
+    c.part(FourCC::DXIL)
+        .and_then(|part| viport_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| code_walks_bvh(&p.code)))
+}
+
+#[cfg(windows)]
+fn code_walks_bvh(code: &[u8]) -> bool {
+    viport_shader::gfx10::decode(code).is_ok_and(|insts| {
+        insts
+            .iter()
+            .any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh")))
+    })
+}
+
+#[cfg(windows)]
+pub fn note_title_dll(file: &str, base: usize, size: usize) {
+    builder::note_title_dll(file, base, size);
 }
 
 /// Host pipelines queued and not made yet.
@@ -353,19 +397,34 @@ fn code_of(code: &Bytecode) -> Option<*const [u8]> {
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    code: &[*const u8],
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
+    let builder = !code.is_empty() && builder::created_by_builder(code);
+    #[cfg(not(windows))]
+    let _ = code;
+    #[cfg(windows)]
+    let walks_bvh = !builder && shaders.iter().any(|s| walks_bvh(&s.container));
+    #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
     make::early(&host);
+    #[cfg(windows)]
+    if builder {
+        builder::note(&host);
+    }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        builder,
+        #[cfg(windows)]
+        walks_bvh,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -389,6 +448,7 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        &[],
         iid,
         out,
     )
@@ -409,6 +469,7 @@ pub(crate) extern "system" fn create_compute(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
         None,
+        &[desc.stage.code],
         iid,
         out,
     )
@@ -488,6 +549,7 @@ pub(crate) extern "system" fn create_stream(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        &[],
         iid,
         out,
     )
@@ -554,6 +616,8 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(windows)]
+mod builder;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
@@ -697,6 +761,69 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn builder_dispatches_wait_for_every_builder_pipeline() {
+        let _one = builder::test_lock();
+        let code = [0xB0u8; 64];
+        let create = |code: &[u8]| {
+            let desc = ComputeHead {
+                root: std::ptr::null(),
+                stage: Bytecode {
+                    code: code.as_ptr(),
+                    size: code.len(),
+                },
+            };
+            let mut p: This = std::ptr::null();
+            assert_eq!(
+                create_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                S_OK
+            );
+            p
+        };
+        builder::note_title_dll("xboxbvhbuilder.DLL", code.as_ptr() as usize, code.len());
+        let p = create(&code);
+        let other_code = [0xC0u8; 64];
+        let other = create(&other_code);
+        builder::note_title_dll("XboxBvhBuilder.dll", 0, 0);
+        assert!(pipeline(p).builder);
+        assert!(!pipeline(other).builder);
+        let refused = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            make::state(&pipeline(p).host).is_some()
+        });
+        assert!(refused);
+        assert_eq!(make::state(&pipeline(p).host), Some(false));
+        assert!(held_back(p).is_some());
+        assert_eq!(held_back(other), None);
+        for q in [p, other] {
+            slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn programs_that_intersect_rays_walk_the_structures() {
+        let code = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        const S_ENDPGM: u32 = 0xBF81_0000;
+        let rest = 20 << 8 | 3 << 16;
+        let narrow = code(&[0xF198_9F01, rest | 2, S_ENDPGM]);
+        let wide = code(&[0xF19C_9F07, rest | 2, 0x0504_030D, 0x0908_0706, 0x000C_0B0A, S_ENDPGM]);
+        assert!(code_walks_bvh(&narrow));
+        assert!(code_walks_bvh(&wide));
+        assert!(!code_walks_bvh(&code(&[S_ENDPGM])));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn walks_wait_for_the_builder_to_run_whole() {
+        let _one = builder::test_lock();
+        builder::note_title_dll("XboxBvhBuilder.dll", 0x1000, 0x1000);
+        assert!(!builder::built());
+        builder::clear_image_for_tests();
+        assert!(builder::built());
     }
 
     #[test]

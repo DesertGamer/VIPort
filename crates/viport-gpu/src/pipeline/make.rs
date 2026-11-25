@@ -189,6 +189,16 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
+pub(crate) fn begin(p: &Arc<Pending>) {
+    if !p.shaders.is_empty() {
+        start(p, false);
+    }
+}
+
+pub(crate) fn state(p: &Pending) -> Option<bool> {
+    p.made.get().map(Option::is_some)
+}
+
 /// Queues `p` for the workers: once, and once more ahead of the early
 /// starts if a draw waits for it (`now`) while it is still queued.
 fn start(p: &Arc<Pending>, now: bool) {
