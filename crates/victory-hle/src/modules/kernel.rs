@@ -685,19 +685,26 @@ mod tests {
     /// title building paths from it named other folders.
     #[test]
     fn a_title_image_name_is_in_the_ansi_code_page() {
-        let base = 0x7000_0001_0000;
-        let path = r"C:\Spiele\Grüße\game.exe";
-        runtime::set_image_path(base, std::path::Path::new(path));
-        let mut buf = [0xFFu8; 64];
-        let n = GetModuleFileNameA(base as *mut c_void, buf.as_mut_ptr(), buf.len() as u32);
-        let bytes = &buf[..n as usize];
-        assert_eq!(buf[n as usize], 0);
-        assert_eq!(bytes, to_ansi(path));
-        assert_eq!(from_ansi(bytes), path);
         // SAFETY: no arguments.
         let acp = unsafe { windows_sys::Win32::Globalization::GetACP() };
-        if acp == 1252 {
-            assert!(bytes.windows(4).any(|w| w == b"Gr\xFC\xDF"), "{bytes:02x?}");
+        let paths = [
+            (1252, r"C:\Spiele\Grüße\game.exe"),
+            (1251, r"C:\Игры\game.exe"),
+        ];
+        for (i, (page, path)) in paths.into_iter().enumerate() {
+            let base = 0x7000_0001_0000 + i * 0x1_0000;
+            runtime::set_image_path(base, std::path::Path::new(path));
+            let mut buf = [0xFFu8; 64];
+            let n = GetModuleFileNameA(base as *mut c_void, buf.as_mut_ptr(), buf.len() as u32);
+            let bytes = &buf[..n as usize];
+            assert_eq!(buf[n as usize], 0);
+            assert_eq!(bytes, to_ansi(path));
+            if acp == page {
+                assert_eq!(from_ansi(bytes), path);
+            }
+            if acp == 1252 && page == 1252 {
+                assert!(bytes.windows(4).any(|w| w == b"Gr\xFC\xDF"), "{bytes:02x?}");
+            }
         }
     }
 
