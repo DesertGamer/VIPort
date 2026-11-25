@@ -45,6 +45,9 @@ fn main() {
 /// `apps/victory` has: without it Windows 10 reports shader model 6.5 and every
 /// SM 6.6 test is skipped. A no-op unless the runtime is already staged.
 fn app_local_agility_runtime() {
+    // Declared on every build, including the ones that take an early return below: a `cfg`
+    // name has to be known to rustc even when nothing sets it.
+    println!("cargo:rustc-check-cfg=cfg(agility_runtime)");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -59,12 +62,14 @@ fn app_local_agility_runtime() {
         .expect("a profile directory above OUT_DIR")
         .to_path_buf();
     let runtime = profile.join("D3D12").join("D3D12Core.dll");
-    println!("cargo:rerun-if-changed={}", runtime.display());
     if !runtime.is_file() {
         // No app-local runtime: leave the in-box one alone, exactly as a build without
-        // the opt-in would.
+        // the opt-in would. Do not watch the missing file: `rerun-if-changed` on a path
+        // that does not exist reruns this script on every build.
         return;
     }
+    // The runtime is staged: rerun if it is replaced or removed.
+    println!("cargo:rerun-if-changed={}", runtime.display());
 
     // The loader resolves `D3D12SDKPath` next to the running module, and test binaries run
     // from `deps`, so mirror the runtime there before the tests need it.
@@ -72,11 +77,14 @@ fn app_local_agility_runtime() {
     let _ = std::fs::create_dir_all(&deps);
     let _ = std::fs::copy(&runtime, deps.join("D3D12Core.dll"));
 
-    // Export the two symbols the Agility SDK loader looks for in the host module, so
-    // d3d12.dll loads that runtime instead of the in-box copy. Without them Windows 10
-    // reports shader model 6.5 and every SM 6.6 test is skipped.
-    println!("cargo:rustc-link-arg=/EXPORT:D3D12SDKVersion,DATA");
-    println!("cargo:rustc-link-arg=/EXPORT:D3D12SDKPath,DATA");
+    // `src/agility.rs` defines the two symbols the Agility SDK loader looks for in the host
+    // module, and carries the `/EXPORT:...,DATA` directive that publishes them. Neither can
+    // come from here: `cargo:rustc-link-arg` applies to every target of the package, and the
+    // `guard_runs` bench defines no such symbol, so asking it to export one breaks its link
+    // with LNK2001. The directive lives in the object file that defines the symbols instead,
+    // which is also what keeps the runtime selectors out of binaries that do not host a
+    // device — `apps/victory` defines its own copy and two in one binary collide.
+    println!("cargo:rustc-cfg=agility_runtime");
 }
 
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
