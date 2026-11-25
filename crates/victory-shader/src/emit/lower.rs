@@ -5880,7 +5880,7 @@ impl<'a> Lower<'a> {
                     // A host driver reads a constant dot operand's low half in
                     // both halves though, so such a dot is taken by hand from
                     // the byte products rather than through the intrinsic.
-                    if let Some(Operand::Const(cc @ 240..=248)) = v.src.get(k).copied() {
+                    if let Some(Operand::Const(cc @ 240..=248)) = self.x.p.operands(v.src).get(k).copied() {
                         folded = true;
                         let held = Operand::Const(cc);
                         xs.push(self.f16_operand(inst, &held)?);
