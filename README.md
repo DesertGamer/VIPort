@@ -27,13 +27,13 @@ An independent, community-built project on the VIctory codebase: hundreds of pul
 > [Marvisak](https://github.com/Marvisak/VIctory) and its contributors.** It
 > started as an integration fork of it and is now developed independently.
 >
-> VIctory is developed in the open and receives a lot of community pull
+> VIPort is developed in the open and receives a lot of community pull
 > requests (shader lowering, GPU fixes, HLE, formats, tooling). A big queue of
 > them builds up faster than one maintainer can review. VIPort put those
 > contributions together in one tree that builds, passes the tests, and can be
 > tried today, without waiting for each one to land upstream.
 >
-> **VIPort is not the official VIctory project and is not endorsed by its
+> **VIPort is not the official VIPort project and is not endorsed by its
 > author.** Its history, with every author, is kept here intact. VIPort merged
 > from the original until 2026-11-25 and no longer does; the original stays a
 > reference. The code is GPL-3.0, as the original.
@@ -41,7 +41,7 @@ An independent, community-built project on the VIctory codebase: hundreds of pul
 <details>
 <summary><b>На русском</b></summary>
 
-**VIPort** — независимый проект на кодовой базе VIctory (неофициальный, GPL-3.0): запуск GTA VI (Xbox Series X|S) на Windows из ваших файлов. Игра пока не играбельна: меню и вступительное видео работают, дальше игра загружает мир и рисует его по 1–2 секунды на кадр, с дефектами. В репозитории нет игровых данных, их вы приносите сами.
+**VIPort** — независимый проект на кодовой базе VIPort (неофициальный, GPL-3.0): запуск GTA VI (Xbox Series X|S) на Windows из ваших файлов. Игра пока не играбельна: меню и вступительное видео работают, дальше игра загружает мир и рисует его по 1–2 секунды на кадр, с дефектами. В репозитории нет игровых данных, их вы приносите сами.
 
 Нужна помощь: отчёты по железу ([#4](https://github.com/DesertGamer/VIPort/issues/4)), небольшие задачи ([#16](https://github.com/DesertGamer/VIPort/issues/16), [#17](https://github.com/DesertGamer/VIPort/issues/17), [#18](https://github.com/DesertGamer/VIPort/issues/18)) и подсчёт сбоев DirectStorage на вашей видеокарте ([#15](https://github.com/DesertGamer/VIPort/issues/15)). Связь: Telegram [@desertdev](https://t.me/desertdev).
 
@@ -52,7 +52,7 @@ An independent, community-built project on the VIctory codebase: hundreds of pul
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
+The title's x86-64 code runs unchanged inside our process; VIPort supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
@@ -210,7 +210,7 @@ notes above on Windows 11 with an NVIDIA RTX 5070.
 > builds, and Windows then resets the display driver (every monitor goes
 > black for a moment). The latest runs did not, but it is not ruled out; a
 > run can also end on a GPU fault (`crashes.log`). A diagnostics build with
-> `VICTORY_D3D12_WARP=1` renders on the software adapter instead (too slow
+> `VIPORT_D3D12_WARP=1` renders on the software adapter instead (too slow
 > to reach the world in minutes).
 > A world frame can also outlast Windows' 2 s GPU timeout on slower GPUs
 > (`slow host submission` above 2000 ms, then the device is removed as hung);
@@ -263,21 +263,21 @@ the files in its cache.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
+copy viport.example.toml viport.toml   # then set your paths (outside the repo)
 cargo test --workspace -- --test-threads=1 # serializes D3D12 tests; no game data
-cargo run -p victory -- config           # check your paths
+cargo run -p viport -- config           # check your paths
 ```
 
 The shader tests' GPU checks run on the default adapter and WARP. On a machine
-with two GPUs, `$env:VICTORY_ADAPTER=1` runs them on the second (DXGI's
+with two GPUs, `$env:VIPORT_ADAPTER=1` runs them on the second (DXGI's
 adapter order, 0 being the default); the first test to make a device names it.
 
 Run the title:
 
 ```powershell
-cargo build --release -p victory
-target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+cargo build --release -p viport
+target\release\viport.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
+target\release\viport.exe run <game dir>\<the title's exe> --execute
 ```
 
 The `translate --cache` step (minutes; again after a change of the shader
@@ -294,24 +294,24 @@ early, it keeps what it made.
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
 [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
-and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
+and point `VIPORT_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
 `Kits/FidelityFX/signedbin` folder, which holds
 `amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
 upscaler for your GPU (the log says so), the title's own DLLs run. Series X
 mode uses the title's own upscaler; a diagnostics build switches it to
-FidelityFX with `VICTORY_UPSCALER` and `VICTORY_FFX_SCALE` (below).
+FidelityFX with `VIPORT_UPSCALER` and `VIPORT_FFX_SCALE` (below).
 
 Linux (Wine or Proton) is not a supported host, but the title runs as far
 as its loading screen there. The host needs an audio output device: under
 Wine, install its sound driver (on Fedora `wine-pulseaudio`, which `wine`
 alone does not pull in). Without one the title stops on an assert about
-15 s in, and VIctory warns "the host has no audio output device".
+15 s in, and VIPort warns "the host has no audio output device".
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
+are kept under the data folder (default `%LOCALAPPDATA%\viport\data`), derived
 data under the cache folder.
 
-Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
+Set `VIPORT_WINDOW_MAX=1920x1080` before launching to limit the title's
 top-level window to that bounding box. Smaller windows keep their size,
 larger windows keep their proportions, and the monitor's work area still
 limits them. This scales the displayed image; it does not change the
@@ -333,22 +333,22 @@ title's window has focus:
 ## Commands
 
 ```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm] [--effects]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory translate [paths...] --cache [--pipelines] [--jobs N]
-victory meshdump [paths...] [--hash <16 hex>] [--isa] [--compute]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
+viport inspect <exe|dll> [--imports] [--exports]
+viport census [paths...] [--missing] [--strict]
+viport lib-exports <import.lib> [--list]
+viport shader-info [paths...] [--verbose] [--disasm] [--effects]
+viport translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+viport translate [paths...] --cache [--pipelines] [--jobs N]
+viport meshdump [paths...] [--hash <16 hex>] [--isa] [--compute]
+viport run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
-victory config
+viport config
 ```
 
 `translate --jobs N` requires a positive worker count. Omit it to use the
 default worker count.
 
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
+Logging: `VIPORT_LOG=viport_loader=trace,info` (a release build logs
 info and above).
 
 `meshdump` surveys the title's mesh (and with `--compute`, compute)
@@ -369,8 +369,8 @@ from [Microsoft's DirectX Shader Compiler releases](https://github.com/microsoft
 or a current Windows SDK. Set its path for the test session:
 
 ```powershell
-$env:VICTORY_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
-cargo test -p victory-shader --lib --locked -- --test-threads=1
+$env:VIPORT_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
+cargo test -p viport-shader --lib --locked -- --test-threads=1
 ```
 
 Without this override, the validator loader selects the newest installed
@@ -391,56 +391,56 @@ Get-FileHash -Algorithm SHA256 -LiteralPath 'C:\path\to\title\anim.rpf'
 ```
 
 If a hash differs, restore that file from your verified backup and rerun with
-the same build of VIctory and the same options. A breakpoint can have other
+the same build of VIPort and the same options. A breakpoint can have other
 causes. Include the archive verification outcome in your test report.
 
 A release build has no debugging aids. Build them in with
 
 ```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+cargo build --profile diag -p viport --features diagnostics   # target\diag\viport.exe
 ```
 
 The on/off switches below (`...=1`) are off when unset or set to `0`.
 
 | Variable | Effect |
 |----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_LOG=victory_gpu::sync_wait=trace,victory_gpu::sync_write=trace` | requested command-list memory waits and their constant-value producers at recording, submission, and storage in guest memory |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_NO_HOST_PAD=1` | ignores XInput pads, so the keyboard drives the stand-in pad |
-| `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_TITLE_ASSERTS=<n>` | continues past up to `n` `int3` asserts in title code, where the first one ends the process; the check is taken as passed, so what follows it is undefined |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
-| `VICTORY_DUMP_WRITERS=<hash>,...` | with the two above, also the textures a pipeline containing a listed shader hash writes, the first frame it runs, and for its buffers a log line (dwords changed, dwords not zero) |
-| `VICTORY_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged after each submission. Listed frames also log targets of 16 texels or fewer as values, each table view's view words and whether its host slot is null, the host copy of every buffer of 64 bytes or fewer a draw reads (at submission and after its list), and each 1D or 3D texture a dispatch writes, read back right after it |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | each list of a submission run and timed on its own; slow lists are logged, and with `VICTORY_D3D12_DRED=1` their slowest commands are named too — the per-command notes come from that switch, so `VICTORY_GPU_TIMING` alone reports `commands=0`; a device removal names the list it happened in and lists all its commands |
-| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500) |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_MODE=<width>x<height>` | report that display mode instead of the console's 3840x2160 (smaller render targets on smaller hosts) |
-| `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
-| `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^14 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_SHADER_DUMP=<dir>` | writes each shader container and its DXIL as `<hash>.bin` / `<hash>.dxil` when it is translated, for the hashes DRED and timing lines name (`dxc -dumpbin <hash>.dxil`) |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-| `VICTORY_UPSCALER=<rva>[,<kind>]` | the title's upscaler picker returns `kind` (default 7, FidelityFX; 1.0.2.1: `7E93F0`): FidelityFX in Series X mode |
-| `VICTORY_FFX_SCALE=<scale>[,<rva>]` | render scale of the title's FidelityFX path (`0.6667`: 1440p for 4K, `0.5`: 1080p; 1.0.2.1 default rva `28EF680`); with the above, Series X otherwise renders native 4K and overflows its memory plan |
+| `VIPORT_LOG=<target>=debug,...` | debug and trace output |
+| `VIPORT_LOG=viport_gpu::sync_wait=trace,viport_gpu::sync_write=trace` | requested command-list memory waits and their constant-value producers at recording, submission, and storage in guest memory |
+| `VIPORT_STACKS=20,60` | every thread's stack at those seconds |
+| `VIPORT_WATCH=<rva>,...` | logs a title u32 when it changes |
+| `VIPORT_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
+| `VIPORT_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VIPORT_NO_HOST_PAD=1` | ignores XInput pads, so the keyboard drives the stand-in pad |
+| `VIPORT_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
+| `VIPORT_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
+| `VIPORT_TITLE_ASSERTS=<n>` | continues past up to `n` `int3` asserts in title code, where the first one ends the process; the check is taken as passed, so what follows it is undefined |
+| `VIPORT_CAPTURE=<dir>` | saves presented frames (powers of two, or `VIPORT_CAPTURE_FRAMES=<list>`) |
+| `VIPORT_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VIPORT_CAPTURE_WORLD=<list>` | with `VIPORT_CAPTURE`, also saves (and with `VIPORT_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
+| `VIPORT_DUMP_WRITERS=<hash>,...` | with the two above, also the textures a pipeline containing a listed shader hash writes, the first frame it runs, and for its buffers a log line (dwords changed, dwords not zero) |
+| `VIPORT_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged after each submission. Listed frames also log targets of 16 texels or fewer as values, each table view's view words and whether its host slot is null, the host copy of every buffer of 64 bytes or fewer a draw reads (at submission and after its list), and each 1D or 3D texture a dispatch writes, read back right after it |
+| `VIPORT_D3D12_DEBUG=1` | host debug layer |
+| `VIPORT_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
+| `VIPORT_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VIPORT_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VIPORT_GPU_TIMING=1` | each list of a submission run and timed on its own; slow lists are logged, and with `VIPORT_D3D12_DRED=1` their slowest commands are named too — the per-command notes come from that switch, so `VIPORT_GPU_TIMING` alone reports `commands=0`; a device removal names the list it happened in and lists all its commands |
+| `VIPORT_TRACE_SHADERS=<hash>,...` | with `VIPORT_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500) |
+| `VIPORT_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VIPORT_MODE=<width>x<height>` | report that display mode instead of the console's 3840x2160 (smaller render targets on smaller hosts) |
+| `VIPORT_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
+| `VIPORT_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
+| `VIPORT_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^14 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VIPORT_SHADER_DUMP=<dir>` | writes each shader container and its DXIL as `<hash>.bin` / `<hash>.dxil` when it is translated, for the hashes DRED and timing lines name (`dxc -dumpbin <hash>.dxil`) |
+| `VIPORT_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
+| `VIPORT_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+| `VIPORT_UPSCALER=<rva>[,<kind>]` | the title's upscaler picker returns `kind` (default 7, FidelityFX; 1.0.2.1: `7E93F0`): FidelityFX in Series X mode |
+| `VIPORT_FFX_SCALE=<scale>[,<rva>]` | render scale of the title's FidelityFX path (`0.6667`: 1440p for 4K, `0.5`: 1080p; 1.0.2.1 default rva `28EF680`); with the above, Series X otherwise renders native 4K and overflows its memory plan |
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.
 
 For a startup breakpoint (`0x80000003`), run the diagnostics build with
-`VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
+`VIPORT_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
 `crashes.log` entries. A host DLL refusal includes the caller stack in the
 console output. The refusal is expected for DLLs outside the host policy,
 including `rpcrt4.dll`.
@@ -451,7 +451,7 @@ package beside the title executable. `run --execute` checks that it can
 read the RPF9 header before starting this build.
 
 To compare hardware and software rendering, repeat with
-`VICTORY_D3D12_WARP=1` and check the console for
+`VIPORT_D3D12_WARP=1` and check the console for
 `host device on the software adapter (WARP)` to confirm the WARP device was
 created. Compare the exception's module and offset, stack frames, and
 preceding messages across the two runs.

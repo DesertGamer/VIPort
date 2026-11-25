@@ -16,9 +16,9 @@ import time
 from pathlib import Path
 
 parser = argparse.ArgumentParser(
-    description="Synthetic VIctory runtime conformance under Wine"
+    description="Synthetic VIPort runtime conformance under Wine"
 )
-parser.add_argument("--victory", required=True, type=Path)
+parser.add_argument("--viport", required=True, type=Path)
 parser.add_argument("--wine", required=True, type=Path)
 parser.add_argument("--wine-library-dir", action="append", default=[])
 parser.add_argument("--wine-framework-dir")
@@ -34,7 +34,7 @@ if base == repo or repo in base.parents:
     raise SystemExit("Temporary directory must be outside checkout")
 
 root = Path(tempfile.mkdtemp(
-    prefix="victory-runtime-", dir=base
+    prefix="viport-runtime-", dir=base
 )).resolve()
 
 title = root / "title"
@@ -44,12 +44,12 @@ for directory in (title, logs, root / "cache", root / "data"):
     directory.mkdir()
 
 wine = args.wine.expanduser().absolute()
-victory = args.victory.expanduser().resolve()
+viport = args.viport.expanduser().resolve()
 
 print("Laboratory:", root, flush=True)
 
 assert wine.is_file()
-assert victory.is_file()
+assert viport.is_file()
 
 results = []
 
@@ -102,7 +102,7 @@ import_lib("xgameruntime", [
     "XGameRuntimeUninitialize"
 ])
 
-import_lib("victory-pr9-missing", [
+import_lib("viport-pr9-missing", [
     "ProbeMissing"
 ])
 
@@ -576,7 +576,7 @@ for name, defines in cases.items():
             cmd += ["pr9-title.lib"]
 
         if name == "missing":
-            cmd += ["victory-pr9-missing.lib"]
+            cmd += ["viport-pr9-missing.lib"]
 
         build(cmd)
 
@@ -621,14 +621,14 @@ env["WINEDEBUG"] = "-all"
 env["MVK_CONFIG_LOG_LEVEL"] = "0"
 
 for key in list(env):
-    if key.startswith("VICTORY_"):
+    if key.startswith("VIPORT_"):
         env.pop(key)
 
 env.pop("WINEARCH", None)
 
-env["VICTORY_CACHE_DIR"] = winpath(root / "cache")
-env["VICTORY_DATA_DIR"] = winpath(root / "data")
-env["VICTORY_LOG"] = "info"
+env["VIPORT_CACHE_DIR"] = winpath(root / "cache")
+env["VIPORT_DATA_DIR"] = winpath(root / "data")
+env["VIPORT_LOG"] = "info"
 
 def invoke(name, args, timeout=120):
     print(f"\n=== {name} ===", flush=True)
@@ -701,7 +701,7 @@ def loader(case, expected=42, extra=(), execute=True, suffix=""):
         return
 
     args = [
-        winpath(victory),
+        winpath(viport),
         "run",
         winpath(title / f"{case}.exe")
     ]
@@ -806,7 +806,7 @@ for case in (
 ):
     direct(case)
 
-print("\n=== VICTORY LOADER TESTS ===")
+print("\n=== VIPORT LOADER TESTS ===")
 
 loader("host", execute=False, suffix="-map")
 loader("host")
@@ -860,8 +860,8 @@ counts = {
 summary = {
     "counts": counts,
     "results": results,
-    "victory_sha256": hashlib.sha256(
-        victory.read_bytes()
+    "viport_sha256": hashlib.sha256(
+        viport.read_bytes()
     ).hexdigest(),
     "wine": str(wine)
 }

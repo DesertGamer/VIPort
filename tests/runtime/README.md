@@ -2,11 +2,11 @@
 
 This opt-in integration harness builds synthetic x86-64 PE fixtures
 from original source and executes them directly under Wine and through
-VIctory's Windows loader.
+VIPort's Windows loader.
 
 ## Requirements
 
-- A Windows x86-64 build of VIctory.
+- A Windows x86-64 build of VIPort.
 - Wine capable of executing x86-64 Windows programs.
 - AVX2 and FMA support in the execution environment.
 - Python 3, Bash, clang, lld-link, llvm-dlltool and llvm-readobj.
@@ -16,7 +16,7 @@ The compiler and linker tools must be on PATH.
 ## Running
 
     bash tests/runtime/run.sh \
-      --victory /path/to/victory.exe \
+      --viport /path/to/viport.exe \
       --wine /path/to/wine
 
 For bundled macOS Wine engines, optional repeated
@@ -51,7 +51,7 @@ Homebrew LLVM/LLD 23.1.6.
 
 The initial local laboratory recorded 37 successful checks:
 12 fixture builds, 9 direct execution controls and
-16 VIctory loader checks.
+16 VIPort loader checks.
 
 No game files or proprietary assets are required.
 

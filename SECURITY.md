@@ -1,6 +1,6 @@
 # Security
 
-VIctory runs a title's machine code inside its own process, with the rights of
+VIPort runs a title's machine code inside its own process, with the rights of
 the user who started it, and it loads libraries, reads and writes files and
 talks to the GPU driver on that user's behalf. A mistake or a hostile change
 here is more serious than in an ordinary application.

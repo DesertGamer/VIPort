@@ -1,0 +1,39 @@
+[package]
+name = "viport"
+description = "Command-line front end: inspect, census, convert, run."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+viport-core.workspace = true
+viport-pe.workspace = true
+viport-loader.workspace = true
+viport-hle.workspace = true
+viport-gpu.workspace = true
+viport-shader = { workspace = true, features = ["host"] }
+viport-game.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+memchr.workspace = true
+clap.workspace = true
+walkdir.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Memory"] }
+
+[features]
+# Debug-level logs and the debugging switches (frame capture, stack dumps,
+# the host debug layer, scripted keys). Off in a plain release build.
+diagnostics = [
+    "viport-core/diagnostics",
+    "viport-hle/diagnostics",
+    "viport-loader/diagnostics",
+    "viport-shader/diagnostics",
+]
+
+[lints]
+workspace = true

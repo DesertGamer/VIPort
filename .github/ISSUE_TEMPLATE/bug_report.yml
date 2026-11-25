@@ -46,5 +46,5 @@ body:
     id: log
     attributes:
       label: Log
-      description: The relevant lines of the run output or `crashes.log`, with `VICTORY_LOG` set if you know how. A short excerpt is better than the whole file.
+      description: The relevant lines of the run output or `crashes.log`, with `VIPORT_LOG` set if you know how. A short excerpt is better than the whole file.
       render: text

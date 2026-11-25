@@ -24,7 +24,7 @@ and a Direct3D 12 GPU. Rust is pinned in `rust-toolchain.toml`.
 
 ```powershell
 cargo xtask install-hooks
-copy victory.example.toml victory.toml
+copy viport.example.toml viport.toml
 cargo test --workspace
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
@@ -33,7 +33,7 @@ The tree is not fully `rustfmt`-clean and CI does not check it. Format the
 code you write (`rustfmt.toml` is in the repository) but do not reformat files
 or lines you did not change.
 
-`cargo test --workspace` needs no game data. `victory.toml` is ignored by git;
+`cargo test --workspace` needs no game data. `viport.toml` is ignored by git;
 keep every path in it outside the repository.
 
 ## What a good pull request looks like
@@ -87,7 +87,7 @@ your change does not depend on anything VIPort-specific, send it there too.
 
 See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md). Security problems go through
 [SECURITY.md](SECURITY.md), not a public issue.
-# Contributing to VIctory
+# Contributing to VIPort
 
 You can help with source code, synthetic tests, documentation, or reproducible
 compatibility reports. You do not need game files for the source and test
@@ -107,7 +107,7 @@ your fork, run the checks that apply to your change:
 
 ```powershell
 cargo xtask install-hooks
-cargo test --locked -p victory-formats
+cargo test --locked -p viport-formats
 cargo xtask policy
 ```
 
@@ -120,7 +120,7 @@ Format only the Rust files you touch so unrelated changes stay out of the PR.
 
 ## Write a useful report
 
-Include the VIctory commit, build profile, Windows version, CPU, GPU and driver.
+Include the VIPort commit, build profile, Windows version, CPU, GPU and driver.
 Give the command or settings needed to reproduce the issue, the last stage
 that worked, and the exact error code if available. Replace personal paths
 with placeholders. When comparing two builds, use the same settings and give
