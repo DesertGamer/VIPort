@@ -381,10 +381,6 @@ impl Staging {
         (size, true)
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer. The
-    /// buffer is a mapped upload heap (write-combined), where the scattered
-    /// writes of detiling are very slow: each subresource is detiled into
-    /// cached memory, then copied over in one sequential pass.
     fn detile(&self, tiled: &[u8]) {
         let mut cached = DETILE_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
