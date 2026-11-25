@@ -204,7 +204,7 @@ pub(crate) fn sync_heaps() {
 #[cfg(windows)]
 pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<u64> {
     let words = (viport_shader::emit::HEAP_VIEWS / 32) as usize;
-    let (bitmap, data) = crate::host::host()?.shared_buffer((words as u64 * 4).next_multiple_of(256))?;
+    let (bitmap, back, data) = crate::host::host()?.gpu_bitmap((words as u64 * 4).next_multiple_of(256))?;
     crate::host::name(&bitmap, || "heap slots read".into());
     // SAFETY: our mapped buffer of at least `words` dwords.
     unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
@@ -219,6 +219,28 @@ pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<
         if heap == 0 {
             USAGE.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+    list.keep(&back);
+    let copied = (bitmap.clone(), back);
+    list.defer_closing(move |l| {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        };
+        let (from, to) = &copied;
+        // SAFETY: an open list; both buffers live as long as it.
+        unsafe {
+            l.ResourceBarrier(&[crate::host::transition(
+                from,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            l.CopyResource(to, from);
+            l.ResourceBarrier(&[crate::host::transition(
+                from,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+    });
         let mut used = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             if *mark == 0 {

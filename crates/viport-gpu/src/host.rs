@@ -977,6 +977,7 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    closing: Vec<Box<dyn Fn(&ID3D12GraphicsCommandList) + Send>>,
 }
 
 impl Deferred {
@@ -1835,6 +1836,10 @@ impl HostList {
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
+        let closing = std::mem::take(&mut self.deferred().closing);
+        for work in &closing {
+            work(&self.list);
+        }
             ));
         }
     }
@@ -2276,6 +2281,10 @@ impl HostList {
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
+    pub(crate) fn defer_closing(&self, work: impl Fn(&ID3D12GraphicsCommandList) + Send + 'static) {
+        self.deferred().closing.push(Box::new(work));
+    }
+
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -3031,6 +3040,40 @@ impl Host {
         size: u64,
         kind: D3D12_HEAP_TYPE,
         state: D3D12_RESOURCE_STATES,
+    pub(crate) fn gpu_bitmap(&self, size: u64) -> Option<(ID3D12Resource, ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a buffer in video memory.
+        unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                    &mut buffer,
+                )
+                .ok()?;
+        }
+        let (back, data) = self.read_back_buffer(size)?;
+        Some((buffer?, back, data))
+    }
+
     ) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: kind,
