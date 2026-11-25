@@ -123,9 +123,12 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         .unwrap_or_else(|e| e.into_inner());
     let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
     for &(label, warp) in super::valu_tests::backends(force_warp) {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("no SM 6.6 {label} device ({e}); skipped");
+                continue;
+            }
         };
         let (root, pso) = match host.compute_pipeline(shader) {
             Ok(p) => p,

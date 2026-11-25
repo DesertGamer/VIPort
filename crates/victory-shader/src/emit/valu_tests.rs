@@ -219,9 +219,12 @@ fn run_cases(
     let mut ran = 0;
     let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
     for &(label, warp) in backends(force_warp) {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("no SM 6.6 {label} device ({e}); skipped");
+                continue;
+            }
         };
         let (root, pso) = host
             .compute_pipeline(shader)
