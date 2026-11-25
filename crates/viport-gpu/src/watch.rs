@@ -397,8 +397,9 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
 }
 
 /// Pages `[first, last)` changed, and so the pages showing the same memory
-/// elsewhere: gives write access back where we guarded them and marks them
-/// in every tracker holding them. True if one of `[first, last)` was
+/// elsewhere: gives write access back where we guarded `[first, last)` and
+/// marks all in every tracker holding them (the other mappings stay guarded:
+/// a later write there faults again). True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize) -> bool {
     let guarded = changed_here(g, first, last);
@@ -409,7 +410,7 @@ fn changed(g: &mut Guards, first: usize, last: usize) -> bool {
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
     for page in others {
-        changed_here(g, page, page + 1);
+        mark(g, page, page + 1);
     }
     guarded
 }
@@ -420,6 +421,11 @@ fn changed_here(g: &mut Guards, first: usize, last: usize) -> bool {
     for &page in &guarded {
         open(g, page);
     }
+    mark(g, first, last);
+    !guarded.is_empty()
+}
+
+fn mark(g: &mut Guards, first: usize, last: usize) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
@@ -427,7 +433,6 @@ fn changed_here(g: &mut Guards, first: usize, last: usize) -> bool {
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
     }
-    !guarded.is_empty()
 }
 
 /// At each presented frame (diagnostics): counts the tracked pages written
@@ -768,11 +773,16 @@ pub(crate) mod tests {
     /// title's pool view and tiled heap show the same physical pages),
     /// reported as the runtime does when it maps them.
     pub(crate) fn twin_views(pages: usize) -> (usize, usize) {
+        let views = views(pages, 2);
+        (views[0], views[1])
+    }
+
+    fn views(pages: usize, count: usize) -> Vec<usize> {
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
         let len = pages * PAGE;
-        // SAFETY: a pagefile section mapped read-write twice; the test
-        // keeps both views.
-        let (a, b) = unsafe {
+        // SAFETY: a pagefile section mapped read-write `count` times; the
+        // test keeps all views.
+        let views: Vec<usize> = unsafe {
             let section = CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
@@ -782,16 +792,87 @@ pub(crate) mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            (
-                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize,
-                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize,
-            )
+            (0..count)
+                .map(|_| MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize)
+                .collect()
         };
-        assert!(a != 0 && b != 0);
+        assert!(views.iter().all(|&v| v != 0));
         for k in (0..len).step_by(PAGE) {
-            title_memory_aliased(b + k, &[a + k]);
+            for (i, &view) in views.iter().enumerate().skip(1) {
+                let earlier: Vec<usize> = views[..i].iter().map(|&v| v + k).collect();
+                title_memory_aliased(view + k, &earlier);
+            }
         }
-        (a, b)
+        views
+    }
+
+    fn open_pages(views: &[usize], pages: usize) -> usize {
+        let g = guards();
+        views
+            .iter()
+            .flat_map(|&v| (0..pages).map(move |i| v / PAGE + i))
+            .filter(|p| !g.protected.contains(p))
+            .count()
+    }
+
+    #[test]
+    fn a_write_through_another_mapping_leaves_the_tracked_mapping_guarded() {
+        let (a, b) = twin_views(2);
+        let t = track(a, 2 * PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+        unsafe { ((b + PAGE + 4) as *mut u32).write_volatile(7) };
+        assert!(t.changed(a / PAGE + 1) && !t.changed(a / PAGE));
+        assert!(guards().protected.contains(&(a / PAGE + 1)));
+        assert!(!guards().protected.contains(&(b / PAGE + 1)));
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a + PAGE, a + 2 * PAGE)]);
+        assert!(guards().protected.contains(&(a / PAGE + 1)));
+        assert!(guards().protected.contains(&(b / PAGE + 1)));
+        assert!(t.take(a, a + 2 * PAGE).is_empty());
+    }
+
+    #[test]
+    fn a_write_through_the_tracked_mapping_after_an_alias_write_is_seen() {
+        let (a, b) = twin_views(2);
+        let t = track(a, 2 * PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+        unsafe { ((b + 4) as *mut u32).write_volatile(1) };
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+        unsafe { ((a + 8) as *mut u32).write_volatile(2) };
+        assert!(t.changed(a / PAGE));
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+        assert_eq!(unsafe { ((b + 8) as *const u32).read_volatile() }, 2);
+        assert_eq!(unsafe { ((a + 4) as *const u32).read_volatile() }, 1);
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_alias_writes() {
+        const PAGES: usize = 1000;
+        let views = views(PAGES, 3);
+        let (a, b, c) = (views[0], views[1], views[2]);
+        let t = track(a, PAGES * PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGES * PAGE).len(), 1);
+        let started = std::time::Instant::now();
+        for i in 0..PAGES {
+            let at = if i % 2 == 0 { b } else { c };
+            unsafe { ((at + i * PAGE + 4) as *mut u32).write_volatile(i as u32) };
+        }
+        let writes = started.elapsed();
+        let open = open_pages(&views, PAGES);
+        let started = std::time::Instant::now();
+        let taken = t.take(a, a + PAGES * PAGE);
+        let take = started.elapsed();
+        assert_eq!(taken, [(a, a + PAGES * PAGE)]);
+        let again = open_pages(&views, PAGES);
+        let started = std::time::Instant::now();
+        for i in 0..PAGES {
+            unsafe { ((a + i * PAGE + 8) as *mut u32).write_volatile(i as u32) };
+        }
+        let direct = started.elapsed();
+        println!(
+            "alias writes {writes:?}, open after {open}, take {take:?}, open after take {again}, direct writes {direct:?}, open after {}",
+            open_pages(&views, PAGES)
+        );
     }
 
     /// A write through another mapping of the same pages marks the tracker
@@ -802,10 +883,8 @@ pub(crate) mod tests {
         let (a, b) = twin_views(2);
         let t = track(a, 2 * PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
-        // SAFETY: the second view of the pages, guarded by the take.
         unsafe { ((b + PAGE + 4) as *mut u32).write_volatile(7) };
         assert_eq!(t.take(a, a + 2 * PAGE), [(a + PAGE, a + 2 * PAGE)]);
-        // SAFETY: the tracked view, which shows the write.
         assert_eq!(unsafe { ((a + PAGE + 4) as *const u32).read_volatile() }, 7);
         drop(writing(b, 8));
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
@@ -813,7 +892,6 @@ pub(crate) mod tests {
         // A third mapping made later starts guarded, so its writes count.
         let (c, _) = twin_views(1);
         title_memory_aliased(c, &[a]);
-        // SAFETY: a view of ours (another section: only the tracking
         // takes it for `a`'s pages here).
         unsafe { (c as *mut u32).write_volatile(1) };
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
