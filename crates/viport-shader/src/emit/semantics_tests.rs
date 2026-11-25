@@ -887,6 +887,17 @@ fn mad_legacy(a: u32, b: u32, c: u32) -> u32 {
     add(mul_legacy(a, b), c)
 }
 
+/// `v_fma_legacy_f32` / `v_fmac_legacy_f32`: fused multiply-add with DX9's
+/// `0 × anything = +0` rule (denormals read as zero).
+fn fma_legacy(a: u32, b: u32, c: u32) -> u32 {
+    let (a, b) = (ftz(a), ftz(b));
+    if a & 0x7FFF_FFFF == 0 || b & 0x7FFF_FFFF == 0 {
+        add(0, c)
+    } else {
+        fma(a, b, c)
+    }
+}
+
 /// Minimum or maximum: one NaN operand gives the other, two give the
 /// first; -0 orders below +0 (measured on RDNA2, RX 6800, by the Leonida
 /// project with the AnyPS5 hardware oracle).
@@ -1184,13 +1195,13 @@ fn arithmetic_probes() -> Vec<Probe> {
         probe([vop2(0x05, 5, v(1), 2)], ab, F32, |i| {
             vec![add(i[1], i[0] ^ 0x8000_0000)]
         }),
-        // v_fmac_f32, v_mac_f32 and v_mac_legacy_f32 accumulate into v5 = c.
+        // v_fmac_f32, v_mac_f32 and v_fmac_legacy_f32 accumulate into v5 = c.
         accumulate(0x2B, fma, mad),
         accumulate(0x1F, mad, mad),
-        accumulate(0x06, mad_legacy, mad_legacy),
+        accumulate(0x06, fma_legacy, mad_legacy),
         vop3_f3(0x14B, NONE, fma, mad, abc.clone(), fused),
         vop3_f3(0x141, NONE, mad, mad, abc.clone(), fused),
-        vop3_f3(0x140, NONE, mad_legacy, mad_legacy, abc, fused),
+        vop3_f3(0x140, NONE, fma_legacy, mad_legacy, abc, fused),
     ];
     let small = pairs(F32_EDGES, &F32_EDGES[..16]);
     let abc_small = triples(&F32_EDGES[..16], &F32_EDGES[..16], F32_THIRD);
@@ -1248,7 +1259,7 @@ fn arithmetic_probes() -> Vec<Probe> {
         p.push(vop3_f3(
             0x140,
             m,
-            mad_legacy,
+            fma_legacy,
             mad_legacy,
             abc_small.clone(),
             tolerant(1, m),
@@ -2800,10 +2811,10 @@ fn defect(probes: Vec<Probe>, which: &str) {
     assert_clean(check(&probes));
 }
 
-/// Open: `v_fma_f32`, `v_fmac_f32` and `v_fma_mix*` are fused on the
-/// hardware (RDNA2 ISA; LLVM's `getNewFMAInst` maps `V_FMAC_F32` to
-/// `V_FMA_F32`); the lowering emits DXIL `FMad`, which the host may leave
-/// unfused, and WARP does: NaN for `fma(1.5, MAX, -inf)` (the product
+/// Open: `v_fma_f32`, `v_fmac_f32`, `v_fma_legacy_f32`, `v_fmac_legacy_f32`
+/// and `v_fma_mix*` are fused on the hardware (RDNA2 ISA; LLVM's `getNewFMAInst`
+/// maps `V_FMAC_F32` to `V_FMA_F32`); the lowering emits DXIL `FMad`, which the
+/// host may leave unfused, and WARP does: NaN for `fma(1.5, MAX, -inf)` (the product
 /// overflows first), +inf for `fma(1.5, MAX, -MAX)`, 0 for
 /// `fma(1 - ulp, 1 + ulp, -1)`, +0 for a tiny negative product plus +0.
 /// The RX 6700 XT fuses, and `viport-gpu` warns once at device creation
