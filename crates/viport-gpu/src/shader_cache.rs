@@ -64,6 +64,9 @@ pub fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
+        if let Some(host) = crate::host::host() {
+            viport_shader::emit::set_host_max_wave(host.wave_lanes().1);
+        }
         let limit = viport_shader::emit::loop_limit();
         if limit != viport_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(

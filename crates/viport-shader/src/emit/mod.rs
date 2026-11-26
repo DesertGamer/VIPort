@@ -257,9 +257,29 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
     parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
 }
 
+static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(64);
+
+pub fn set_host_max_wave(lanes: u32) {
+    HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn parse_switch(value: Option<&str>) -> Option<bool> {
+    match value {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+
+fn resolve_switch(forced: Option<bool>, host_max_wave: u32) -> bool {
+    forced.unwrap_or((32..64).contains(&host_max_wave))
+}
+
 pub fn mesh64_on_32() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VIPORT_MESH64_ON_32").is_ok_and(|v| v == "1"))
+    static FORCED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let forced =
+        *FORCED.get_or_init(|| parse_switch(std::env::var("VIPORT_MESH64_ON_32").ok().as_deref()));
+    resolve_switch(forced, HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 #[cfg(test)]
@@ -272,8 +292,10 @@ pub fn wave64_on_32() -> bool {
     if WAVE64_ON_32_FOR_TEST.with(std::cell::Cell::get) {
         return true;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VIPORT_WAVE64_ON_32").is_ok_and(|v| v == "1"))
+    static FORCED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let forced =
+        *FORCED.get_or_init(|| parse_switch(std::env::var("VIPORT_WAVE64_ON_32").ok().as_deref()));
+    resolve_switch(forced, HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 #[cfg(test)]
@@ -665,7 +687,30 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::{parse_loop_limit, parse_shader_opt};
+    use super::{parse_loop_limit, parse_shader_opt, parse_switch, resolve_switch};
+
+    #[test]
+    fn a_switch_is_forced_only_by_one_or_zero() {
+        assert_eq!(parse_switch(Some("1")), Some(true));
+        assert_eq!(parse_switch(Some("0")), Some(false));
+        assert_eq!(parse_switch(Some("yes")), None);
+        assert_eq!(parse_switch(Some("")), None);
+        assert_eq!(parse_switch(None), None);
+    }
+
+    #[test]
+    fn an_unforced_switch_is_on_only_for_hosts_of_32_lane_waves() {
+        assert!(resolve_switch(None, 32));
+        assert!(!resolve_switch(None, 64));
+        assert!(!resolve_switch(None, 16));
+        assert!(!resolve_switch(None, 0));
+    }
+
+    #[test]
+    fn a_forced_switch_wins_over_the_host() {
+        assert!(resolve_switch(Some(true), 64));
+        assert!(!resolve_switch(Some(false), 32));
+    }
 
     /// An `ISG1` part of one element, with the given row register and mask.
     fn isg1(register: u32, mask: u8) -> Vec<u8> {
