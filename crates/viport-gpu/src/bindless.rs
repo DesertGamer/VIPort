@@ -195,10 +195,13 @@ fn left_kind(view: &View) -> usize {
 pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const MOST_SKIPPED: u32 = 8;
-    let stamp = (crate::watch::texture_writes(), HEAP_TEXTURES.load(Relaxed));
+    let stamp = (
+        (crate::watch::texture_writes(), HEAP_TEXTURES.load(Relaxed)),
+        heaps.iter().map(|h| Arc::as_ptr(h) as usize).collect::<Vec<_>>(),
+    );
     {
         let mut clean = CLEAN.lock().unwrap_or_else(|e| e.into_inner());
-        if *clean == Some(stamp) && SKIPPED.load(Relaxed) < MOST_SKIPPED && crate::host::idle() {
+        if clean.as_ref() == Some(&stamp) && SKIPPED.load(Relaxed) < MOST_SKIPPED && crate::host::idle() {
             SKIPPED.fetch_add(1, Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::UpSkipped, 1);
@@ -280,7 +283,8 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
 static POOL: Mutex<Vec<Holder>> = Mutex::new(Vec::new());
 
 static HEAP_TEXTURES: AtomicU64 = AtomicU64::new(0);
-static CLEAN: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+type Clean = ((u64, u64), Vec<usize>);
+static CLEAN: Mutex<Option<Clean>> = Mutex::new(None);
 static SKIPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub(crate) struct Holder(HostList);
