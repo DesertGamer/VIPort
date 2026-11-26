@@ -1015,8 +1015,6 @@ struct Deferred {
     /// Buffer ranges refreshed since the last overlapping title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
-    /// Buffer ranges shaders of the list were declared to write (host copy,
-    /// address, bytes): declaring one again finds its bytes already kept.
     declared: std::collections::HashSet<(usize, usize, usize)>,
     /// Upload fills recorded since the last overlapping title write or upload
     /// overwrite (upload dst, title src, bytes).
@@ -1275,7 +1273,11 @@ impl Host {
         let started = std::time::Instant::now();
         let addresses: Vec<usize> = runs.iter().map(|&l| std::ptr::from_ref(l) as usize).collect();
         if leases.is_some() {
+            #[cfg(feature = "diagnostics")]
+            let waiting = std::time::Instant::now();
             AIR.wait_lists(&addresses);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ListSubmitNs, waiting.elapsed().as_nanos() as u64);
         } else {
             AIR.settle();
         }
@@ -1392,7 +1394,11 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let landed_here = false;
         if leases.is_some() && groups.len() == 1 && !landed_here {
+            #[cfg(feature = "diagnostics")]
+            let settling = std::time::Instant::now();
             AIR.settle();
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ExecSettleNs, settling.elapsed().as_nanos() as u64);
             *submitted += 1;
             let value = *submitted;
             // SAFETY: the lists in `groups` are closed and live until the submission lands.
@@ -2077,7 +2083,11 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        #[cfg(feature = "diagnostics")]
+        let waiting = std::time::Instant::now();
         wait_list(self);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ListResetNs, waiting.elapsed().as_nanos() as u64);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2804,7 +2814,11 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
+                    #[cfg(feature = "diagnostics")]
+                    let gating = std::time::Instant::now();
                     gate(*address, address.saturating_add(*len));
+                    #[cfg(feature = "diagnostics")]
+                    add(C::WriteGateNs, gating.elapsed().as_nanos() as u64);
                     shadow.writing(*address, *len);
                     continue;
                 }
@@ -3001,7 +3015,23 @@ impl Batch {
     }
 
     fn flush_one(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let overlap = AIR.overlap(from, to);
+        #[cfg(feature = "diagnostics")]
+        let changed_under = overlap.iter().any(|&(a, b)| shadow.changed_in(a, b));
+        #[cfg(feature = "diagnostics")]
+        let gating = std::time::Instant::now();
         gate(from, to);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            let waited = gating.elapsed().as_nanos() as u64;
+            add(C::FlushGateNs, waited);
+            if !overlap.is_empty() {
+                add(C::FlushGateOverlaps, 1);
+                add(if changed_under { C::FlushGateChangedNs } else { C::FlushGateNoChangeNs }, waited);
+            }
+        }
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;

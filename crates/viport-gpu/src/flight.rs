@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,29 @@ thread_local! {
 
 pub(crate) fn landing_here() -> bool {
     LANDING.with(Cell::get)
+}
+
+#[derive(Clone, Copy)]
+enum Site {
+    Range,
+    Open,
+    Settle,
+    Lists,
+}
+
+#[cfg(feature = "diagnostics")]
+impl Site {
+    fn note(self, waited: Duration) {
+        use crate::copystat::{C, add};
+        let (calls, us) = match self {
+            Site::Range => (C::BlockedRange, C::BlockedRangeUs),
+            Site::Open => (C::BlockedOpen, C::BlockedOpenUs),
+            Site::Settle => (C::BlockedSettle, C::BlockedSettleUs),
+            Site::Lists => (C::BlockedLists, C::BlockedListsUs),
+        };
+        add(calls, 1);
+        add(us, waited.as_micros() as u64);
+    }
 }
 
 #[derive(Default)]
@@ -46,6 +70,19 @@ impl Footprint {
         self.ranges.truncate(out + usize::from(!self.ranges.is_empty()));
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn cut(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        if self.open {
+            return vec![(from, to)];
+        }
+        let at = self.ranges.partition_point(|&(_, end)| end <= from);
+        self.ranges[at..]
+            .iter()
+            .take_while(|&&(start, _)| start < to)
+            .map(|&(a, b)| (a.max(from), b.min(to)))
+            .collect()
+    }
+
     fn overlaps(&self, from: usize, to: usize) -> bool {
         if self.open {
             return true;
@@ -68,6 +105,7 @@ struct State {
 
 pub(crate) struct Air {
     state: Mutex<State>,
+    flying: AtomicBool,
     work: Condvar,
     landed: Condvar,
 }
@@ -85,6 +123,7 @@ impl Air {
                 },
                 after: Vec::new(),
             }),
+            flying: AtomicBool::new(false),
             work: Condvar::new(),
             landed: Condvar::new(),
         }
@@ -112,34 +151,49 @@ impl Air {
         state
     }
 
-    fn wait_while(&self, stop: impl FnOnce(&State) -> bool) {
-        if landing_here() {
+    fn wait_while(&self, site: Site, stop: impl FnOnce(&State) -> bool) {
+        if landing_here() || !self.flying.load(Ordering::Acquire) {
             return;
         }
         let state = self.lock();
         if state.in_air && stop(&state) {
+            #[cfg(feature = "diagnostics")]
+            let started = Instant::now();
             drop(self.wait_landed(state));
+            #[cfg(feature = "diagnostics")]
+            site.note(started.elapsed());
         }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = site;
     }
 
     pub(crate) fn settle(&self) {
-        self.wait_while(|_| true);
+        self.wait_while(Site::Settle, |_| true);
     }
 
     pub(crate) fn gate(&self, from: usize, to: usize) {
-        self.wait_while(|s| s.footprint.overlaps(from, to));
+        self.wait_while(Site::Range, |s| s.footprint.overlaps(from, to));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn overlap(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        if landing_here() || !self.flying.load(Ordering::Acquire) || from >= to {
+            return Vec::new();
+        }
+        let state = self.lock();
+        if state.in_air { state.footprint.cut(from, to) } else { Vec::new() }
     }
 
     pub(crate) fn idle(&self) -> bool {
-        !self.lock().in_air
+        !self.flying.load(Ordering::Acquire)
     }
 
     pub(crate) fn gate_open(&self) {
-        self.wait_while(|s| s.footprint.open);
+        self.wait_while(Site::Open, |s| s.footprint.open);
     }
 
     pub(crate) fn wait_lists(&self, lists: &[usize]) {
-        self.wait_while(|s| lists.iter().any(|l| s.lists.contains(l)));
+        self.wait_while(Site::Lists, |s| lists.iter().any(|l| s.lists.contains(l)));
     }
 
     pub(crate) fn fly(&self, lists: Vec<usize>, mut footprint: Footprint, landing: Job) {
@@ -149,6 +203,7 @@ impl Air {
             state = self.wait_landed(state);
         }
         state.in_air = true;
+        self.flying.store(true, Ordering::Release);
         state.lists = lists;
         state.footprint = footprint;
         state.job = Some(landing);
@@ -179,6 +234,7 @@ impl Air {
     fn land(&self) {
         let mut state = self.lock();
         state.in_air = false;
+        self.flying.store(false, Ordering::Release);
         state.lists.clear();
         state.footprint = Footprint::default();
         for work in std::mem::take(&mut state.after) {
@@ -291,6 +347,28 @@ mod tests {
         release.send(()).unwrap();
         t1.join().unwrap();
         t2.join().unwrap();
+    }
+
+    #[test]
+    fn nothing_in_the_air_is_decided_without_the_state_lock() {
+        let air = air();
+        assert!(air.idle());
+        let guard = air.lock();
+        let a = air.clone();
+        let (gated, t1) = returns_soon(move || {
+            a.gate(0, 100);
+            a.gate_open();
+            a.settle();
+            a.wait_lists(&[1]);
+        });
+        assert!(gated.load(Ordering::SeqCst), "waiting for nothing does not take the lock");
+        drop(guard);
+        t1.join().unwrap();
+        let release = held(&air, vec![1], footprint(&[(0, 10)]));
+        assert!(!air.idle());
+        release.send(()).unwrap();
+        air.settle();
+        assert!(air.idle());
     }
 
     #[test]

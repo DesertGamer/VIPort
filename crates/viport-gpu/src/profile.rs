@@ -273,7 +273,7 @@ fn run(period: Duration) {
             reported = Instant::now();
             let mut list: Vec<&mut Tracked> = threads.values_mut().filter(|t| t.samples > 0).collect();
             list.sort_by_key(|t| std::cmp::Reverse((t.cpu_ms_report, t.samples)));
-            for t in list.into_iter().take(10) {
+            for (rank, t) in list.into_iter().take(10).enumerate() {
                 tracing::info!(
                     "prof {}: cpu {:.0}% ({} ms), {} samples",
                     t.name,
@@ -283,7 +283,7 @@ fn run(period: Duration) {
                 );
                 let mut stacks: Vec<_> = std::mem::take(&mut t.stacks).into_iter().collect();
                 stacks.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-                for (stack, n) in stacks.into_iter().take(4) {
+                for (stack, n) in stacks.into_iter().take(if rank == 0 { 80 } else { 4 }) {
                     let frames: Vec<String> = stack
                         .iter()
                         .take_while(|&&a| a != 0)

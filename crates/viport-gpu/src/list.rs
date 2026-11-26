@@ -301,7 +301,11 @@ extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HR
 extern "system" fn list_release(this: This) -> u32 {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
+        #[cfg(feature = "diagnostics")]
+        let waiting = std::time::Instant::now();
         crate::host::wait_list(host);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ListReleaseNs, waiting.elapsed().as_nanos() as u64);
     }
     object::release_boxed::<List>(this)
 }

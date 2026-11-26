@@ -49,8 +49,6 @@ struct Changed(Mutex<BTreeSet<usize>>, Mutex<BTreeSet<usize>>, std::sync::atomic
 
 static TEXTURE_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// How many times the memory of trackers made [`Tracked::textures`] was
-/// marked changed.
 pub(crate) fn texture_writes() -> u64 {
     TEXTURE_WRITES.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -322,6 +320,20 @@ impl Tracked {
             }
         }
         runs
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn changed_in(&self, from: usize, to: usize) -> bool {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        from < to
+            && self
+                .changed
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .range(from / PAGE..to.div_ceil(PAGE))
+                .next()
+                .is_some()
     }
 
     pub(crate) fn textures(&self) {

@@ -497,9 +497,6 @@ impl Shadow {
             let mut cursor = from;
             while cursor < to {
                 let n = (PIECE - (start + cursor) % PIECE).min(to - cursor);
-                // A whole piece is compared once per submission, whichever
-                // declared ranges overlap it: then what the GPU wrote there
-                // went back.
                 let compared_before = n == PIECE && !compared.insert(start + cursor);
                 let remapped = !compared_before
                     && self.tracked.as_ref().is_some_and(|t| t.was_remapped((start + cursor) / PAGE));
@@ -603,6 +600,11 @@ impl Shadow {
             }
         }
         written
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn changed_in(&self, from: usize, to: usize) -> bool {
+        self.tracked.as_ref().is_some_and(|t| t.changed_in(from, to))
     }
 
     /// At submission: copies what changed of `[address, address + len)`

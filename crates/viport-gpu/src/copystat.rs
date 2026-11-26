@@ -110,8 +110,25 @@ pub(crate) enum C {
     GpuWritesRepeated,
     FlushRangeNs,
     FlushCoalesceNs,
+    BlockedRange,
+    BlockedRangeUs,
+    BlockedOpen,
+    BlockedOpenUs,
+    BlockedSettle,
+    BlockedSettleUs,
+    BlockedLists,
+    BlockedListsUs,
+    FlushGateNs,
+    WriteGateNs,
+    ExecSettleNs,
+    ListSubmitNs,
+    ListResetNs,
+    ListReleaseNs,
+    FlushGateOverlaps,
+    FlushGateChangedNs,
+    FlushGateNoChangeNs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -356,6 +373,26 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesRepeated as usize],
         c[C::FlushRangeNs as usize] / 1e6,
         c[C::FlushCoalesceNs as usize] / 1e6,
+    );
+    tracing::info!(
+        "  blocked waits per frame: range {:.0} calls {:.1} ms, computed {:.0} calls {:.1} ms, settle {:.0} calls {:.1} ms, lists {:.0} calls {:.1} ms; of the gate time: update flush {:.1} ms, shader write {:.1} ms; settle before execute {:.1} ms; list waits by caller: submit {:.1} ms, reset {:.1} ms, release {:.1} ms; update flush waited on {:.0} ranges: changed pages under them {:.1} ms, none {:.1} ms",
+        c[C::BlockedRange as usize],
+        ms(c[C::BlockedRangeUs as usize]),
+        c[C::BlockedOpen as usize],
+        ms(c[C::BlockedOpenUs as usize]),
+        c[C::BlockedSettle as usize],
+        ms(c[C::BlockedSettleUs as usize]),
+        c[C::BlockedLists as usize],
+        ms(c[C::BlockedListsUs as usize]),
+        c[C::FlushGateNs as usize] / 1e6,
+        c[C::WriteGateNs as usize] / 1e6,
+        c[C::ExecSettleNs as usize] / 1e6,
+        c[C::ListSubmitNs as usize] / 1e6,
+        c[C::ListResetNs as usize] / 1e6,
+        c[C::ListReleaseNs as usize] / 1e6,
+        c[C::FlushGateOverlaps as usize],
+        c[C::FlushGateChangedNs as usize] / 1e6,
+        c[C::FlushGateNoChangeNs as usize] / 1e6,
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
