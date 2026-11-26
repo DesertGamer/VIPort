@@ -696,7 +696,10 @@ impl HostHeap {
             PLACED_WHY[2].fetch_add(1, Relaxed);
             return false;
         };
-        if !is_placed_texture(&view) && !(lazy_views() && is_placed_buffer_view(&view)) {
+        if !is_placed_texture(&view)
+            && !is_unmade_texture(&view)
+            && !(lazy_views() && is_placed_buffer_view(&view))
+        {
             PLACED_WHY[3].fetch_add(1, Relaxed);
             return false;
         }
@@ -777,7 +780,7 @@ impl HostHeap {
                 made[index as usize] = Slot { made: 0, parked: key, lazy };
                 return Some(view);
             }
-            let later = !for_draw && is_placed_texture(&view) || lazy;
+            let later = !for_draw && (is_placed_texture(&view) || is_unmade_texture(&view)) || lazy;
             made[index as usize] = if later {
                 Slot { made: 0, parked: key, lazy }
             } else {
@@ -1418,6 +1421,13 @@ pub(crate) static PLACED_WHY: [std::sync::atomic::AtomicU64; 4] = [const { std::
 
 fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
+}
+
+/// A shader view of a title texture whose host copy is not made yet: made,
+/// with the copy, when a shader reads its slot (as placed textures are),
+/// since the title writes a view of every texture it streams in.
+fn is_unmade_texture(view: &View) -> bool {
+    matches!(view, View::Shader(resource, _) | View::Unordered(resource, ..) if crate::resource::host_pending(*resource as crate::object::This))
 }
 
 fn is_placed_buffer_view(view: &View) -> bool {
