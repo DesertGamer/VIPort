@@ -130,6 +130,10 @@ impl Air {
         self.wait_while(|s| s.footprint.overlaps(from, to));
     }
 
+    pub(crate) fn idle(&self) -> bool {
+        !self.lock().in_air
+    }
+
     pub(crate) fn gate_open(&self) {
         self.wait_while(|s| s.footprint.open);
     }

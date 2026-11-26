@@ -447,6 +447,33 @@ impl Shadow {
         written
     }
 
+    fn differing(&self, pieces: &[(usize, usize)], from: usize, before: &[u8]) -> Vec<bool> {
+        const THREADS: usize = 4;
+        const PARALLEL_BYTES: usize = 8 << 20;
+        let data = self.data as usize;
+        let differs = move |&(at, n): &(usize, usize)| {
+            // SAFETY: inside the mapping; only the submitting thread writes it.
+            let host = unsafe { std::slice::from_raw_parts((data as *const u8).add(at), n) };
+            host != &before[at - from..at - from + n]
+        };
+        let bytes: usize = pieces.iter().map(|p| p.1).sum();
+        if pieces.len() < 2 * THREADS || bytes < PARALLEL_BYTES {
+            return pieces.iter().map(differs).collect();
+        }
+        let mut out = vec![false; pieces.len()];
+        let chunk = pieces.len().div_ceil(THREADS);
+        std::thread::scope(|scope| {
+            for (part, slots) in pieces.chunks(chunk).zip(out.chunks_mut(chunk)) {
+                scope.spawn(move || {
+                    for (piece, slot) in part.iter().zip(slots) {
+                        *slot = differs(piece);
+                    }
+                });
+            }
+        });
+        out
+    }
+
     fn copy_back_inner(&self, address: usize, len: usize, back: bool) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
@@ -466,39 +493,44 @@ impl Shadow {
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
-            let mut at = from;
-            while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
+            let mut pieces: Vec<(usize, usize)> = Vec::new();
+            let mut cursor = from;
+            while cursor < to {
+                let n = (PIECE - (start + cursor) % PIECE).min(to - cursor);
+                // A whole piece is compared once per submission, whichever
+                // declared ranges overlap it: then what the GPU wrote there
+                // went back.
+                let compared_before = n == PIECE && !compared.insert(start + cursor);
+                let remapped = !compared_before
+                    && self.tracked.as_ref().is_some_and(|t| t.was_remapped((start + cursor) / PAGE));
+                if !compared_before && !remapped {
+                    pieces.push((cursor, n));
+                }
+                cursor += n;
+            }
+            #[cfg(feature = "diagnostics")]
+            let t0 = std::time::Instant::now();
+            let differing = self.differing(&pieces, from, before);
+            #[cfg(feature = "diagnostics")]
+            {
+                cb_time(2, t0);
+                crate::copystat::add(
+                    crate::copystat::C::CompareBytes,
+                    pieces.iter().map(|p| p.1 as u64).sum(),
+                );
+            }
+            for (&(at, n), &differs) in pieces.iter().zip(&differing) {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
-                // A whole piece is compared once per submission, whichever
-                // declared ranges overlap it: then what the GPU wrote there
-                // went back.
-                if n == PIECE && !compared.insert(start + at) {
-                    at += n;
-                    continue;
-                }
-                if self.tracked.as_ref().is_some_and(|t| t.was_remapped((start + at) / PAGE)) {
-                    at += n;
-                    continue;
-                }
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                #[cfg(feature = "diagnostics")]
-                let t0 = std::time::Instant::now();
-                let differs = host != old;
                 if differs && learning() {
                     let last = host.iter().zip(old).rposition(|(h, o)| h != o).unwrap_or(0);
                     written_end = written_end.max(at - from + last + 1);
                 }
                 #[cfg(feature = "diagnostics")]
-                {
-                    cb_time(2, t0);
-                    cb_add(6, 1);
-                }
+                cb_add(6, 1);
                 #[cfg(feature = "diagnostics")]
                 let t1 = std::time::Instant::now();
                 let read = differs && crate::host::read_into((start + at) as *const u8, title);
@@ -536,7 +568,6 @@ impl Shadow {
                     }
                     synced.push((start + at) / PAGE);
                 }
-                at += n;
             }
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what

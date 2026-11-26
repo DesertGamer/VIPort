@@ -97,8 +97,21 @@ pub(crate) enum C {
     /// the time.
     CompareBytes,
     CompareUs,
+    GateCalls,
+    GateUs,
+    SettleCalls,
+    SettleUs,
+    UpWaitUs,
+    UpVisited,
+    UpLoopUs,
+    UpRecorded,
+    UpSkipped,
+    GpuWrites,
+    GpuWritesRepeated,
+    FlushRangeNs,
+    FlushCoalesceNs,
 }
-const COUNTERS: usize = 64;
+const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -328,6 +341,22 @@ pub(crate) fn log(frames: f64) {
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    tracing::info!(
+        "  waits per frame: gate {:.0} calls {:.1} ms, settle {:.0} calls {:.1} ms; heap uploads: wait loop {:.1} ms over {:.0} textures, upload loop {:.1} ms, {:.0} recorded, {:.0} passes skipped; shader writes declared {:.0}, {:.0} of them repeated; flush: range stats {:.1} ms, coalescing {:.1} ms",
+        c[C::GateCalls as usize],
+        c[C::GateUs as usize] / 1e6,
+        c[C::SettleCalls as usize],
+        ms(c[C::SettleUs as usize]),
+        ms(c[C::UpWaitUs as usize]),
+        c[C::UpVisited as usize],
+        ms(c[C::UpLoopUs as usize]),
+        c[C::UpRecorded as usize],
+        c[C::UpSkipped as usize],
+        c[C::GpuWrites as usize],
+        c[C::GpuWritesRepeated as usize],
+        c[C::FlushRangeNs as usize] / 1e6,
+        c[C::FlushCoalesceNs as usize] / 1e6,
+    );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));

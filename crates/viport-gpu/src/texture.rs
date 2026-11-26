@@ -605,6 +605,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
+    let tracked = crate::watch::track(memory as usize, layout_size, true);
+    if let Some(t) = &tracked {
+        t.textures();
+    }
     let s = Arc::new(Staging {
         buffer,
         size: total,
@@ -617,7 +621,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         memory,
-        tracked: crate::watch::track(memory as usize, layout_size, true),
+        tracked,
         last: Mutex::default(),
     });
     #[cfg(feature = "diagnostics")]

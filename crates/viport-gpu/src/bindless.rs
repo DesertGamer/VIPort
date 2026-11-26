@@ -102,6 +102,7 @@ impl Inner {
                 }
             }
             Seen::Texture(r) => {
+                HEAP_TEXTURES.fetch_add(1, Relaxed);
                 let n = self.textures.entry(*r).or_insert(0);
                 step(n);
                 if *n == 0 {
@@ -193,6 +194,21 @@ fn left_kind(view: &View) -> usize {
 /// submission shows from the next one on.
 pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    const MOST_SKIPPED: u32 = 8;
+    let stamp = (crate::watch::texture_writes(), HEAP_TEXTURES.load(Relaxed));
+    {
+        let mut clean = CLEAN.lock().unwrap_or_else(|e| e.into_inner());
+        if *clean == Some(stamp) && SKIPPED.load(Relaxed) < MOST_SKIPPED && crate::host::idle() {
+            SKIPPED.fetch_add(1, Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::UpSkipped, 1);
+            return None;
+        }
+        *clean = None;
+        SKIPPED.store(0, Relaxed);
+    }
+    #[cfg(feature = "diagnostics")]
+    let waiting = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UpWaitUs);
     for viewed in heaps {
         let resources: Vec<usize> = viewed
             .inner
@@ -202,12 +218,18 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
             .keys()
             .copied()
             .collect();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::UpVisited, resources.len() as u64);
         for r in resources {
             if let Some(texture) = crate::resource::host_resource(r as This) {
                 crate::texture::wait_landed(r as This, texture);
             }
         }
     }
+    #[cfg(feature = "diagnostics")]
+    drop(waiting);
+    #[cfg(feature = "diagnostics")]
+    let looping = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UpLoopUs);
     let pooled = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
     let list = match pooled {
         Some(Holder(list)) => {
@@ -238,9 +260,17 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
                 crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
                 recorded = true;
                 #[cfg(feature = "diagnostics")]
-                UPLOADED.fetch_add(1, Relaxed);
+                {
+                    UPLOADED.fetch_add(1, Relaxed);
+                    crate::copystat::add(crate::copystat::C::UpRecorded, 1);
+                }
             }
         }
+    }
+    #[cfg(feature = "diagnostics")]
+    drop(looping);
+    if !recorded {
+        *CLEAN.lock().unwrap_or_else(|e| e.into_inner()) = Some(stamp);
     }
     held.list.as_ref()?.close();
     // A list recording nothing is not run (its reset next time is fine).
@@ -248,6 +278,10 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
 }
 
 static POOL: Mutex<Vec<Holder>> = Mutex::new(Vec::new());
+
+static HEAP_TEXTURES: AtomicU64 = AtomicU64::new(0);
+static CLEAN: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+static SKIPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub(crate) struct Holder(HostList);
 // SAFETY: D3D12 objects are free-threaded and a pooled list belongs to one submission at a time.
@@ -326,6 +360,7 @@ pub(crate) fn forget(resource: usize) {
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.textures.remove(&resource).is_some() {
+            HEAP_TEXTURES.fetch_add(1, Relaxed);
             inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
         }
     }

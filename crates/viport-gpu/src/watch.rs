@@ -45,7 +45,15 @@ mod page_batch;
 pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed.
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<BTreeSet<usize>>);
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<BTreeSet<usize>>, std::sync::atomic::AtomicBool);
+
+static TEXTURE_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the memory of trackers made [`Tracked::textures`] was
+/// marked changed.
+pub(crate) fn texture_writes() -> u64 {
+    TEXTURE_WRITES.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Title memory a host copy or texture staging takes: bytes `[start, end)`.
 pub(crate) struct Tracked {
@@ -183,7 +191,11 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     install();
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
-    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default()));
+    let changed = Arc::new(Changed(
+        Mutex::new(pages.clone().collect()),
+        Mutex::default(),
+        std::sync::atomic::AtomicBool::new(false),
+    ));
     let mut g = guards();
     for page in pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -312,6 +324,10 @@ impl Tracked {
         runs
     }
 
+    pub(crate) fn textures(&self) {
+        self.changed.2.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
         self.changed
@@ -436,6 +452,9 @@ fn mark(g: &mut Guards, first: usize, last: usize) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
+            if c.2.load(std::sync::atomic::Ordering::Relaxed) {
+                TEXTURE_WRITES.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
         }
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
@@ -950,6 +969,21 @@ pub(crate) mod tests {
         title_memory_written(b, PAGE);
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert!(t.take(a, a + PAGE).is_empty());
+    }
+
+    #[test]
+    fn only_writes_to_texture_trackers_count_as_texture_writes() {
+        let (a, _) = twin_views(2);
+        let buffer = track(a, PAGE, true).expect("views are tracked");
+        let texture = track(a + PAGE, PAGE, true).expect("views are tracked");
+        texture.textures();
+        buffer.take(a, a + PAGE);
+        texture.take(a + PAGE, a + 2 * PAGE);
+        let before = texture_writes();
+        title_memory_written(a, PAGE);
+        assert_eq!(texture_writes(), before);
+        title_memory_written(a + PAGE, PAGE);
+        assert!(texture_writes() > before);
     }
 
     /// A write or mapping that runs past the end of the address space (a

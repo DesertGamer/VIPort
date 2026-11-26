@@ -229,7 +229,15 @@ pub(crate) fn async_submit() -> bool {
 }
 
 pub(crate) fn settle() {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::SettleCalls, 1);
+    #[cfg(feature = "diagnostics")]
+    let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SettleUs);
     AIR.settle();
+}
+
+pub(crate) fn idle() -> bool {
+    AIR.idle()
 }
 
 pub(crate) fn wait_list(list: &HostList) {
@@ -241,7 +249,13 @@ pub(crate) fn after_landing(work: impl FnOnce() + Send + 'static) {
 }
 
 pub(crate) fn gate(from: usize, to: usize) {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::GateCalls, 1);
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     AIR.gate(from, to);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::GateUs, started.elapsed().as_nanos() as u64);
 }
 
 /// Verifies that the host device is usable before starting a title.
@@ -1001,6 +1015,9 @@ struct Deferred {
     /// Buffer ranges refreshed since the last overlapping title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Buffer ranges shaders of the list were declared to write (host copy,
+    /// address, bytes): declaring one again finds its bytes already kept.
+    declared: std::collections::HashSet<(usize, usize, usize)>,
     /// Upload fills recorded since the last overlapping title write or upload
     /// overwrite (upload dst, title src, bytes).
     fills: std::collections::HashSet<(usize, usize, usize)>,
@@ -2466,9 +2483,16 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GpuWrites, 1);
+        if deferred.declared.insert(key) {
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        } else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GpuWritesRepeated, 1);
+        }
     }
 
     /// Shaders of the list take views from the heap itself
@@ -2982,7 +3006,11 @@ impl Batch {
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
+        let ranged = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::FlushRangeNs, ranged.elapsed().as_nanos() as u64);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         copied
@@ -2995,7 +3023,11 @@ impl Batch {
         self.pending.clear();
         let mut total = 0;
         for (shadow, mut ranges) in self.refreshes.drain(..) {
+            #[cfg(feature = "diagnostics")]
+            let coalescing = std::time::Instant::now();
             coalesce_ranges(&mut ranges, COALESCE_GAP);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::FlushCoalesceNs, coalescing.elapsed().as_nanos() as u64);
             if ranges.is_empty() {
                 continue;
             }
