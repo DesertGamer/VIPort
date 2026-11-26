@@ -729,6 +729,7 @@ impl<'a> Lower<'a> {
         let mut lane_all = Vec::new();
         let mut lane_scratch = None;
         let mut lane_threads = 1;
+        let mut scratch_dwords = LANE_SCRATCH;
         let mut lds_barriers = false;
         let mut lds_unordered = false;
         let mut lds_div = HashSet::new();
@@ -871,9 +872,45 @@ impl<'a> Lower<'a> {
                     None => lds_unordered = true,
                 }
             }
+            let crosses_lanes = insts().any(|i| {
+                let name = i.name();
+                if name.starts_with("s_bcnt1")
+                    || matches!(name, "v_readlane_b32" | "v_writelane_b32")
+                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                {
+                    return true;
+                }
+                if name != "v_readfirstlane_b32" {
+                    return false;
+                }
+                let waterfall = i
+                    .writes(p)
+                    .first()
+                    .is_some_and(|w| x.res.waterfall.reads.contains(&w.1));
+                let source = i
+                    .reads(p)
+                    .iter()
+                    .find(|r| matches!(r.0, Reg::V(_)))
+                    .map(|r| r.1);
+                !waterfall && source.is_none_or(|v| lane_varying.contains(&v))
+            });
+            if mesh_on_32
+                && crosses_lanes
+                && ms.threads <= 128
+                && ms.threads % 64 == 0
+                && ms.lds_bytes.div_ceil(4) + ms.threads <= MAX_LDS_DWORDS
+                && let Some(all) = all_lane_blocks(p, x.st, false)
+            {
+                wave64_on_32 = true;
+                lane_threads = ms.threads;
+                lane_all = all;
+                lane_scratch = Some(s.lds_dwords);
+                scratch_dwords = ms.threads;
+                s.lds_dwords += scratch_dwords;
+            }
         }
         let fence_only_barrier = divergent_barriers(p, x.st, &no_barrier);
-        let lds_user = s.lds_dwords - if lane_scratch.is_some() { LANE_SCRATCH } else { 0 };
+        let lds_user = s.lds_dwords - if lane_scratch.is_some() { scratch_dwords } else { 0 };
         Lower {
             s,
             x,
@@ -3602,7 +3639,12 @@ impl<'a> Lower<'a> {
         self.s.m.store(c, mine, x);
         self.lane_barrier(c);
         let k63 = self.s.m.i32(63);
-        let from = self.s.m.bin(c, Bin::And, lane, k63);
+        let mut from = self.s.m.bin(c, Bin::And, lane, k63);
+        if self.lane_threads > 64 {
+            let wave_base = self.s.m.i32(!63);
+            let own_wave = self.s.m.bin(c, Bin::And, flat, wave_base);
+            from = self.s.m.bin(c, Bin::Or, from, own_wave);
+        }
         let theirs = self.scratch_slot(c, from);
         let r = self.s.m.load(c, theirs);
         self.lane_barrier(c);
@@ -3642,10 +3684,26 @@ impl<'a> Lower<'a> {
         let mine = self.s.m.bin(at, Bin::Shl, one, sh);
         let mine = self.s.m.select(at, bit, mine, z);
         let all = self.exchange_all(at, ir, mine)?;
-        let mut words = [z, z];
-        for (lane, &v) in all.iter().enumerate() {
-            let w = &mut words[lane / 32];
-            *w = self.s.m.bin(at, Bin::Or, *w, v);
+        let mut waves = Vec::new();
+        for wave in all.chunks(64) {
+            let mut words = [z, z];
+            for (lane, &v) in wave.iter().enumerate() {
+                let w = &mut words[lane / 32];
+                *w = self.s.m.bin(at, Bin::Or, *w, v);
+            }
+            waves.push(words);
+        }
+        let mut words = waves[0];
+        if waves.len() > 1 {
+            let k6 = self.s.m.i32(6);
+            let own_wave = self.s.m.bin(at, Bin::LShr, flat, k6);
+            for (n, other) in waves.iter().enumerate().skip(1) {
+                let k = self.s.m.i32(n as u32);
+                let here = self.s.m.cmp(at, pred::EQ, own_wave, k);
+                for half in 0..2 {
+                    words[half] = self.s.m.select(at, here, other[half], words[half]);
+                }
+            }
         }
         Ok((words[0], words[1]))
     }
@@ -3658,6 +3716,9 @@ impl<'a> Lower<'a> {
         id: V,
         float: bool,
     ) -> Result<V, Why> {
+        if self.lane_threads > 64 {
+            return Err(LANE_EXCHANGE);
+        }
         let c = self.cur;
         let bits = if float { self.as_int(arg) } else { arg };
         let all = self.exchange_all(c, Some(self.cur_ir), bits)?;
@@ -4059,6 +4120,7 @@ impl<'a> Lower<'a> {
         let offset = inst.machine.offset;
         let name = inst.name();
         if self.mesh_on_32
+            && !self.wave64_on_32
             && let Some(why) = self.lane_dependent(inst)
         {
             return Err(unsupported(offset, why));
