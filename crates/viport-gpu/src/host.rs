@@ -210,6 +210,42 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+#[cfg(feature = "diagnostics")]
+static FENCE_DONE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+fn clock_ns(at: std::time::Instant) -> u64 {
+    static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+    at.saturating_duration_since(*BASE.get_or_init(std::time::Instant::now)).as_nanos() as u64
+}
+
+#[cfg(feature = "diagnostics")]
+fn gpu_by_pipeline(commands: Vec<(f64, String)>) {
+    use std::collections::HashMap;
+    type Window = (std::time::Instant, HashMap<String, (f64, u64)>);
+    static ACC: Mutex<Option<Window>> = Mutex::new(None);
+    let mut acc = ACC.lock().unwrap_or_else(|e| e.into_inner());
+    let (since, totals) = acc.get_or_insert_with(|| (std::time::Instant::now(), HashMap::new()));
+    for (ms, text) in commands {
+        let kind = text.split_whitespace().next().unwrap_or("");
+        let shaders = text.find('[').and_then(|a| text[a..].find(']').map(|b| &text[a..=a + b])).unwrap_or("");
+        let entry = totals.entry(format!("{kind} {shaders}")).or_default();
+        entry.0 += ms;
+        entry.1 += 1;
+    }
+    if since.elapsed() < std::time::Duration::from_secs(5) {
+        return;
+    }
+    let mut rows: Vec<(&String, &(f64, u64))> = totals.iter().collect();
+    rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+    let all: f64 = rows.iter().map(|r| r.1.0).sum();
+    tracing::info!("gpu time by pipeline, last 5 s: {all:.0} ms in {} kinds", rows.len());
+    for (key, (ms, n)) in rows.into_iter().take(12) {
+        tracing::info!("gpu pipeline {ms:.0} ms ({n} commands): {key}");
+    }
+    *acc = None;
+}
+
 static AIR: crate::flight::Air = crate::flight::Air::new();
 static LANDER: std::sync::Once = std::sync::Once::new();
 
@@ -1462,7 +1498,16 @@ impl Host {
             let settling = std::time::Instant::now();
             AIR.settle();
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::ExecSettleNs, settling.elapsed().as_nanos() as u64);
+            {
+                let total = settling.elapsed().as_nanos() as u64;
+                let gpu = FENCE_DONE_NS
+                    .load(Ordering::Acquire)
+                    .saturating_sub(clock_ns(settling))
+                    .min(total);
+                crate::copystat::add(crate::copystat::C::ExecSettleNs, total);
+                crate::copystat::add(crate::copystat::C::ExecSettleGpuNs, gpu);
+                crate::copystat::add(crate::copystat::C::ExecSettleLandNs, total - gpu);
+            }
             *submitted += 1;
             let value = *submitted;
             // SAFETY: the lists in `groups` are closed and live until the submission lands.
@@ -1549,6 +1594,12 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
+            if timing() && groups.len() > 1 {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                gpu_by_pipeline(runs[i].slowest(frequency, usize::MAX));
+            }
+            #[cfg(feature = "diagnostics")]
             if timing() && groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
@@ -1609,6 +1660,8 @@ impl Host {
                     },
                 )
             };
+            #[cfg(feature = "diagnostics")]
+            FENCE_DONE_NS.store(clock_ns(std::time::Instant::now()), Ordering::Release);
             if matches!(ended, Waited::Stalled) {
                 fail(format_args!(
                     "host GPU has not finished a submission of {} lists in {STALL_SECS} s and reports \

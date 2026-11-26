@@ -129,8 +129,10 @@ pub(crate) enum C {
     FlushGateNoChangeNs,
     FlushSkipped,
     ListsRenewed,
+    ExecSettleGpuNs,
+    ExecSettleLandNs,
 }
-const COUNTERS: usize = 96;
+const COUNTERS: usize = 128;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -377,7 +379,7 @@ pub(crate) fn log(frames: f64) {
         c[C::FlushCoalesceNs as usize] / 1e6,
     );
     tracing::info!(
-        "  blocked waits per frame: range {:.0} calls {:.1} ms, computed {:.0} calls {:.1} ms, settle {:.0} calls {:.1} ms, lists {:.0} calls {:.1} ms; of the gate time: update flush {:.1} ms, shader write {:.1} ms; settle before execute {:.1} ms; list waits by caller: submit {:.1} ms, reset {:.1} ms, release {:.1} ms; update flush waited on {:.0} ranges: changed pages under them {:.1} ms, none {:.1} ms; {:.0} ranges skipped as unchanged; {:.0} lists renewed instead of waited for",
+        "  blocked waits per frame: range {:.0} calls {:.1} ms, computed {:.0} calls {:.1} ms, settle {:.0} calls {:.1} ms, lists {:.0} calls {:.1} ms; of the gate time: update flush {:.1} ms, shader write {:.1} ms; settle before execute {:.1} ms (till the GPU finished {:.1} ms, landing work after {:.1} ms); list waits by caller: submit {:.1} ms, reset {:.1} ms, release {:.1} ms; update flush waited on {:.0} ranges: changed pages under them {:.1} ms, none {:.1} ms; {:.0} ranges skipped as unchanged; {:.0} lists renewed instead of waited for",
         c[C::BlockedRange as usize],
         ms(c[C::BlockedRangeUs as usize]),
         c[C::BlockedOpen as usize],
@@ -389,6 +391,8 @@ pub(crate) fn log(frames: f64) {
         c[C::FlushGateNs as usize] / 1e6,
         c[C::WriteGateNs as usize] / 1e6,
         c[C::ExecSettleNs as usize] / 1e6,
+        c[C::ExecSettleGpuNs as usize] / 1e6,
+        c[C::ExecSettleLandNs as usize] / 1e6,
         c[C::ListSubmitNs as usize] / 1e6,
         c[C::ListResetNs as usize] / 1e6,
         c[C::ListReleaseNs as usize] / 1e6,
