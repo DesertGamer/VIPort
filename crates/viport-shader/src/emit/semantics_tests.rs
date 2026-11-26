@@ -3126,3 +3126,185 @@ fn lds_bytes_and_halves_match_the_hardware() {
         }),
     ]));
 }
+
+/// Sum of absolute differences (`v_sad_u8`, `v_sad_hi_u8`, `v_sad_u16`,
+/// `v_sad_u32`) and masked SAD (`v_msad_u8`, skipping lanes where the `src1`
+/// mask byte is 0), all wrapping at 32 bits (RDNA2 ISA VOP3).
+#[test]
+fn sad_and_msad_match_the_hardware() {
+    let edges = [
+        0x0000_0000u32,
+        0xFFFF_FFFF,
+        0x00FF_00FF,
+        0xFF00_FF00,
+        0x0102_0304,
+        0x0403_0201,
+        0x807F_00FF,
+        0x7F80_FF00,
+        0x1234_5678,
+        0x8765_4321,
+    ];
+    let accs = [0u32, 1, 0x0000_FFFF, 0xFFFF_0000, 0xFFFF_FFFE, 0xFFFF_FFFF];
+    let inputs = triples(&edges, &edges, &accs);
+    fn sad_bytes(a: u32, b: u32, masked: bool) -> u32 {
+        (0..4)
+            .map(|k| {
+                let x = (a >> (8 * k)) & 0xFF;
+                let y = (b >> (8 * k)) & 0xFF;
+                if masked && y == 0 { 0 } else { x.abs_diff(y) }
+            })
+            .sum()
+    }
+    fn sad_halves(a: u32, b: u32) -> u32 {
+        (a & 0xFFFF)
+            .abs_diff(b & 0xFFFF)
+            .wrapping_add((a >> 16).abs_diff(b >> 16))
+    }
+    let vop3_sad = |op: u16, f: F3| {
+        probe(
+            vop3(op, 5, [v(1), v(2), v(3)], NONE),
+            inputs.clone(),
+            INT,
+            move |i| vec![f(i[0], i[1], i[2])],
+        )
+    };
+    assert_clean(check(&[
+        vop3_sad(0x15A, |a, b, c| sad_bytes(a, b, false).wrapping_add(c)),
+        vop3_sad(0x15B, |a, b, c| {
+            (sad_bytes(a, b, false) << 16).wrapping_add(c)
+        }),
+        vop3_sad(0x15C, |a, b, c| sad_halves(a, b).wrapping_add(c)),
+        vop3_sad(0x15D, |a, b, c| a.abs_diff(b).wrapping_add(c)),
+        vop3_sad(0x171, |a, b, c| sad_bytes(a, b, true).wrapping_add(c)),
+    ]));
+}
+
+/// 64-bit multiply-add (`v_mad_u64_u32` with carry out to VCC, and
+/// `v_mad_i64_i32` with signed 32×32 → 64 product plus 64-bit addend;
+/// RDNA2 ISA VOP3B).
+#[test]
+fn wide_mad_matches_the_hardware() {
+    let vals = [
+        0u32,
+        1,
+        2,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0x8000_0001,
+        0xFFFF_FFFE,
+        0xFFFF_FFFF,
+    ];
+    let addends: [(u32, u32); 6] = [
+        (0, 0),
+        (1, 0),
+        (0xFFFF_FFFF, 0),
+        (0, 0x8000_0000),
+        (0xFFFF_FFFF, 0x7FFF_FFFF),
+        (0xFFFF_FFFF, 0xFFFF_FFFF),
+    ];
+    let mut inputs = Vec::with_capacity(vals.len() * vals.len() * addends.len());
+    for &a in &vals {
+        for &b in &vals {
+            for &(lo, hi) in &addends {
+                inputs.push([a, b, lo, hi]);
+            }
+        }
+    }
+    let mut unsigned = vop3b(0x176, 5, 106, [v(1), v(2), v(3)], false).to_vec();
+    unsigned.extend(vop3(0x101, 7, [int(0), int(1), VCC], NONE));
+    let signed = vop3b(0x177, 5, 106, [v(1), v(2), v(3)], false);
+    assert_clean(check(&[
+        probe(unsigned, inputs.clone(), INT, |i| {
+            let p = u64::from(i[0]) * u64::from(i[1]);
+            let add = u64::from(i[2]) | u64::from(i[3]) << 32;
+            let (r, carry) = p.overflowing_add(add);
+            vec![r as u32, (r >> 32) as u32, u32::from(carry)]
+        }),
+        probe(signed, inputs, INT, |i| {
+            let p = i64::from(i[0] as i32) * i64::from(i[1] as i32);
+            let add = (u64::from(i[2]) | u64::from(i[3]) << 32) as i64;
+            let r = p.wrapping_add(add) as u64;
+            vec![r as u32, (r >> 32) as u32]
+        }),
+    ]));
+}
+
+/// Byte permute (`v_perm_b32`): bytes 0..=7 pick from `{src0, src1}`,
+/// 8..=11 fill from the sign bit of bytes 1 and 3 of `src1` then `src0`,
+/// 12 gives `0x00`, and 13..=255 give `0xFF` (RDNA2 ISA VOP3). Covers
+/// both runtime VGPR selectors and a literal constant selector.
+#[test]
+fn byte_permute_matches_the_hardware() {
+    let words = [
+        0x0000_0000u32,
+        0x7F7F_7F7F,
+        0x8080_8080,
+        0x817E_00FF,
+        0x12A4_7F80,
+        0xFE01_807F,
+    ];
+    let selectors = [
+        0x0302_0100u32, // bytes 0..=3 of src1
+        0x0706_0504,    // bytes 0..=3 of src0
+        0x0B0A_0908,    // sign-fill of bytes 1,3 of src1 then src0
+        0xFF0E_0D0C,    // 12 -> 0x00, 13/14/255 -> 0xFF
+        0x0C09_0401,    // mixed bytes, sign-fill, zero
+        0x100B_0806,    // mixed bytes, sign-fill, 0xFF
+    ];
+    let perm_byte = |src0: u32, src1: u32, sel: u32| -> u32 {
+        match sel & 0xFF {
+            0..=3 => (src1 >> (8 * (sel & 3))) & 0xFF,
+            4..=7 => (src0 >> (8 * (sel & 3))) & 0xFF,
+            8 => {
+                if (src1 >> 15) & 1 != 0 {
+                    0xFF
+                } else {
+                    0
+                }
+            }
+            9 => {
+                if (src1 >> 31) & 1 != 0 {
+                    0xFF
+                } else {
+                    0
+                }
+            }
+            10 => {
+                if (src0 >> 15) & 1 != 0 {
+                    0xFF
+                } else {
+                    0
+                }
+            }
+            11 => {
+                if (src0 >> 31) & 1 != 0 {
+                    0xFF
+                } else {
+                    0
+                }
+            }
+            12 => 0x00,
+            _ => 0xFF,
+        }
+    };
+    let perm = move |src0: u32, src1: u32, sel: u32| -> u32 {
+        (0..4).fold(0u32, |acc, k| {
+            acc | (perm_byte(src0, src1, sel >> (8 * k)) << (8 * k))
+        })
+    };
+    let inputs = triples(&words, &words, &selectors);
+    let const_sel = 0x0D0C_0904u32;
+    let mut const_body = vop3(0x344, 5, [v(1), v(2), 255], NONE).to_vec();
+    const_body.push(const_sel);
+    assert_clean(check(&[
+        probe(
+            vop3(0x344, 5, [v(1), v(2), v(3)], NONE),
+            inputs,
+            INT,
+            move |i| vec![perm(i[0], i[1], i[2])],
+        ),
+        probe(const_body, pairs(&words, &words), INT, move |i| {
+            vec![perm(i[0], i[1], const_sel)]
+        }),
+    ]));
+}
