@@ -192,6 +192,14 @@ impl Air {
         self.wait_while(Site::Open, |s| s.footprint.open);
     }
 
+    pub(crate) fn holds(&self, list: usize) -> bool {
+        if landing_here() || !self.flying.load(Ordering::Acquire) {
+            return false;
+        }
+        let state = self.lock();
+        state.in_air && state.lists.contains(&list)
+    }
+
     pub(crate) fn wait_lists(&self, lists: &[usize]) {
         self.wait_while(Site::Lists, |s| lists.iter().any(|l| s.lists.contains(l)));
     }
@@ -384,6 +392,19 @@ mod tests {
         release.send(()).unwrap();
         t1.join().unwrap();
         t2.join().unwrap();
+    }
+
+    #[test]
+    fn a_list_is_held_only_while_its_submission_is_in_the_air() {
+        let air = air();
+        assert!(!air.holds(0x10));
+        let release = held(&air, vec![0x10, 0x20], Footprint::default());
+        assert!(air.holds(0x10));
+        assert!(air.holds(0x20));
+        assert!(!air.holds(0x30));
+        release.send(()).unwrap();
+        air.settle();
+        assert!(!air.holds(0x10));
     }
 
     #[test]

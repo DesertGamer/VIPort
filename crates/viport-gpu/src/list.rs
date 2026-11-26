@@ -116,9 +116,42 @@ struct List {
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Upload>>,
     #[cfg(windows)]
-    host: Option<crate::host::HostList>,
+    host: HostSlot,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+}
+
+#[cfg(windows)]
+struct HostSlot(std::sync::atomic::AtomicPtr<crate::host::HostList>);
+
+#[cfg(windows)]
+impl HostSlot {
+    fn new(list: Option<crate::host::HostList>) -> HostSlot {
+        let at = list.map_or(std::ptr::null_mut(), |l| Box::into_raw(Box::new(l)));
+        HostSlot(std::sync::atomic::AtomicPtr::new(at))
+    }
+
+    fn current<'a>(&self) -> Option<&'a crate::host::HostList> {
+        // SAFETY: null, or a box this slot owns until it is replaced; a replaced list is kept until its submission has landed.
+        unsafe { self.0.load(std::sync::atomic::Ordering::Acquire).as_ref() }
+    }
+
+    fn replace(&self, fresh: Box<crate::host::HostList>) -> Option<Box<crate::host::HostList>> {
+        let old = self.0.swap(Box::into_raw(fresh), std::sync::atomic::Ordering::AcqRel);
+        // SAFETY: null, or a box this slot made with `Box::into_raw` and no longer holds.
+        (!old.is_null()).then(|| unsafe { Box::from_raw(old) })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HostSlot {
+    fn drop(&mut self) {
+        let at = *self.0.get_mut();
+        if !at.is_null() {
+            // SAFETY: a box this slot made with `Box::into_raw` and still holds.
+            drop(unsafe { Box::from_raw(at) });
+        }
+    }
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -180,7 +213,7 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
         return None;
     }
     // SAFETY: the title passes one of our lists.
-    unsafe { (*this.cast::<List>()).host.as_ref() }
+    unsafe { (*this.cast::<List>()).host.current() }
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -262,13 +295,13 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
+        host: HostSlot::new(crate::host::host().and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
                 None
             }
-        }),
+        })),
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
@@ -324,18 +357,29 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let held = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(windows)]
     with_state(this, |host, state| {
-        host.reset();
         state.reset(pipeline);
+        if let Some(fresh) = crate::host::renewed(host) {
+            // SAFETY: the title passes one of our lists.
+            let slot = unsafe { &(*this.cast::<List>()).host };
+            if let Some(old) = slot.replace(fresh) {
+                crate::host::retire_list(old, held);
+            }
+        } else {
+            host.reset();
+            drop(held);
+        }
     });
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
-    let _ = this;
+    {
+        let _ = this;
+        drop(held);
+    }
     S_OK
 }
 

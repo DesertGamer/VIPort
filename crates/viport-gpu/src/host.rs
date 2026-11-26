@@ -244,6 +244,38 @@ pub(crate) fn wait_list(list: &HostList) {
     AIR.wait_lists(&[std::ptr::from_ref(list) as usize]);
 }
 
+struct Landed(Box<HostList>);
+
+// SAFETY: a list that has landed is touched by one thread at a time (the pool's lock hands it over), and its D3D12 objects are free-threaded.
+unsafe impl Send for Landed {}
+
+static SPARE_LISTS: Mutex<Vec<Landed>> = Mutex::new(Vec::new());
+
+pub(crate) fn renewed(list: &HostList) -> Option<Box<HostList>> {
+    if !AIR.holds(std::ptr::from_ref(list) as usize) {
+        return None;
+    }
+    let spare = SPARE_LISTS.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    let fresh = match spare {
+        Some(Landed(spare)) => {
+            spare.reset();
+            spare
+        }
+        None => Box::new(host()?.new_list().ok()?),
+    };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ListsRenewed, 1);
+    Some(fresh)
+}
+
+pub(crate) fn retire_list(list: Box<HostList>, kept: impl Send + 'static) {
+    let landed = Landed(list);
+    AIR.after_landing(Box::new(move || {
+        SPARE_LISTS.lock().unwrap_or_else(|e| e.into_inner()).push(landed);
+        drop(kept);
+    }));
+}
+
 pub(crate) fn after_landing(work: impl FnOnce() + Send + 'static) {
     AIR.after_landing(Box::new(work));
 }
@@ -585,6 +617,38 @@ mod tests {
         list.reset();
         assert_eq!(list.scratch(512).unwrap(), first);
         list.close();
+    }
+
+    #[test]
+    fn a_list_in_the_air_is_renewed_and_comes_back_once_landed() {
+        let Some(host) = host() else { return };
+        LANDER.call_once(|| {
+            std::thread::Builder::new().name("viport-landing".into()).spawn(|| AIR.serve()).unwrap();
+        });
+        let list = Box::new(host.new_list().unwrap());
+        let old = std::ptr::from_ref(&*list) as usize;
+        list.close();
+        assert!(super::renewed(&list).is_none(), "a list not in the air is reset in place");
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        AIR.fly(vec![old], crate::flight::Footprint::default(), Box::new(move || { let _ = wait.recv(); }));
+        let fresh = super::renewed(&list).expect("a list in the air is replaced, not waited for");
+        assert_ne!(std::ptr::from_ref(&*fresh) as usize, old);
+        super::retire_list(list, ());
+        let spare = |address: usize| {
+            SPARE_LISTS.lock().unwrap().iter().any(|l| std::ptr::from_ref(&*l.0) as usize == address)
+        };
+        assert!(!spare(old), "the list is not reused while its submission is in the air");
+        release.send(()).unwrap();
+        AIR.settle();
+        assert!(spare(old), "the landed list is kept for the next reset");
+        let again = Box::new(host.new_list().unwrap());
+        again.close();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        AIR.fly(vec![std::ptr::from_ref(&*again) as usize], crate::flight::Footprint::default(), Box::new(move || { let _ = wait.recv(); }));
+        let reused = super::renewed(&again).expect("in the air");
+        assert_eq!(std::ptr::from_ref(&*reused) as usize, old, "a landed list is reused before a new one is made");
+        release.send(()).unwrap();
+        AIR.settle();
     }
 
     #[test]
