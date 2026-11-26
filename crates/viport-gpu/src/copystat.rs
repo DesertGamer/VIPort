@@ -127,6 +127,7 @@ pub(crate) enum C {
     FlushGateOverlaps,
     FlushGateChangedNs,
     FlushGateNoChangeNs,
+    FlushSkipped,
 }
 const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -375,7 +376,7 @@ pub(crate) fn log(frames: f64) {
         c[C::FlushCoalesceNs as usize] / 1e6,
     );
     tracing::info!(
-        "  blocked waits per frame: range {:.0} calls {:.1} ms, computed {:.0} calls {:.1} ms, settle {:.0} calls {:.1} ms, lists {:.0} calls {:.1} ms; of the gate time: update flush {:.1} ms, shader write {:.1} ms; settle before execute {:.1} ms; list waits by caller: submit {:.1} ms, reset {:.1} ms, release {:.1} ms; update flush waited on {:.0} ranges: changed pages under them {:.1} ms, none {:.1} ms",
+        "  blocked waits per frame: range {:.0} calls {:.1} ms, computed {:.0} calls {:.1} ms, settle {:.0} calls {:.1} ms, lists {:.0} calls {:.1} ms; of the gate time: update flush {:.1} ms, shader write {:.1} ms; settle before execute {:.1} ms; list waits by caller: submit {:.1} ms, reset {:.1} ms, release {:.1} ms; update flush waited on {:.0} ranges: changed pages under them {:.1} ms, none {:.1} ms; {:.0} ranges skipped as unchanged",
         c[C::BlockedRange as usize],
         ms(c[C::BlockedRangeUs as usize]),
         c[C::BlockedOpen as usize],
@@ -393,6 +394,7 @@ pub(crate) fn log(frames: f64) {
         c[C::FlushGateOverlaps as usize],
         c[C::FlushGateChangedNs as usize] / 1e6,
         c[C::FlushGateNoChangeNs as usize] / 1e6,
+        c[C::FlushSkipped as usize],
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();

@@ -607,6 +607,12 @@ impl Shadow {
         self.tracked.as_ref().is_some_and(|t| t.changed_in(from, to))
     }
 
+    pub(crate) fn unchanged(&self, from: usize, to: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        from >= to || self.tracked.as_ref().is_some_and(|t| !t.changed_in(from, to))
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -1142,6 +1148,28 @@ mod tests {
         write(40, 0x23);
         assert_eq!(copy.copy_back_page(p), 0);
         assert_eq!([read(10), read(40)], [0x22, 0x23]);
+        unregister(p, p as u64);
+    }
+
+    #[test]
+    fn a_range_is_unchanged_until_the_title_writes_a_page_of_it() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return;
+        };
+        assert!(!copy.unchanged(p, p + len));
+        copy.update(p, len);
+        assert!(copy.unchanged(p, p + len));
+        assert!(copy.unchanged(p + len, p + len + PAGE));
+        // SAFETY: a committed page of the test's pool.
+        unsafe { ((p + PAGE + 4) as *mut u8).write_volatile(1) };
+        assert!(copy.unchanged(p, p + PAGE));
+        assert!(!copy.unchanged(p + PAGE, p + len));
+        copy.update(p, len);
+        assert!(copy.unchanged(p, p + len));
         unregister(p, p as u64);
     }
 

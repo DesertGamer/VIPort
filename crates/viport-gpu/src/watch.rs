@@ -322,7 +322,6 @@ impl Tracked {
         runs
     }
 
-    #[cfg(feature = "diagnostics")]
     pub(crate) fn changed_in(&self, from: usize, to: usize) -> bool {
         let (from, to) = (from.max(self.start), to.min(self.end));
         from < to

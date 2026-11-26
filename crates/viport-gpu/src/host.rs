@@ -3015,6 +3015,19 @@ impl Batch {
     }
 
     fn flush_one(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> usize {
+        if shadow.unchanged(from, to) {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add, range};
+                let len = (to - from) as u64;
+                range(from, to - from, 0, 0);
+                add(C::Watches, 1);
+                add(C::Checked, len);
+                add(C::Unchanged, len);
+                add(C::FlushSkipped, 1);
+            }
+            return 0;
+        }
         #[cfg(feature = "diagnostics")]
         let overlap = AIR.overlap(from, to);
         #[cfg(feature = "diagnostics")]
