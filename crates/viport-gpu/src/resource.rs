@@ -814,16 +814,12 @@ struct Resource {
     /// yet.
     #[cfg(windows)]
     host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
-    /// What the host texture is made with on first need (state, clear
-    /// value), when made late (`VIPORT_LAZY_HOST_TEXTURES`): every D3D12
-    /// resource is charged to process commit when created, resident or not.
     #[cfg(windows)]
     make: Option<(u32, Option<[u32; 5]>)>,
 }
 
 #[cfg(windows)]
 impl Resource {
-    /// The host texture, made now if it was left for first need.
     fn host(&self) -> Option<&std::sync::Arc<HostTexture>> {
         self.host
             .get_or_init(|| {
@@ -836,7 +832,6 @@ impl Resource {
             .as_ref()
     }
 
-    /// The host texture if it was made.
     fn host_made(&self) -> Option<&std::sync::Arc<HostTexture>> {
         self.host.get().and_then(Option::as_ref)
     }
@@ -1086,9 +1081,6 @@ pub(crate) fn host_resource<'a>(
     resource(this).host().map(|h| &h.texture)
 }
 
-/// Whether a title texture's host copy is left for first need and not made
-/// yet (`VIPORT_LAZY_HOST_TEXTURES`): its shader views in heaps wait for a
-/// shader to read them.
 #[cfg(windows)]
 pub(crate) fn host_pending(this: This) -> bool {
     if this.is_null() {

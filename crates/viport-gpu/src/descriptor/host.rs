@@ -685,18 +685,20 @@ impl HostHeap {
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         let key = u64::from(generation) << 32 | u64::from(i);
-        {
+        let parked = {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             if made[index as usize].made == key {
                 PLACED_WHY[1].fetch_add(1, Relaxed);
                 return false;
             }
-        }
+            made[index as usize].parked == key
+        };
         let Some(view) = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten() else {
             PLACED_WHY[2].fetch_add(1, Relaxed);
             return false;
         };
-        if !is_placed_texture(&view)
+        if !parked
+            && !is_placed_texture(&view)
             && !is_unmade_texture(&view)
             && !(lazy_views() && is_placed_buffer_view(&view))
         {
@@ -1423,9 +1425,6 @@ fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
 }
 
-/// A shader view of a title texture whose host copy is not made yet: made,
-/// with the copy, when a shader reads its slot (as placed textures are),
-/// since the title writes a view of every texture it streams in.
 fn is_unmade_texture(view: &View) -> bool {
     matches!(view, View::Shader(resource, _) | View::Unordered(resource, ..) if crate::resource::host_pending(*resource as crate::object::This))
 }
